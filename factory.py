@@ -40,6 +40,10 @@ CONFIG_PATH = ROOT / "config.json"
 TEMPLATE_PATH = ROOT / "prompt_template.md"
 REVIEW_TEMPLATE_PATH = ROOT / "review_prompt_template.md"
 TRIAGE_TEMPLATE_PATH = ROOT / "triage_prompt_template.md"
+ACCEPTANCE_TEMPLATE_PATH = ROOT / "epic_acceptance_prompt_template.md"
+SPEC_TEMPLATE_PATH = ROOT / "epic_spec_prompt_template.md"
+SPEC_REVIEW_TEMPLATE_PATH = ROOT / "epic_spec_review_prompt_template.md"
+DECOMPOSE_TEMPLATE_PATH = ROOT / "epic_decompose_prompt_template.md"
 # Всё, что специфично для конкретного проекта, лежит здесь и подставляется в промпты.
 # Промпты от этого остаются общими, а команда правит только свои правила.
 PROJECT_DIR = ROOT / "project"
@@ -86,6 +90,88 @@ STOP_PHRASES = [
 # под шапку «продолжение i/n».
 COMMENT_LIMIT = 4096
 COMMENT_RESERVE = 48
+
+ACCEPTANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "unclear"]},
+        "summary": {"type": "string"},
+        "criteria": {"type": "array", "items": {"type": "string"}},
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "backend_needed": {"type": "boolean"},
+        "joke": {"type": "string"},
+    },
+    "required": ["status", "summary"],
+    "additionalProperties": False,
+}
+
+SPEC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "unclear"]},
+        "summary": {"type": "string"},
+        "spec_path": {"type": "string"},
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "string"},
+        "joke": {"type": "string"},
+    },
+    "required": ["status", "summary"],
+    "additionalProperties": False,
+}
+
+SPEC_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ok", "needs_changes"]},
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                    "where": {"type": "string"},
+                    "what": {"type": "string"},
+                    "fix": {"type": "string"},
+                },
+                "required": ["severity", "what", "fix"],
+                "additionalProperties": False,
+            },
+        },
+        "joke": {"type": "string"},
+    },
+    "required": ["verdict", "summary"],
+    "additionalProperties": False,
+}
+
+DECOMPOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "unclear"]},
+        "summary": {"type": "string"},
+        "subtasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["frontend", "backend"]},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    # фронт можно делать сразу, на моке: бек блокирует не разработку,
+                    # а раскатку. Флаг оседает в карточке и в PR предупреждением
+                    "mocks_backend": {"type": "boolean"},
+                },
+                "required": ["kind", "title", "description"],
+                "additionalProperties": False,
+            },
+        },
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "joke": {"type": "string"},
+    },
+    "required": ["status", "summary"],
+    "additionalProperties": False,
+}
+
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -441,6 +527,33 @@ class Kaiten:
         return f"https://{self.domain}/space/{space}/boards/card/{card['id']}"
 
 
+def flat_columns(board: dict) -> list[dict]:
+    """
+    Все колонки доски одним списком, включая подколонки.
+
+    Подколонки Kaiten не отдаёт отдельным запросом: `GET /boards/{id}/columns` их не
+    показывает, а `GET /boards/{id}/columns/{id}` вообще 405. Единственное место, где
+    они лежат, — ключ `subcolumns` внутри колонок самой доски.
+
+    Карточки живут только в листьях: у колонки с подколонками своих карточек не бывает
+    (проверено на доске эпиков — в родительских колонках ноль). Поэтому родителей
+    в список не кладём, иначе в мастере можно выбрать колонку, в которую не попасть.
+    """
+    result = []
+    for column in sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0):
+        subs = sorted(column.get("subcolumns") or [], key=lambda c: c.get("sort_order") or 0)
+        if not subs:
+            result.append({**column, "path": column.get("title") or ""})
+            continue
+        for sub in subs:
+            result.append({**sub, "path": f"{column.get('title')} / {sub.get('title')}"})
+    return result
+
+
+def column_label(column: dict) -> str:
+    return f"{column.get('path') or column.get('title')}  (id {column['id']})"
+
+
 # --------------------------------------------------------------------------- #
 # блокеры: как фабрика говорит «дальше ход человека»
 # --------------------------------------------------------------------------- #
@@ -512,7 +625,7 @@ HANDOFF_BLOCKERS = {
 
 
 def make_profile(key: str, board: dict, repo_key: str | None = None,
-                 attach_to_debt: bool = True) -> dict:
+                 attach_to_debt: bool = True, own_only: bool = False) -> dict:
     columns = {role: value for role, value in (board.get("columns") or {}).items() if value}
     missing = [role for role in REQUIRED_ROLES if not columns.get(role)]
     if missing:
@@ -525,6 +638,10 @@ def make_profile(key: str, board: dict, repo_key: str | None = None,
         "card_type_id": board.get("card_type_id"),
         "repo": repo_key,
         "attach_to_debt": attach_to_debt,
+        # На своей доске фабрика хозяйка и берёт всё, что лежит в «Очереди». На доске
+        # команды так нельзя: там свой бэклог, и фабрика должна трогать только те
+        # карточки, которые сама и создала — их узнаём по строке «Из эпика: #<id>».
+        "own_only": own_only,
     }
 
 
@@ -541,7 +658,7 @@ def board_profiles(cfg: dict) -> list[dict]:
         # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
         # только раздует описание долга, поэтому туда её не привязываем
         profiles.append(make_profile("сабтаски", subtasks, subtasks.get("repo"),
-                                     attach_to_debt=False))
+                                     attach_to_debt=False, own_only=True))
     return profiles
 
 
@@ -862,6 +979,9 @@ def extract_verdict(payload: dict, key: str = "status"):
 # отведено на день. Считаем по факту, из meta самого агента.
 SPENT = {"usd": 0.0}
 
+# Карточки, ждущие ответа человека, суммарно по всем доскам за прогон
+AWAITING = {"count": 0}
+
 
 def note_spend(meta: dict | None) -> None:
     SPENT["usd"] += float((meta or {}).get("cost_usd") or 0.0)
@@ -1047,13 +1167,23 @@ def ensure_debt_card(kaiten: Kaiten, epic: dict, dry_run: bool) -> dict:
     return created
 
 
+def sprint_debt(cfg: dict) -> dict | None:
+    """
+    Настройки карточки долга спринта.
+
+    Секция называется `sprint_debt`. Старое имя `epic` поддерживаем: оно слишком похоже
+    на `epic_flow` — второй режим работы — и путало бы, но ломать чужие конфиги незачем.
+    """
+    return cfg.get("sprint_debt") or cfg.get("epic") or None
+
+
 def attach_to_debt_card(kaiten: Kaiten, cfg: dict, card_id: int, dry_run: bool) -> str:
     """
     Вешает карточку дочерней на эпик долга. Возвращает строку для комментария.
     Ошибку не поднимает: PR уже создан, из-за неудачной привязки карточка не должна
     уезжать в «Упало».
     """
-    epic = cfg.get("epic")
+    epic = sprint_debt(cfg)
     if not epic:
         return ""
     try:
@@ -1102,6 +1232,15 @@ def find_pr_template(worktree: Path) -> Path | None:
     return None
 
 
+def mock_backend_warning(card: dict) -> str:
+    """
+    Сабтаска, помеченная моком, несёт предупреждение и в PR: человек, который смотрит
+    только гитхаб, иначе раскатает фронт без бека и получит пустой экран.
+    """
+    description = strip_html(card.get("description")) or ""
+    return f"\n\n{MOCK_BACKEND_NOTE}\n" if MOCK_BACKEND_LINE in description else ""
+
+
 def compose_pr_body(worktree: Path, card: dict, card_url: str, verdict: dict) -> str:
     """
     Шаблон PR из репозитория не выбрасываем: заполняем в нём раздел «Описание»,
@@ -1111,6 +1250,7 @@ def compose_pr_body(worktree: Path, card: dict, card_url: str, verdict: dict) ->
         f"Карточка: [#{card['id']} {(card.get('title') or '').strip()}]({card_url})\n\n"
         f"{verdict.get('summary', '')}"
         + (f"\n\n**Риски:** {verdict['risks']}" if verdict.get("risks") else "")
+        + mock_backend_warning(card)
         + "\n\n> ⚠️ Код написан агентом автоматически — нужен внимательный ревью."
     )
 
@@ -1188,6 +1328,11 @@ def finish_status(card_id: int, title: str, outcome: str, meta, pr_url: str = ""
     })
 
 
+def own_subtask(card: dict) -> bool:
+    """Карточка создана фабрикой из эпика, а не человеком."""
+    return bool(EPIC_ORIGIN_RE.search(strip_html(card.get("description")) or ""))
+
+
 def skip_hands_off(kaiten: Kaiten, cards: list, cfg: dict) -> list:
     """
     Убирает карточки, в которых просили не трогать. Комментарий не пишем: просили
@@ -1219,6 +1364,8 @@ def fix_round_cards(kaiten: Kaiten, profile: dict) -> list:
 
     found = []
     for card in kaiten.cards_in_column(profile["board_id"], in_progress):
+        if profile.get("own_only") and not own_subtask(card):
+            continue
         if blocked_by(kaiten, card["id"]):
             continue
         texts = [strip_html(c.get("text", "")) for c in kaiten.comments(card["id"])]
@@ -1256,8 +1403,10 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
             f"{', '.join('#' + str(c['id']) for c in answered)}")
     if waiting:
         log(f"ещё {waiting} карточек ждут твоего ответа")
-    # человечек в меню-баре по этому числу решает, вопрошать ему или спать
-    write_status(awaiting_answer=waiting)
+    # человечек в меню-баре по этому числу решает, вопрошать ему или спать. Досок может
+    # быть несколько, поэтому копим, а не перетираем — иначе видно только последнюю
+    AWAITING["count"] += waiting
+    write_status(awaiting_answer=AWAITING["count"])
 
     fixes = fix_round_cards(kaiten, profile)
     if fixes:
@@ -1266,6 +1415,12 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     # потом отвеченные вопросы — человек только что написал, ему нужен быстрый отклик
     queue = kaiten.cards_in_column(board_id, cols["queue"])
     picked = skip_hands_off(kaiten, fixes + answered + queue, cfg)
+    if profile.get("own_only"):
+        before = len(picked)
+        picked = [c for c in picked if own_subtask(c)]
+        if before != len(picked):
+            log(f"на доске «{profile['key']}» {before - len(picked)} чужих карточек — "
+                f"их фабрика не трогает")
     return [c for c in picked if not blocked_by(kaiten, c["id"])]
 
 
@@ -1598,6 +1753,9 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         if profile.get("attach_to_debt"):
             write_status(phase="привязываю к долгу спринта")
             epic_note = attach_to_debt_card(kaiten, cfg, card_id, args.dry_run)
+
+        if pr_url.startswith("http") and mock_backend_warning(card) and not args.dry_run:
+            post_pr_review(worktree, pr_url, MOCK_BACKEND_NOTE)
 
         text = comment_success(verdict, meta, pr_url, branch)
         if dirty:
@@ -2053,6 +2211,580 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
 
 
 # --------------------------------------------------------------------------- #
+# режим эпиков: АЦ -> спека -> сабтаски -> ревью
+# --------------------------------------------------------------------------- #
+
+# Метка комментариев эпик-агента. Своя, чтобы не путать с исполнителем и ревьювером
+EPIC_MARK = "🧩"
+
+# Как называется чек-лист приёмочных критериев. По имени же его и находим обратно:
+# другого признака «АЦ уже написаны» у нас нет
+ACCEPTANCE_LIST = "Приёмочные критерии"
+
+# Строки-маркеры в комментариях эпика. Состояние пайплайна выводится только из Kaiten:
+# прогон идёт раз в час, человек между прогонами двигает карточки руками, и любое
+# состояние, которое фабрика держала бы у себя, разъехалось бы с доской в первый же раз.
+SPEC_LINE = "Спека:"
+SPEC_OK_LINE = "Спека отревьюена."
+SUBTASKS_LINE = "Разложил на сабтаски:"
+
+# Строка в описании сабтаски: из какого эпика она выросла. По ней же считаются свои
+# дети — у эпика могут висеть и карточки, которые подвесил человек, и ждать их закрытия
+# фабрика не должна.
+EPIC_ORIGIN = "Из эпика:"
+EPIC_ORIGIN_RE = re.compile(r"Из эпика:\s*#(\d+)")
+
+# Фазы. Порядок важен: фаза выводится первым совпавшим условием
+EPIC_PHASES = ("acceptance", "waiting_approval", "spec", "spec_review",
+               "decompose", "working", "closing")
+
+EPIC_PHASE_LABELS = {
+    "acceptance": "пишу приёмочные критерии",
+    "waiting_approval": "жду апрува АЦ",
+    "spec": "пишу спеку",
+    "spec_review": "ревью спеки",
+    "decompose": "раскладываю на сабтаски",
+    "working": "сабтаски в работе",
+    "closing": "закрываю эпик",
+}
+
+
+def epic_flow(cfg: dict) -> dict | None:
+    """Настройки режима эпиков. Нет секции — режима нет, как с инбоксом и долгом."""
+    flow = cfg.get("epic_flow") or {}
+    if not (flow.get("boards") and flow.get("subtasks", {}).get("board_id")):
+        return None
+    return flow
+
+
+def has_tag(card: dict, name: str) -> bool:
+    wanted = normalize_phrase(name)
+    return any(normalize_phrase(tag.get("name")) == wanted for tag in (card.get("tags") or []))
+
+
+def next_column_after(kaiten: Kaiten, board_id: int, column_id: int) -> int | None:
+    """
+    Колонка справа от указанной.
+
+    Эпик после ревью уезжает «в следующую после разработки», а не в жёстко заданную:
+    так это описано в процессе. Подколонки считаются внутри своего родителя, и только
+    когда сосед справа кончился — переходим к следующей верхней колонке.
+    """
+    board = kaiten.board(board_id)
+    columns = flat_columns(board)
+    ids = [int(c["id"]) for c in columns]
+    if column_id not in ids:
+        return None
+    position = ids.index(column_id)
+    return ids[position + 1] if position + 1 < len(ids) else None
+
+
+def acceptance_items(card: dict) -> list[dict]:
+    """Пункты чек-листа приёмочных критериев. Пусто — значит АЦ ещё не писали."""
+    for checklist in card.get("checklists") or []:
+        if normalize_phrase(checklist.get("name")) == normalize_phrase(ACCEPTANCE_LIST):
+            return checklist.get("items") or []
+    return []
+
+
+def said(comments: list, line: str) -> bool:
+    """Говорил ли эпик-агент такое раньше. Человеческие реплики не считаются."""
+    for comment in comments:
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(EPIC_MARK) and line in text:
+            return True
+    return False
+
+
+def own_blocker(kaiten: Kaiten, card_id: int, kind: str) -> dict | None:
+    """Наш действующий блокер нужного вида. Снят — значит человек дал ход дальше."""
+    reason = block_reason(kind)
+    for blocker in kaiten.blockers(card_id):
+        if str(blocker.get("reason") or "").startswith(reason):
+            return blocker
+    return None
+
+
+def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> list:
+    """
+    Только свои сабтаски: те, где в описании стоит «Из эпика: #<id>».
+
+    У эпика могут висеть и карточки, подвешенные человеком. Если считать всех детей,
+    эпик не закроется никогда — человек про свою карточку просто забудет.
+    """
+    own = []
+    for child in children:
+        description = strip_html(child.get("description")) or ""
+        match = EPIC_ORIGIN_RE.search(description)
+        if match and int(match.group(1)) == epic_id:
+            own.append(child)
+    return own
+
+
+def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list) -> str:
+    """
+    В какой фазе эпик прямо сейчас. Выводится целиком из Kaiten — чек-лист, блокеры,
+    комментарии, дети — чтобы прогон мог начаться с любого места и не зависеть
+    от того, что фабрика помнит о прошлом разе.
+    """
+    card_id = card["id"]
+    if not acceptance_items(card):
+        return "acceptance"
+    if own_blocker(kaiten, card_id, BLOCK_ACCEPTANCE):
+        return "waiting_approval"
+    if not said(comments, SPEC_LINE):
+        return "spec"
+    if not said(comments, SPEC_OK_LINE):
+        return "spec_review"
+
+    children = kaiten.children(card_id)
+    own = epic_subtasks(kaiten, card_id, children)
+    if not own:
+        return "decompose"
+
+    profile = subtask_profile(cfg, flow)
+    review_column = role_column(profile, "review")
+    done_column = role_column(profile, "done")
+    finished = 0
+    for child in own:
+        column = child.get("column_id")
+        if column == done_column:
+            finished += 1
+        elif column == review_column and blocked_by(kaiten, child["id"]):
+            # в колонке ревью с блокером — агентское ревью пройдено, дальше человек
+            finished += 1
+    log(f"  сабтасок {len(own)}, отревьюено {finished}")
+    return "closing" if finished == len(own) else "working"
+
+
+def subtask_profile(cfg: dict, flow: dict) -> dict:
+    subtasks = flow["subtasks"]
+    return make_profile("сабтаски", subtasks, subtasks.get("repo"), attach_to_debt=False)
+
+
+def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
+    """Карточки с рабочим тегом на перечисленных досках, у которых нет чужого блокера."""
+    tag = flow.get("tag") or "claude:epic"
+    found = []
+    for board_id in flow["boards"]:
+        for card in kaiten.cards_on_board(int(board_id), with_description=True):
+            if not has_tag(card, tag):
+                continue
+            comments = kaiten.comments(card["id"])
+            stop = hands_off(card, comments, cfg)
+            if stop:
+                log(f"#{card['id']} не трогаю: в карточке «{stop}»")
+                continue
+            found.append(card)
+    return found
+
+
+
+# Предупреждение про мок бека. Едет в описание сабтаски, в тело PR и отдельным
+# комментарием в PR: раскатывать такую правку до релиза бека нельзя, и человек,
+# который смотрит только PR, должен это увидеть там же.
+MOCK_BACKEND_LINE = "Бек ещё не готов: фронт сделан на моке."
+MOCK_BACKEND_NOTE = ("⚠️ **Нельзя раскатывать и включать до релиза бека.** "
+                     "Фронт работает на моке.")
+
+
+def epic_prompt(path: Path, card: dict, card_url: str, repo_cfg: dict,
+                extra: dict | None = None) -> str:
+    replacements = {
+        "{{CARD_ID}}": str(card["id"]),
+        "{{CARD_URL}}": card_url,
+        "{{TITLE}}": card.get("title") or "(без заголовка)",
+        "{{DESCRIPTION}}": strip_html(card.get("description")) or "(описания нет)",
+        "{{BASE_BRANCH}}": repo_cfg["base_branch"],
+        "{{REMOTE}}": repo_cfg["remote"],
+        **(extra or {}),
+        **project_replacements(),
+    }
+    return apply_template(path.read_text(encoding="utf-8"), replacements)
+
+
+def comment_acceptance(verdict: dict, meta: dict) -> str:
+    """АЦ уехали чек-листом, в комментарии — только просьба их проверить."""
+    text = (f"{EPIC_MARK} **Приёмочные критерии готовы.**\n\n"
+            f"{verdict.get('summary', '')}\n\n"
+            f"Они лежат чек-листом в этой карточке. Прочитай и, если согласен, "
+            f"**сними блокер** — по нему я и понимаю, что можно начинать. "
+            f"Если что-то не так, напиши комментарием и снимай блокер уже после правок.")
+    if verdict.get("backend_needed"):
+        text += "\n\nПохоже, понадобится и бек — учту при декомпозиции."
+    tail = format_meta(meta)
+    text += f"\n\n_приёмочные критерии{': ' + tail if tail else ''}. Код не менял._"
+    return text + format_joke(verdict)
+
+
+def comment_epic_unclear(verdict: dict, meta: dict, phase: str) -> str:
+    text = (f"{EPIC_MARK} **Не хватает данных, чтобы {phase}.**\n\n"
+            f"{verdict.get('summary', '')}")
+    text += format_list("Что нужно уточнить", verdict.get("questions"))
+    text += ("\n\nОтветь комментарием и **сними блокер** — я вернусь и продолжу "
+             "с того же места.")
+    tail = format_meta(meta)
+    text += f"\n\n_{phase}{': ' + tail if tail else ''}. Код не менял._"
+    return text + format_joke(verdict)
+
+
+def subtask_description(epic: dict, epic_url: str, item: dict, spec_note: str) -> str:
+    """
+    Описание сабтаски. Первой строкой — откуда она выросла: по этой строке фабрика
+    отличает своих детей от тех, что подвесил человек.
+    """
+    parts = [f"{EPIC_ORIGIN} #{epic['id']} — {epic_url}", ""]
+    parts.append(item.get("description", "").strip())
+    if spec_note:
+        parts += ["", spec_note]
+    if item.get("mocks_backend"):
+        parts += ["", f"⚠️ {MOCK_BACKEND_LINE} Раскатывать и включать нельзя, "
+                      f"пока бек не уедет в прод."]
+    return "\n".join(parts)
+
+
+def show_prompt(prompt: str, args, what: str) -> bool:
+    """--prompt-only: показать промпт и не запускать агента. True — дальше не идём."""
+    if not args.prompt_only:
+        return False
+    print("\n" + "=" * 78)
+    print(prompt)
+    print("=" * 78 + "\n")
+    log(f"  промпт {what} показан, агент не запускался, карточка не тронута")
+    return True
+
+
+def log_phase(card_id: int, phase: str, verdict: dict, meta: dict) -> None:
+    LOGS.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    (LOGS / f"epic-{phase}-{card_id}-{stamp}.json").write_text(
+        json.dumps({"verdict": verdict, "meta": meta}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    log(f"  {phase}: {verdict.get('status') or verdict.get('verdict')}, {format_meta(meta)}")
+
+
+def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url: str,
+                    items: list, verdict: dict, meta: dict, args) -> None:
+    """
+    Создаёт сабтаски на своей доске и вешает их дочерними на эпик.
+
+    Бек не блокирует фронт: фронт делается сразу, на моке, а блокер вешается только
+    на раскатку. Иначе половина работы простаивала бы, ожидая чужую команду.
+    """
+    profile = subtask_profile(cfg, flow)
+    limit = flow.get("max_subtasks", 5)
+    if len(items) > limit:
+        log(f"  сабтасок {len(items)}, беру первые {limit} — остальное человеку")
+        items = items[:limit]
+
+    spec_note = ""
+    for comment in kaiten.comments(epic["id"]):
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(EPIC_MARK) and SPEC_LINE in text:
+            spec_note = text.split("\n")[0].replace(EPIC_MARK, "").strip("* ")
+            break
+
+    created, backend = [], [i for i in items if i.get("kind") == "backend"]
+    for item in items:
+        body = {
+            "board_id": profile["board_id"],
+            "column_id": role_column(profile, "queue"),
+            "title": item["title"].strip(),
+            "description": subtask_description(epic, epic_url, item, spec_note),
+        }
+        if profile.get("lane_id"):
+            body["lane_id"] = profile["lane_id"]
+        if profile.get("card_type_id"):
+            body["type_id"] = profile["card_type_id"]
+        if args.dry_run:
+            log(f"  [dry-run] сабтаска «{item['title'][:50]}» ({item.get('kind')})")
+            continue
+        card = kaiten.create_card(body)
+        if not card:
+            log(f"  !! не создалась сабтаска «{item['title'][:40]}»")
+            continue
+        kaiten.add_child(epic["id"], card["id"])
+        created.append((card, item))
+        log(f"  + #{card['id']} «{item['title'][:50]}» ({item.get('kind')})")
+
+    # блокер раскатки — на фронт, который сделан на моке
+    for card, item in created:
+        if item.get("mocks_backend"):
+            detail = (f"бек #{created[0][0]['id']}" if backend and created
+                      else "бек ещё не готов")
+            hold(kaiten, card["id"], BLOCK_ROLLOUT, detail)
+
+    lines = "\n".join(f"- #{c['id']} {i['title']} ({i.get('kind')})" for c, i in created)
+    text = (f"{EPIC_MARK} **{SUBTASKS_LINE}**\n\n{lines or '(в dry-run не создавал)'}\n\n"
+            f"{verdict.get('summary', '')}")
+    if any(i.get("mocks_backend") for _, i in created):
+        text += f"\n\n{MOCK_BACKEND_NOTE}"
+    text += f"\n\n_декомпозиция, {format_meta(meta)}._" + format_joke(verdict)
+    kaiten.comment(epic["id"], text)
+
+
+def epic_worktree(kaiten: Kaiten, cfg: dict, repo_cfg: dict, repo_key: str,
+                  card_id: int, writable: bool) -> Path:
+    """
+    Рабочая копия для фазы эпика.
+
+    Для чтения (АЦ, декомпозиция) переиспользуем постоянную копию разведчика: она
+    уже есть и обновляется дешево. Для спеки нужна своя ветка — там будет коммит.
+    """
+    repo = Path(repo_cfg["path"]).expanduser()
+    if not (repo / ".git").exists():
+        raise FactoryError(f"репозиторий не найден: {repo}")
+    if not writable:
+        return ensure_scout_worktree(repo, repo_cfg, repo_key)
+    worktree = WORKTREES / f"spec-{card_id}"
+    branch = f"{cfg['pr']['branch_prefix']}{card_id}-spec"
+    existing = remote_branch_for_card(repo, repo_cfg["remote"],
+                                      cfg["pr"]["branch_prefix"], card_id)
+    continue_from = existing if existing and existing.endswith("-spec") else None
+    make_worktree(repo, branch, repo_cfg["base_branch"], repo_cfg["remote"], worktree,
+                  continue_from=continue_from)
+    return worktree
+
+
+def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list,
+                 phase: str, args) -> None:
+    """Продвигает эпик на одну фазу. Каждая фаза заканчивается либо шагом, либо блокером."""
+    card_id = card["id"]
+    card_url = kaiten.card_url(card)
+    title = (card.get("title") or "").strip()
+    repo_key, repo_cfg = resolve_repo(card, cfg, (flow.get("subtasks") or {}).get("repo"))
+    agent_cfg = {**cfg["triager"], **(flow.get("agent") or {})}
+
+    if phase == "acceptance":
+        worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
+        prompt = epic_prompt(ACCEPTANCE_TEMPLATE_PATH, card, card_url, repo_cfg,
+                             {"{{COMMENTS}}": format_comments(comments)})
+        if show_prompt(prompt, args, "приёмочных критериев"):
+            return
+        verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=ACCEPTANCE_SCHEMA)
+        note_spend(meta)
+        log_phase(card_id, "acceptance", verdict, meta)
+
+        criteria = [c for c in (verdict.get("criteria") or []) if str(c).strip()]
+        if verdict.get("status") != "ready" or not criteria:
+            kaiten.comment(card_id, comment_epic_unclear(verdict, meta,
+                                                         "написать приёмочные критерии"))
+            hold(kaiten, card_id, BLOCK_QUESTION, "нужны детали для приёмочных критериев")
+            return
+        kaiten.add_checklist(card_id, ACCEPTANCE_LIST, criteria)
+        kaiten.comment(card_id, comment_acceptance(verdict, meta))
+        hold(kaiten, card_id, BLOCK_ACCEPTANCE)
+        log(f"  -> АЦ на апруве: {len(criteria)} пунктов")
+        return
+
+    if phase == "spec":
+        worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=True)
+        criteria = acceptance_items(card)
+        prompt = epic_prompt(SPEC_TEMPLATE_PATH, card, card_url, repo_cfg, {
+            "{{COMMENTS}}": format_comments(comments),
+            "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}" for i in criteria),
+            "{{SPEC_DIR}}": flow.get("spec_dir") or "specs",
+            "{{BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+        })
+        if show_prompt(prompt, args, "спеки"):
+            return
+        verdict, meta = run_agent(prompt, worktree, cfg["agent"], schema=SPEC_SCHEMA)
+        note_spend(meta)
+        log_phase(card_id, "spec", verdict, meta)
+
+        base_ref = f"{repo_cfg['remote']}/{repo_cfg['base_branch']}"
+        commits = git(worktree, "log", f"{base_ref}..HEAD", "--oneline")
+        if verdict.get("status") != "done" or not commits:
+            kaiten.comment(card_id, comment_epic_unclear(verdict, meta, "написать спеку"))
+            hold(kaiten, card_id, BLOCK_QUESTION, "нужны детали для спеки")
+            drop_worktree(Path(repo_cfg["path"]).expanduser(), worktree)
+            return
+
+        branch = git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+        if not args.dry_run:
+            git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
+        pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
+                         verdict, cfg["pr"], args.dry_run) if not args.no_pr else "(без PR)"
+        kaiten.comment(card_id,
+                       f"{EPIC_MARK} **{SPEC_LINE}** {pr_url}\n\n"
+                       f"{verdict.get('summary', '')}\n\n"
+                       f"_спека, {format_meta(meta)}. Дальше её посмотрит ревьювер._"
+                       + format_joke(verdict))
+        log(f"  -> спека: {pr_url}")
+        if not (args.keep_worktree or cfg.get("keep_worktree")):
+            drop_worktree(Path(repo_cfg["path"]).expanduser(), worktree)
+        return
+
+    if phase == "spec_review":
+        worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
+        prompt = epic_prompt(SPEC_REVIEW_TEMPLATE_PATH, card, card_url, repo_cfg, {
+            "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
+                                        for i in acceptance_items(card)),
+            "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+        })
+        if show_prompt(prompt, args, "ревью спеки"):
+            return
+        review, meta = run_agent(prompt, worktree, cfg["reviewer"],
+                                 schema=SPEC_REVIEW_SCHEMA, verdict_key="verdict")
+        note_spend(meta)
+        log_phase(card_id, "spec-review", review, meta)
+
+        findings = review.get("findings") or []
+        blocking = [f for f in findings if f.get("severity") in ("blocker", "major")]
+        if review.get("verdict") == "needs_changes" or blocking:
+            text = (f"{REVIEWER_MARK} **Спеку надо поправить.**\n\n"
+                    f"{review.get('summary', '')}")
+            for f in findings:
+                text += (f"\n\n{SEVERITY_ICON.get(f.get('severity', ''), '•')} "
+                         f"{f.get('what')}\n  → {f.get('fix')}")
+            kaiten.comment(card_id, text)
+            hold(kaiten, card_id, BLOCK_QUESTION, "ревьювер вернул замечания к спеке")
+            log("  -> спека вернулась на правки")
+            return
+        kaiten.comment(card_id,
+                       f"{EPIC_MARK} **{SPEC_OK_LINE}** {review.get('summary', '')}\n\n"
+                       f"_ревью спеки, {format_meta(meta)}._" + format_joke(review))
+        log("  -> спека принята")
+        return
+
+    if phase == "decompose":
+        worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
+        prompt = epic_prompt(DECOMPOSE_TEMPLATE_PATH, card, card_url, repo_cfg, {
+            "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
+                                        for i in acceptance_items(card)),
+            "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{MAX_SUBTASKS}}": str(flow.get("max_subtasks", 5)),
+        })
+        if show_prompt(prompt, args, "декомпозиции"):
+            return
+        verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=DECOMPOSE_SCHEMA)
+        note_spend(meta)
+        log_phase(card_id, "decompose", verdict, meta)
+
+        items = [i for i in (verdict.get("subtasks") or []) if i.get("title")]
+        if verdict.get("status") != "ready" or not items:
+            kaiten.comment(card_id, comment_epic_unclear(verdict, meta, "разложить на сабтаски"))
+            hold(kaiten, card_id, BLOCK_QUESTION, "не смог разложить эпик на сабтаски")
+            return
+        create_subtasks(kaiten, cfg, flow, card, card_url, items, verdict, meta, args)
+        return
+
+    log(f"  фаза «{phase}» ничего не требует")
+
+
+def take_epic(kaiten: Kaiten, flow: dict, card: dict) -> None:
+    """Взяли эпик в работу — двигаем в колонку разработки, если он не там."""
+    target = flow.get("development_column_id")
+    if not target or card.get("column_id") == target:
+        return
+    log("  двигаю эпик в колонку разработки")
+    kaiten.move(card["id"], int(target))
+
+
+def close_epic(kaiten: Kaiten, flow: dict, card: dict) -> str:
+    """
+    Все сабтаски отревьюены — эпик уезжает на полноценное ревью.
+
+    Целевая колонка по умолчанию не задаётся, а вычисляется: «следующая после
+    разработки». Если её выставили в конфиге — уважаем конфиг.
+    """
+    card_id = card["id"]
+    target = flow.get("review_column_id")
+    if not target:
+        target = next_column_after(kaiten, card["board_id"],
+                                   int(flow["development_column_id"]))
+        if not target:
+            return "не понял, куда двигать эпик: справа от колонки разработки пусто"
+    # человек мог утащить эпик дальше сам — тогда не возвращаем его назад
+    if card.get("column_id") == target:
+        return ""
+    log(f"  все сабтаски отревьюены, двигаю эпик в колонку {target}")
+    kaiten.move(card_id, int(target))
+    return f"{EPIC_MARK} **Все сабтаски отревьюены.** Эпик уехал на ревью."
+
+
+def epic_card_url(kaiten: Kaiten, card: dict) -> str:
+    return kaiten.card_url(card)
+
+
+def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> int:
+    """
+    Фаза эпиков: по каждому определить, где он стоит, и сдвинуть на один шаг.
+
+    За прогон эпик продвигается максимум на одну фазу. Так дешевле и понятнее:
+    между фазами стоят гейты человека, и пытаться проскочить их пачкой смысла нет.
+    """
+    flow = epic_flow(cfg)
+    if not flow:
+        log("режим эпиков не настроен (нужна секция epic_flow) — пропускаю")
+        return 0
+
+    if only_card:
+        epics = [kaiten.card(only_card)]
+    else:
+        epics = pick_epics(kaiten, cfg, flow)
+        if not epics:
+            log("эпиков с рабочим тегом нет")
+            if not args.prompt_only:
+                write_status(epics_waiting=0)
+            return 0
+        limit = flow.get("max_epics_per_run", 1)
+        log(f"эпиков с тегом: {len(epics)}, беру {min(limit, len(epics))}")
+        epics = epics[:limit]
+
+    waiting = 0
+    for card in epics:
+        card_id = card["id"]
+        title = (card.get("title") or "").strip()
+        # чек-листы приезжают только в полной карточке, в выдаче по доске их нет
+        card = kaiten.card(card_id)
+        comments = kaiten.comments(card_id)
+
+        foreign = [b for b in kaiten.blockers(card_id) if not ours(b)]
+        if foreign:
+            log(f"#{card_id} «{title[:50]}» — чужой блокер: "
+                f"{foreign[0].get('reason', '')[:60]} — не трогаю")
+            waiting += 1
+            continue
+
+        phase = epic_phase(kaiten, cfg, flow, card, comments)
+        log(f"#{card_id} «{title[:50]}» — фаза: {EPIC_PHASE_LABELS.get(phase, phase)}")
+
+        if phase == "waiting_approval":
+            waiting += 1
+            continue
+
+        if not args.prompt_only:
+            write_status(card={"id": card_id, "title": title,
+                               "url": kaiten.card_url(card)},
+                         phase=f"эпик: {EPIC_PHASE_LABELS.get(phase, phase)}")
+
+        if phase == "closing":
+            note = close_epic(kaiten, flow, card)
+            if note:
+                kaiten.comment(card_id, note)
+            continue
+
+        if phase == "working":
+            # сабтаски разбираются обычными фазами работы и ревью по своему профилю
+            take_epic(kaiten, flow, card)
+            continue
+
+        if out_of_budget(cfg):
+            break
+
+        take_epic(kaiten, flow, card)
+        try:
+            advance_epic(kaiten, cfg, flow, card, comments, phase, args)
+        except FactoryError as e:
+            log(f"  !! фаза «{phase}» не удалась: {e}")
+
+    if not args.prompt_only:
+        write_status(card=None, phase=None, epics_waiting=waiting)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 
@@ -2095,6 +2827,11 @@ def main() -> int:
                         help="пропустить разведку инбокса")
     parser.add_argument("--triage-card", type=int,
                         help="разведать конкретную карточку инбокса по id")
+    parser.add_argument("--only-epics", action="store_true",
+                        help="только фаза эпиков: продвинуть их и выйти")
+    parser.add_argument("--no-epics", action="store_true", help="пропустить фазу эпиков")
+    parser.add_argument("--epic-card", type=int,
+                        help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
 
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -2121,6 +2858,10 @@ def main() -> int:
         return triage_inbox(kaiten, cfg, args, only_card=args.triage_card)
     if args.only_triage:
         return triage_inbox(kaiten, cfg, args)
+    if args.epic_card:
+        return run_epics(kaiten, cfg, args, only_card=args.epic_card)
+    if args.only_epics:
+        return run_epics(kaiten, cfg, args)
 
     # Разведка идёт первой: она дешёвая и быстрая, а на другом конце сидит человек,
     # который только что закинул карточку в инбокс и ждёт, что ему ответят.
@@ -2129,6 +2870,14 @@ def main() -> int:
             triage_inbox(kaiten, cfg, args)
         except Exception as e:  # noqa: BLE001 — чужая доска не должна ронять основной поток
             log(f"разведка инбокса не задалась: {e}")
+
+    # Эпики следующими: почти всегда это дешёвая проверка — висит ли наш блокер, все ли
+    # сабтаски отревьюены. Агент запускается, только когда фаза действительно сменилась.
+    if not (args.card or args.only_review or args.only_work or args.no_epics):
+        try:
+            run_epics(kaiten, cfg, args)
+        except Exception as e:  # noqa: BLE001 — чужая доска не должна ронять основной поток
+            log(f"фаза эпиков не задалась: {e}")
 
     # Ревью идёт раньше работы: оно разблокирует цикл — либо отдаёт карточку человеку,
     # либо кладёт её в «Правки», откуда исполнитель тут же её и подхватит.
@@ -2139,7 +2888,8 @@ def main() -> int:
             # отсмотрел и отдал человеку под блокером — вторые не наши
             to_review = [c for c in kaiten.cards_in_column(profile["board_id"],
                                                            role_column(profile, "agent_review"))
-                         if not blocked_by(kaiten, c["id"])]
+                         if not (profile.get("own_only") and not own_subtask(c))
+                         and not blocked_by(kaiten, c["id"])]
             where = f" ({profile['key']})" if len(profiles) > 1 else ""
             if not to_review:
                 log(f"в «Ревью агента»{where} пусто")

@@ -32,6 +32,9 @@ import sys
 import urllib.parse
 from pathlib import Path
 
+# Колонки с подколонками разбирает фабрика — держим это в одном месте
+from factory import column_label, flat_columns
+
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 EXAMPLE_PATH = ROOT / "config.example.json"
@@ -335,33 +338,6 @@ def provision_board(kaiten: Kaiten, space_id: int, title: str) -> dict:
     }
 
 
-def flat_columns(board: dict) -> list[dict]:
-    """
-    Все колонки доски одним списком, включая подколонки.
-
-    Подколонки Kaiten не отдаёт отдельным запросом: `GET /boards/{id}/columns` их не
-    показывает, а `GET /boards/{id}/columns/{id}` вообще 405. Единственное место, где
-    они лежат, — ключ `subcolumns` внутри колонок самой доски.
-
-    Карточки живут только в листьях: у колонки с подколонками своих карточек не бывает
-    (проверено на доске эпиков — в родительских колонках ноль). Поэтому родителей
-    в список не кладём, иначе в мастере можно выбрать колонку, в которую не попасть.
-    """
-    result = []
-    for column in sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0):
-        subs = sorted(column.get("subcolumns") or [], key=lambda c: c.get("sort_order") or 0)
-        if not subs:
-            result.append({**column, "path": column.get("title") or ""})
-            continue
-        for sub in subs:
-            result.append({**sub, "path": f"{column.get('title')} / {sub.get('title')}"})
-    return result
-
-
-def column_label(column: dict) -> str:
-    return f"{column.get('path') or column.get('title')}  (id {column['id']})"
-
-
 def match_columns(board: dict) -> dict:
     """Угадывает роли колонок по названиям. Что не угадалось — None."""
     columns = flat_columns(board)
@@ -465,7 +441,7 @@ def step_inbox(kaiten: Kaiten, space_id: int) -> dict | None:
 
 
 def step_epic(kaiten: Kaiten, space_id: int) -> dict | None:
-    head("5. Доска эпиков для техдолга (по желанию)")
+    head("5. Долг спринта (по желанию)")
     hint("Каждый спринт фабрика заводит одну карточку-эпик «Долг <даты спринта>» и")
     hint("вешает на неё дочерними всё, что сделала. Так поток видно в отчётах, и он")
     hint("не растворяется в отдельных карточках.")
@@ -519,8 +495,138 @@ def step_epic(kaiten: Kaiten, space_id: int) -> dict | None:
     return epic
 
 
+def ensure_review_column(kaiten: Kaiten, board: dict) -> int:
+    """
+    Колонка, куда сабтаска уезжает после PR. Если её нет — предлагаем создать: без неё
+    «отдал ревьюверу» и «взял в работу» это одна и та же колонка, и поток не различить.
+    """
+    columns = flat_columns(board)
+    hit = next((c for c in columns
+                if any(w in normalize(c.get("title")) for w in ("ревью", "review"))), None)
+    if hit:
+        ok(f"колонка ревью найдена: «{hit.get('path')}»")
+        return int(hit["id"])
+
+    hint("Колонки ревью на этой доске нет. Она нужна, чтобы отличать «агент дописал,")
+    hint("нужен ревьювер» от «карточка в работе».")
+    if ask_yes("Создать колонку «Ревью»?"):
+        # встаём сразу после рабочей колонки, чтобы поток читался слева направо
+        working = next((c for c in columns
+                        if "работ" in normalize(c.get("title"))), columns[0])
+        order = float(working.get("sort_order") or 1) + 0.125
+        created = kaiten.create_column(int(board["id"]), "Ревью", 2, order)
+        ok(f"колонка «Ревью» создана, id {created['id']}")
+        return int(created["id"])
+
+    hint("Тогда выбери, какую использовать вместо неё.")
+    column = choose(columns, "Номер колонки", column_label)
+    return int(column["id"])
+
+
+def step_epic_flow(kaiten: Kaiten, space_id: int, repo_name: str) -> dict | None:
+    head("6. Режим эпиков (по желанию)")
+    hint("Второй способ работы. Эпик с тегом проходит путь: приёмочные критерии")
+    hint("чек-листом → ты их апрувишь, сняв блокер → спека файлом в репозитории →")
+    hint("ревью спеки → сабтаски на своей доске → обычный поток по каждой →")
+    hint("эпик уезжает на полноценное ревью.")
+    if not ask_yes("Включить режим эпиков?", default=False):
+        hint("Пропускаем. Включить потом — секция epic_flow в config.json.")
+        return None
+
+    tag = ask("Тег, которым помечают эпики для фабрики", "claude:epic")
+
+    hint("\nНа какой доске лежат эпики?")
+    epic_board_raw = pick_board(kaiten, space_id, "Номер доски эпиков", allow_none=True)
+    if not epic_board_raw:
+        return None
+    epic_board = kaiten.board(int(epic_board_raw["id"]))
+    columns = flat_columns(epic_board)
+
+    hint("\nВ какую колонку фабрика двигает эпик, когда берёт его в работу?")
+    development = choose(columns, "Номер колонки", column_label)
+    ids = [int(c["id"]) for c in columns]
+    position = ids.index(int(development["id"]))
+    review_column_id = None
+    if position + 1 < len(ids):
+        following = columns[position + 1]
+        hint(f"\nКогда все сабтаски отревьюены, эпик уедет в «{following.get('path')}»")
+        hint("— это колонка сразу справа. ")
+        if not ask_yes("Так и оставить?"):
+            review_column_id = int(choose(columns, "Номер колонки", column_label)["id"])
+    else:
+        warn("справа от этой колонки колонок нет — выбери, куда двигать эпик")
+        review_column_id = int(choose(columns, "Номер колонки", column_label)["id"])
+
+    hint("\nНа какой доске жить сабтаскам?")
+    hint("Обычно это доска команды с задачами — мастер поищет её по названию.")
+    sub_board_raw = pick_board(kaiten, space_id, "Номер доски сабтасок", allow_none=True)
+    if not sub_board_raw:
+        return None
+    sub_board = kaiten.board(int(sub_board_raw["id"]))
+    sub_columns = flat_columns(sub_board)
+
+    review = ensure_review_column(kaiten, sub_board)
+    sub_board = kaiten.board(int(sub_board_raw["id"]))  # перечитываем: колонок стало больше
+    sub_columns = flat_columns(sub_board)
+    by_id = {int(c["id"]): c.get("path") for c in sub_columns}
+    guessed = match_columns(sub_board)
+
+    hint("\nОткуда фабрика берёт сабтаски в работу?")
+    queue = guessed.get("queue") or int(choose(sub_columns, "Номер колонки", column_label)["id"])
+    hint("\nКуда двигает, пока агент пишет код?")
+    working = guessed.get("in_progress") or int(
+        choose(sub_columns, "Номер колонки", column_label)["id"])
+    done = guessed.get("done")
+
+    # Ролей больше, чем колонок: правки возвращаются в рабочую, а «дальше человек»
+    # выражается блокером. Так доска команды остаётся читаемой.
+    columns_map = {
+        "queue": queue,
+        "in_progress": working,
+        "agent_review": review,
+        "fixes": working,
+        "review": review,
+        "question": working,
+        "failed": working,
+    }
+    if done:
+        columns_map["done"] = done
+
+    print()
+    for role, name, _, purpose in COLUMN_ROLES:
+        column_id = columns_map.get(role)
+        if column_id:
+            ok(f"{role:<13} → «{by_id.get(column_id, column_id)}»  \033[2m{purpose}\033[0m")
+        else:
+            hint(f"    {role:<13} не задана — обойдёмся блокером")
+
+    lanes = sub_board.get("lanes") or []
+    lane_id = int(lanes[0]["id"]) if lanes else None
+    if len(lanes) > 1:
+        lane = choose(lanes, "\nНомер дорожки для сабтасок",
+                      lambda l: f"{l.get('title') or '(без названия)'}  (id {l['id']})")
+        lane_id = int(lane["id"])
+
+    return {
+        "tag": tag,
+        "boards": [int(epic_board_raw["id"])],
+        "development_column_id": int(development["id"]),
+        "review_column_id": review_column_id,
+        "max_epics_per_run": 1,
+        "max_subtasks": 5,
+        "spec_dir": "specs",
+        "subtasks": {
+            "board_id": int(sub_board_raw["id"]),
+            "lane_id": lane_id,
+            "card_type_id": int(sub_board.get("default_card_type_id") or 1),
+            "repo": repo_name,
+            "columns": columns_map,
+        },
+    }
+
+
 def step_repo() -> tuple[str, dict]:
-    head("6. Репозиторий")
+    head("7. Репозиторий")
     hint("Фабрика не трогает твою рабочую копию: на каждую карточку она делает")
     hint("отдельный git worktree рядом с собой.")
     while True:
@@ -542,7 +648,7 @@ def step_repo() -> tuple[str, dict]:
 
 
 def step_project_files() -> None:
-    head("7. Правила проекта")
+    head("8. Правила проекта")
     hint("Промпты агентов держатся общими, а всё, что специфично для твоего проекта —")
     hint("какие файлы правил читать и на что смотреть на ревью — лежит в project/.")
     PROJECT_DIR.mkdir(exist_ok=True)
@@ -562,7 +668,8 @@ def step_project_files() -> None:
 
 
 def build_config(domain: str, space_id: int, work: dict, inbox: dict | None,
-                 epic: dict | None, repo_name: str, repo: dict) -> dict:
+                 epic: dict | None, repo_name: str, repo: dict,
+                 flow: dict | None = None) -> dict:
     """Собирает config.json: скелет берём из примера, чтобы не потерять комментарии."""
     config = json.loads(strip_jsonc(EXAMPLE_PATH.read_text(encoding="utf-8")))
     config["kaiten"].update({
@@ -580,9 +687,13 @@ def build_config(domain: str, space_id: int, work: dict, inbox: dict | None,
     else:
         config.pop("inbox", None)
     if epic:
-        config["epic"] = epic
+        config["sprint_debt"] = epic
     else:
-        config.pop("epic", None)
+        config.pop("sprint_debt", None)
+    if flow:
+        config["epic_flow"] = flow
+    else:
+        config.pop("epic_flow", None)
     return config
 
 
@@ -604,9 +715,10 @@ def wizard() -> int:
     inbox = step_inbox(kaiten, space_id)
     epic = step_epic(kaiten, space_id)
     repo_name, repo = step_repo()
+    flow = step_epic_flow(kaiten, space_id, repo_name)
     step_project_files()
 
-    config = build_config(domain, space_id, work, inbox, epic, repo_name, repo)
+    config = build_config(domain, space_id, work, inbox, epic, repo_name, repo, flow)
     CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n",
                            encoding="utf-8")
 
@@ -627,6 +739,84 @@ def wizard() -> int:
 def strip_jsonc(text: str) -> str:
     """В примере конфига есть //-комментарии, json их не ест."""
     return re.sub(r'^\s*//.*$', '', text, flags=re.MULTILINE)
+
+
+def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
+    """
+    Режим эпиков. Проверяем то, что молча ломается: доски эпиков, колонку разработки,
+    вычислимость колонки ревью и колонки доски сабтасок.
+    """
+    flow = config.get("epic_flow")
+    if not flow:
+        hint("  режим эпиков: выключен")
+        return 0
+
+    problems = 0
+    boards = flow.get("boards") or []
+    if not boards:
+        bad("режим эпиков: не указано ни одной доски в epic_flow.boards")
+        problems += 1
+    for board_id in boards:
+        try:
+            board = kaiten.board(int(board_id))
+            ok(f"эпики: «{board['title']}»")
+        except SetupError as e:
+            bad(f"эпики: доска {board_id} недоступна: {e}")
+            problems += 1
+
+    development = flow.get("development_column_id")
+    for board_id in boards:
+        try:
+            columns = flat_columns(kaiten.board(int(board_id)))
+        except SetupError:
+            continue
+        ids = [int(c["id"]) for c in columns]
+        if development and int(development) in ids:
+            position = ids.index(int(development))
+            titles = {int(c["id"]): c.get("path") for c in columns}
+            ok(f"колонка разработки → «{titles[int(development)]}»")
+            target = flow.get("review_column_id")
+            if target:
+                ok(f"колонка ревью эпика → «{titles.get(int(target), target)}»")
+            elif position + 1 < len(ids):
+                ok(f"колонка ревью эпика (вычислена) → «{titles[ids[position + 1]]}»")
+            else:
+                bad("справа от колонки разработки колонок нет — "
+                    "укажи epic_flow.review_column_id явно")
+                problems += 1
+            break
+    else:
+        if development:
+            bad(f"колонка разработки {development} не найдена ни на одной доске эпиков")
+            problems += 1
+
+    subtasks = flow.get("subtasks") or {}
+    if not subtasks.get("board_id"):
+        bad("режим эпиков: не указана доска сабтасок")
+        return problems + 1
+    try:
+        board = kaiten.board(int(subtasks["board_id"]))
+    except SetupError as e:
+        bad(f"доска сабтасок недоступна: {e}")
+        return problems + 1
+    ok(f"сабтаски: «{board['title']}»")
+    have = {int(c["id"]): c.get("path") for c in flat_columns(board)}
+    for role, name, _, _ in COLUMN_ROLES:
+        column_id = (subtasks.get("columns") or {}).get(role)
+        if not column_id:
+            # роли можно делить колонки, но эти три — точки, откуда фабрика берёт работу
+            if role in ("queue", "in_progress", "agent_review"):
+                bad(f"сабтаски: роль {role} ({name}) обязательна, но не указана")
+                problems += 1
+            else:
+                hint(f"    {role}: не указана — фабрика обойдётся блокером")
+            continue
+        if int(column_id) not in have:
+            bad(f"сабтаски: роль {role} — колонки {column_id} на доске нет")
+            problems += 1
+        else:
+            ok(f"{role:<13} → «{have[int(column_id)]}»")
+    return problems
 
 
 def check() -> int:
@@ -709,7 +899,10 @@ def check() -> int:
         bad(f"рабочая доска недоступна: {e}")
         problems += 1
 
-    for section, label in (("inbox", "инбокс"), ("epic", "доска эпиков")):
+    # долг спринта: секция переименована в sprint_debt, старое имя epic ещё работает
+    for section, label in (("inbox", "инбокс"),
+                           ("sprint_debt", "долг спринта"),
+                           ("epic", "долг спринта (старое имя секции)")):
         block = config.get(section)
         if not block:
             hint(f"  {label}: выключен")
@@ -720,6 +913,8 @@ def check() -> int:
         except SetupError as e:
             bad(f"{label} недоступен: {e}")
             problems += 1
+
+    problems += check_epic_flow(kaiten, config)
 
     head("Репозитории")
     for name, repo in (config.get("repos") or {}).items():

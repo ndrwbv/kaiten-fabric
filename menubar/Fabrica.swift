@@ -45,6 +45,7 @@ struct Status {
     var lastURL: String?
     var lastCost: Double?
     var inboxPending = 0
+    var epicsWaiting = 0
 }
 
 final class Fabrica: NSObject, NSApplicationDelegate {
@@ -239,6 +240,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         s.returning = json["returning"] as? Bool ?? false
         s.awaitingAnswer = (json["awaiting_answer"] as? NSNumber)?.intValue ?? 0
         s.inboxPending = (json["inbox_pending"] as? NSNumber)?.intValue ?? 0
+        s.epicsWaiting = (json["epics_waiting"] as? NSNumber)?.intValue ?? 0
         s.pid = (json["pid"] as? NSNumber)?.int32Value
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
@@ -302,6 +304,14 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             let item = action("В инбоксе не разобрано: \(status.inboxPending)",
                               #selector(openBoard))
             item.toolTip = "Карточки инбокса, до которых разведка ещё не дошла"
+            menu.addItem(item)
+        }
+
+        // Эпик в блокере не двигается сам и ничем о себе не напоминает: без этой
+        // строки он молча висит, пока кто-нибудь случайно не откроет доску.
+        if status.epicsWaiting > 0 {
+            let item = action("Эпики ждут тебя: \(status.epicsWaiting)", #selector(openBoard))
+            item.toolTip = "Сними блокер в карточке эпика — фабрика продолжит с того же места"
             menu.addItem(item)
         }
 
