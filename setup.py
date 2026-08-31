@@ -335,9 +335,36 @@ def provision_board(kaiten: Kaiten, space_id: int, title: str) -> dict:
     }
 
 
+def flat_columns(board: dict) -> list[dict]:
+    """
+    Все колонки доски одним списком, включая подколонки.
+
+    Подколонки Kaiten не отдаёт отдельным запросом: `GET /boards/{id}/columns` их не
+    показывает, а `GET /boards/{id}/columns/{id}` вообще 405. Единственное место, где
+    они лежат, — ключ `subcolumns` внутри колонок самой доски.
+
+    Карточки живут только в листьях: у колонки с подколонками своих карточек не бывает
+    (проверено на доске эпиков — в родительских колонках ноль). Поэтому родителей
+    в список не кладём, иначе в мастере можно выбрать колонку, в которую не попасть.
+    """
+    result = []
+    for column in sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0):
+        subs = sorted(column.get("subcolumns") or [], key=lambda c: c.get("sort_order") or 0)
+        if not subs:
+            result.append({**column, "path": column.get("title") or ""})
+            continue
+        for sub in subs:
+            result.append({**sub, "path": f"{column.get('title')} / {sub.get('title')}"})
+    return result
+
+
+def column_label(column: dict) -> str:
+    return f"{column.get('path') or column.get('title')}  (id {column['id']})"
+
+
 def match_columns(board: dict) -> dict:
     """Угадывает роли колонок по названиям. Что не угадалось — None."""
-    columns = sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0)
+    columns = flat_columns(board)
     guessed = {}
     for key, name, _, _ in COLUMN_ROLES:
         wanted = [normalize(name)] + COLUMN_SYNONYMS.get(key, [])
@@ -349,8 +376,8 @@ def match_columns(board: dict) -> dict:
 
 def confirm_columns(board: dict, guessed: dict) -> dict:
     """Показывает разложенные роли и даёт поправить руками."""
-    columns = sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0)
-    by_id = {int(c["id"]): c.get("title") for c in columns}
+    columns = flat_columns(board)
+    by_id = {int(c["id"]): c.get("path") for c in columns}
 
     print()
     for key, name, _, purpose in COLUMN_ROLES:
@@ -423,10 +450,10 @@ def step_inbox(kaiten: Kaiten, space_id: int) -> dict | None:
     if not chosen:
         return None
     board = kaiten.board(int(chosen["id"]))
-    columns = sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0)
+    columns = flat_columns(board)
     hint("\nИз какой колонки брать новые карточки?")
-    column = choose(columns, "Номер колонки", lambda c: f"{c.get('title')}  (id {c['id']})")
-    ok(f"инбокс: «{chosen['title']}» → «{column.get('title')}»")
+    column = choose(columns, "Номер колонки", column_label)
+    ok(f"инбокс: «{chosen['title']}» → «{column.get('path')}»")
     return {
         "board_id": int(chosen["id"]),
         "column_id": int(column["id"]),
@@ -450,9 +477,9 @@ def step_epic(kaiten: Kaiten, space_id: int) -> dict | None:
     if not chosen:
         return None
     board = kaiten.board(int(chosen["id"]))
-    columns = sorted(board.get("columns") or [], key=lambda c: c.get("sort_order") or 0)
+    columns = flat_columns(board)
     hint("\nВ какой колонке держать карточку долга?")
-    column = choose(columns, "Номер колонки", lambda c: f"{c.get('title')}  (id {c['id']})")
+    column = choose(columns, "Номер колонки", column_label)
 
     lanes = board.get("lanes") or []
     lane_id = int(lanes[0]["id"]) if lanes else None
@@ -665,8 +692,9 @@ def check() -> int:
     try:
         board = kaiten.board(int(config["kaiten"]["board_id"]))
         ok(f"рабочая доска «{board['title']}»")
-        have = {int(c["id"]) for c in board.get("columns") or []}
-        titles = {int(c["id"]): c.get("title") for c in board.get("columns") or []}
+        columns = flat_columns(board)
+        have = {int(c["id"]) for c in columns}
+        titles = {int(c["id"]): c.get("path") for c in columns}
         for key, name, _, _ in COLUMN_ROLES:
             column_id = config["kaiten"]["columns"].get(key)
             if not column_id:
@@ -912,10 +940,9 @@ def main() -> int:
             "id": board["id"],
             "title": board["title"],
             "default_card_type_id": board.get("default_card_type_id"),
-            "columns": [{"id": c["id"], "title": c.get("title"), "type": c.get("type"),
-                         "sort_order": c.get("sort_order")}
-                        for c in sorted(board.get("columns") or [],
-                                        key=lambda c: c.get("sort_order") or 0)],
+            "columns": [{"id": c["id"], "title": c.get("title"), "path": c.get("path"),
+                         "type": c.get("type"), "sort_order": c.get("sort_order")}
+                        for c in flat_columns(board)],
             "lanes": [{"id": l["id"], "title": l.get("title")}
                       for l in board.get("lanes") or []],
             "guessed_columns": match_columns(board),
@@ -925,7 +952,7 @@ def main() -> int:
             print(f"\n{d['title']}  (id {d['id']})\n")
             print("  колонки:")
             for c in d["columns"]:
-                print(f"    {c['id']:>10}  {c['title']}")
+                print(f"    {c['id']:>10}  {c['path']}")
             print("\n  дорожки:")
             for l in d["lanes"]:
                 print(f"    {l['id']:>10}  {l['title'] or '(без названия)'}")

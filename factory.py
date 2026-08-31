@@ -408,10 +408,171 @@ class Kaiten:
     def add_child(self, parent_id: int, child_id: int) -> None:
         self._write("POST", f"/cards/{parent_id}/children", {"card_id": child_id})
 
+    def blockers(self, card_id: int) -> list:
+        """
+        Только действующие блокеры.
+
+        Снятый блокер Kaiten не удаляет, а помечает `released: true`, и он остаётся
+        в выдаче навсегда. Проверка на непустой список заблокировала бы карточку
+        насовсем после первого же снятия.
+        """
+        found = self._request("GET", f"/cards/{card_id}/blockers") or []
+        return [b for b in found if not b.get("released")]
+
+    def block(self, card_id: int, reason: str) -> None:
+        self._write("POST", f"/cards/{card_id}/blockers", {"reason": reason})
+
+    def unblock(self, card_id: int, blocker_id: int) -> None:
+        self._write("DELETE", f"/cards/{card_id}/blockers/{blocker_id}")
+
+    def add_checklist(self, card_id: int, name: str, items: list[str]) -> dict | None:
+        """Чек-лист целиком: сам список и пункты по одному, отдельными запросами."""
+        created = self._write("POST", f"/cards/{card_id}/checklists", {"name": name})
+        if not created:
+            return None
+        for text in items:
+            self._write("POST", f"/cards/{card_id}/checklists/{created['id']}/items",
+                        {"text": text, "checked": False})
+        return created
+
     def card_url(self, card: dict) -> str:
         # в ответе /cards/{id} space_id не приходит, поэтому берём его из конфига
         space = card.get("space_id") or (card.get("board") or {}).get("space_id") or self.space_id
         return f"https://{self.domain}/space/{space}/boards/card/{card['id']}"
+
+
+# --------------------------------------------------------------------------- #
+# блокеры: как фабрика говорит «дальше ход человека»
+# --------------------------------------------------------------------------- #
+
+# Свои блокеры узнаём по префиксу: на карточке может висеть и человеческий блокер,
+# и его снимать нельзя. Свои фабрика тоже не снимает — их снимает человек, и именно
+# это снятие означает «продолжай». Другого признака апрува у нас нет: и агент,
+# и человек пишут под одним токеном, по автору их не различить.
+BLOCK_MARK = "🤖"
+
+BLOCK_QUESTION = "не хватило данных, ответь в комментариях"
+BLOCK_FAILED = "прогон сломался, нужен человек"
+BLOCK_HUMAN_REVIEW = "ревью агента пройдено, нужен человек"
+BLOCK_ACCEPTANCE = "жду апрува приёмочных критериев"
+BLOCK_ROLLOUT = "нельзя раскатывать до релиза бека"
+
+
+def block_reason(kind: str, detail: str = "") -> str:
+    text = f"{BLOCK_MARK} {kind}"
+    return f"{text}: {detail}" if detail else text
+
+
+def ours(blocker: dict) -> bool:
+    return str(blocker.get("reason") or "").startswith(BLOCK_MARK)
+
+
+def blocked_by(kaiten: Kaiten, card_id: int) -> str | None:
+    """Причина, по которой карточку сейчас трогать нельзя. None — путь свободен."""
+    for blocker in kaiten.blockers(card_id):
+        return str(blocker.get("reason") or "заблокирована")
+    return None
+
+
+def hold(kaiten: Kaiten, card_id: int, kind: str, detail: str = "") -> None:
+    """
+    Вешает блокер, если такого ещё нет.
+
+    Идемпотентность здесь обязательна: прогон повторяется каждый час, и без проверки
+    на карточке за сутки выросла бы стопка одинаковых блокеров.
+    """
+    reason = block_reason(kind, detail)
+    if any(str(b.get("reason") or "") == reason for b in kaiten.blockers(card_id)):
+        log(f"  блокер уже висит: {kind}")
+        return
+    log(f"  вешаю блокер: {kind}")
+    kaiten.block(card_id, reason)
+
+
+# --------------------------------------------------------------------------- #
+# профиль доски
+# --------------------------------------------------------------------------- #
+
+# Роли колонок, без которых поток некуда вести.
+REQUIRED_ROLES = ("queue", "in_progress", "agent_review")
+
+# Колонки, из которых фабрика забирает карточки сама. Если роль «дальше человек»
+# указывает в одну из них, одного движения мало: без блокера следующий прогон
+# подберёт карточку снова и цикл пойдёт по кругу.
+ACTIVE_ROLES = ("queue", "in_progress", "agent_review")
+
+# Роли, означающие «дальше человек». На доске со своей колонкой под каждую роль всё
+# видно и так, и блокер не нужен. На чужой доске колонок меньше, роли делят их между
+# собой — там блокер и есть единственный способ сказать, чей сейчас ход.
+HANDOFF_BLOCKERS = {
+    "question": BLOCK_QUESTION,
+    "failed": BLOCK_FAILED,
+    "review": BLOCK_HUMAN_REVIEW,
+}
+
+
+def make_profile(key: str, board: dict, repo_key: str | None = None,
+                 attach_to_debt: bool = True) -> dict:
+    columns = {role: value for role, value in (board.get("columns") or {}).items() if value}
+    missing = [role for role in REQUIRED_ROLES if not columns.get(role)]
+    if missing:
+        raise FactoryError(f"профиль «{key}»: нет обязательных колонок {', '.join(missing)}")
+    return {
+        "key": key,
+        "board_id": board["board_id"],
+        "columns": columns,
+        "lane_id": board.get("lane_id"),
+        "card_type_id": board.get("card_type_id"),
+        "repo": repo_key,
+        "attach_to_debt": attach_to_debt,
+    }
+
+
+def board_profiles(cfg: dict) -> list[dict]:
+    """
+    Доски, по которым ходят исполнитель и ревьювер.
+
+    Рабочая доска есть всегда. Доска сабтасок появляется, когда включён режим эпиков:
+    у неё и колонки другие, и репозиторий может быть другой.
+    """
+    profiles = [make_profile("работа", cfg["kaiten"])]
+    subtasks = ((cfg.get("epic_flow") or {}).get("subtasks") or {})
+    if subtasks.get("board_id"):
+        # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
+        # только раздует описание долга, поэтому туда её не привязываем
+        profiles.append(make_profile("сабтаски", subtasks, subtasks.get("repo"),
+                                     attach_to_debt=False))
+    return profiles
+
+
+def role_column(profile: dict, role: str) -> int | None:
+    return profile["columns"].get(role)
+
+
+def needs_blocker(profile: dict, role: str) -> bool:
+    """
+    Нужно ли к движению добавить блокер.
+
+    Нужно, если колонки под роль нет вовсе или она совпадает с колонкой, откуда
+    фабрика сама берёт карточки: иначе «отдал человеку» ничем не отличается от
+    «готово к работе», и карточка вернётся в цикл следующим же прогоном.
+    """
+    target = role_column(profile, role)
+    if not target:
+        return True
+    return any(target == role_column(profile, active) for active in ACTIVE_ROLES)
+
+
+def hand_over(kaiten: Kaiten, profile: dict, card_id: int, role: str,
+              detail: str = "") -> None:
+    """Отдаёт карточку человеку: двигает, если есть куда, и вешает блокер, если надо."""
+    target = role_column(profile, role)
+    if target:
+        kaiten.move(card_id, target)
+    kind = HANDOFF_BLOCKERS.get(role)
+    if kind and needs_blocker(profile, role):
+        hold(kaiten, card_id, kind, detail)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -696,6 +857,30 @@ def extract_verdict(payload: dict, key: str = "status"):
 # отчёты в карточку
 # --------------------------------------------------------------------------- #
 
+# Сколько прогон уже потратил. Бюджеты в конфиге — на одного агента, а прогон
+# запускает их десятками: без общего потолка один жадный эпик съедает всё, что
+# отведено на день. Считаем по факту, из meta самого агента.
+SPENT = {"usd": 0.0}
+
+
+def note_spend(meta: dict | None) -> None:
+    SPENT["usd"] += float((meta or {}).get("cost_usd") or 0.0)
+
+
+def budget_left(cfg: dict) -> float | None:
+    """Сколько ещё можно потратить. None — потолок не задан."""
+    cap = cfg.get("max_spend_per_run")
+    return None if not cap else max(0.0, float(cap) - SPENT["usd"])
+
+
+def out_of_budget(cfg: dict) -> bool:
+    left = budget_left(cfg)
+    if left is None or left > 0:
+        return False
+    log(f"потолок расхода на прогон исчерпан (${SPENT['usd']:.2f}) — дальше не берём")
+    return True
+
+
 def format_meta(meta: dict) -> str:
     bits = []
     if meta.get("duration_ms"):
@@ -750,9 +935,14 @@ def comment_failed(reason: str) -> str:
 # обработка одной карточки
 # --------------------------------------------------------------------------- #
 
-def resolve_repo(card: dict, cfg: dict) -> tuple[str, dict]:
-    """В описании можно переопределить репозиторий строкой `repo: <ключ>`."""
-    key = cfg["default_repo"]
+def resolve_repo(card: dict, cfg: dict, default_key: str | None = None) -> tuple[str, dict]:
+    """
+    В описании можно переопределить репозиторий строкой `repo: <ключ>`.
+
+    Без неё берётся репозиторий профиля (у доски сабтасок он может быть свой),
+    а если и его нет — default_repo из конфига.
+    """
+    key = default_key if default_key in (cfg.get("repos") or {}) else cfg["default_repo"]
     match = re.search(r"^\s*repo:\s*([\w.-]+)\s*$",
                       strip_html(card.get("description")) or "", re.MULTILINE | re.IGNORECASE)
     if match and match.group(1) in cfg["repos"]:
@@ -1013,7 +1203,31 @@ def skip_hands_off(kaiten: Kaiten, cards: list, cfg: dict) -> list:
     return allowed
 
 
-def pick_cards(kaiten: Kaiten, cfg: dict) -> list:
+def fix_round_cards(kaiten: Kaiten, profile: dict) -> list:
+    """
+    Карточки, которым ревьювер вернул замечания.
+
+    Если у доски есть своя колонка «Правки» — всё просто, берём её. Если нет (а на
+    чужой доске её обычно нет), ревьювер возвращает карточку в рабочую колонку, и
+    отличить её от карточки в работе можно только по переписке: последнее слово
+    осталось за ревьювером.
+    """
+    fixes_column = role_column(profile, "fixes")
+    in_progress = role_column(profile, "in_progress")
+    if fixes_column and fixes_column != in_progress:
+        return kaiten.cards_in_column(profile["board_id"], fixes_column)
+
+    found = []
+    for card in kaiten.cards_in_column(profile["board_id"], in_progress):
+        if blocked_by(kaiten, card["id"]):
+            continue
+        texts = [strip_html(c.get("text", "")) for c in kaiten.comments(card["id"])]
+        if texts and texts[-1].startswith(REVIEWER_MARK):
+            found.append(card)
+    return found
+
+
+def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     """
     Что берём в работу:
       1. всё из «Очереди»;
@@ -1022,10 +1236,15 @@ def pick_cards(kaiten: Kaiten, cfg: dict) -> list:
     Отличить ответ человека от вопроса агента по автору нельзя (пишем одним токеном),
     поэтому смотрим на метку AGENT_MARK: последний комментарий не агентский → ответили.
     """
-    board_id = cfg["kaiten"]["board_id"]
-    cols = cfg["kaiten"]["columns"]
+    board_id = profile["board_id"]
+    cols = profile["columns"]
     answered, waiting = [], 0
-    for card in kaiten.cards_in_column(board_id, cols["question"]):
+    for card in kaiten.cards_in_column(board_id, cols.get("question") or 0):
+        # заблокированную карточку не берём, даже если человек уже ответил: блокер
+        # снимает он же, и пока он висит — это его ход, а не наш
+        if blocked_by(kaiten, card["id"]):
+            waiting += 1
+            continue
         history = kaiten.comments(card["id"])
         last = strip_html(history[-1].get("text", "")) if history else ""
         if history and not last.startswith(AGENT_MARKS):
@@ -1040,13 +1259,14 @@ def pick_cards(kaiten: Kaiten, cfg: dict) -> list:
     # человечек в меню-баре по этому числу решает, вопрошать ему или спать
     write_status(awaiting_answer=waiting)
 
-    fixes = kaiten.cards_in_column(board_id, cols["fixes"])
+    fixes = fix_round_cards(kaiten, profile)
     if fixes:
         log(f"в «Правках» {len(fixes)}: {', '.join('#' + str(c['id']) for c in fixes)}")
     # правки вперёд: PR уже открыт, домучить его дешевле, чем начинать новую задачу.
     # потом отвеченные вопросы — человек только что написал, ему нужен быстрый отклик
     queue = kaiten.cards_in_column(board_id, cols["queue"])
-    return skip_hands_off(kaiten, fixes + answered + queue, cfg)
+    picked = skip_hands_off(kaiten, fixes + answered + queue, cfg)
+    return [c for c in picked if not blocked_by(kaiten, c["id"])]
 
 
 # --------------------------------------------------------------------------- #
@@ -1120,9 +1340,8 @@ def post_pr_review(worktree: Path, pr_url: str, body: str) -> None:
         os.unlink(handle.name)
 
 
-def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
+def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> None:
     card_id = card_stub["id"]
-    cols = cfg["kaiten"]["columns"]
     reviewer_cfg = cfg["reviewer"]
     max_rounds = reviewer_cfg.get("max_rounds", 3)
 
@@ -1133,7 +1352,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
         return
-    _, repo_cfg = resolve_repo(card, cfg)
+    _, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
     worktree = WORKTREES / f"review-{card_id}"
     title = (card.get("title") or "").strip()
@@ -1148,7 +1367,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
             return
         kaiten.comment(card_id, f"{REVIEWER_MARK} **Ревьювить нечего:** запушенной ветки "
                                 f"`{cfg['pr']['branch_prefix']}{card_id}*` нет.")
-        kaiten.move(card_id, cols["failed"])
+        hand_over(kaiten, profile, card_id, "failed", "запушенной ветки нет")
         log("  -> Упало (ветки нет)")
         return
 
@@ -1156,7 +1375,8 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
     if round_number > max_rounds and not args.prompt_only:
         kaiten.comment(card_id, f"{REVIEWER_MARK} **Ревью не сошлось за {max_rounds} круга.** "
                                 f"Дальше нужен человек — смотри замечания выше.")
-        kaiten.move(card_id, cols["review"])
+        hand_over(kaiten, profile, card_id, "review",
+                  f"ревью не сошлось за {max_rounds} круга")
         log(f"  -> На ревью (исчерпаны {max_rounds} круга)")
         return
 
@@ -1187,6 +1407,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
         log(f"  ревьювер смотрит {branch} (круг {round_number}/{max_rounds})")
         review, meta = run_agent(prompt, worktree, reviewer_cfg,
                                  schema=REVIEW_SCHEMA, verdict_key="verdict")
+        note_spend(meta)
 
         LOGS.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -1207,11 +1428,13 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
             post_pr_review(worktree, pr_url, body)
 
         if needs_changes:
-            kaiten.move(card_id, cols["fixes"])
+            # правки идут в рабочую колонку: агент подхватит карточку следующим прогоном
+            kaiten.move(card_id, role_column(profile, "fixes")
+                        or role_column(profile, "in_progress"))
             finish_status(card_id, title, "правки", meta)
             log("  -> Правки")
         else:
-            kaiten.move(card_id, cols["review"])
+            hand_over(kaiten, profile, card_id, "review")
             finish_status(card_id, title, "ревью пройдено", meta, pr_url)
             log("  -> На ревью (человеку)")
 
@@ -1219,7 +1442,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
         log(f"  !! {e}")
         if not args.prompt_only:
             kaiten.comment(card_id, comment_failed(str(e)))
-            kaiten.move(card_id, cols["failed"])
+            hand_over(kaiten, profile, card_id, "failed", str(e)[:120])
             finish_status(card_id, title, "упало на ревью", None)
             log("  -> Упало")
     finally:
@@ -1232,7 +1455,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
 def link_review_cards(kaiten: Kaiten, cfg: dict, dry_run: bool) -> int:
     """Разовая операция: привязать всё, что уже висит в «На ревью», к долгу спринта."""
     cards = kaiten.cards_in_column(cfg["kaiten"]["board_id"],
-                                   cfg["kaiten"]["columns"]["review"])
+                                   cfg["kaiten"]["columns"]["review"])  # только рабочая доска
     if not cards:
         log("в «На ревью» пусто")
         return 0
@@ -1243,9 +1466,21 @@ def link_review_cards(kaiten: Kaiten, cfg: dict, dry_run: bool) -> int:
     return 0
 
 
-def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
+def fix_round(kaiten: Kaiten, profile: dict, card: dict, comments: list) -> bool:
+    """
+    Правки после ревью: карточка либо лежит в своей колонке «Правки», либо (когда
+    такой колонки на доске нет) стоит в рабочей, а последнее слово за ревьювером.
+    """
+    fixes_column = role_column(profile, "fixes")
+    if fixes_column and fixes_column != role_column(profile, "in_progress"):
+        return card.get("column_id") == fixes_column
+    texts = [strip_html(c.get("text", "")) for c in comments]
+    return bool(texts) and texts[-1].startswith(REVIEWER_MARK)
+
+
+def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> None:
     card_id = card_stub["id"]
-    cols = cfg["kaiten"]["columns"]
+    cols = profile["columns"]
     card = kaiten.card(card_id)
     card_url = kaiten.card_url(card)
     comments = kaiten.comments(card_id)
@@ -1253,13 +1488,13 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
         return
-    repo_key, repo_cfg = resolve_repo(card, cfg)
+    repo_key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
     worktree = WORKTREES / f"card-{card_id}"
 
     # откуда пришла карточка: ответ на вопрос или правки после ревью
-    returning = card.get("column_id") == cols["question"]
-    fixing = card.get("column_id") == cols["fixes"]
+    returning = bool(cols.get("question")) and card.get("column_id") == cols["question"]
+    fixing = fix_round(kaiten, profile, card, comments)
     title = (card.get("title") or "").strip()
 
     if not (repo / ".git").exists():
@@ -1302,6 +1537,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
         write_status(phase="агент работает")
         started = time.time()
         verdict, meta = run_agent(prompt, worktree, cfg["agent"])
+        note_spend(meta)
         log(f"  агент вернулся за {round(time.time() - started)}с, "
             f"status={verdict.get('status')} {format_meta(meta)}")
 
@@ -1327,7 +1563,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
                     + verdict.get("summary", "")
                 )
             kaiten.comment(card_id, comment_question(verdict, meta))
-            kaiten.move(card_id, cols["question"])
+            hand_over(kaiten, profile, card_id, "question")
             finish_status(card_id, title, "вопрос", meta)
             log("  -> Вопрос от агента (изменений нет)")
             return
@@ -1338,7 +1574,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
                 comment_question(verdict, meta)
                 + f"\n\n_Незапушенные наработки остались в локальной ветке `{branch}`._",
             )
-            kaiten.move(card_id, cols["question"])
+            hand_over(kaiten, profile, card_id, "question")
             finish_status(card_id, title, "вопрос", meta)
             log(f"  -> Вопрос от агента (status={status}, коммиты не пушим)")
             return
@@ -1358,8 +1594,10 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
             pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
                              verdict, cfg["pr"], args.dry_run)
 
-        write_status(phase="привязываю к долгу спринта")
-        epic_note = attach_to_debt_card(kaiten, cfg, card_id, args.dry_run)
+        epic_note = ""
+        if profile.get("attach_to_debt"):
+            write_status(phase="привязываю к долгу спринта")
+            epic_note = attach_to_debt_card(kaiten, cfg, card_id, args.dry_run)
 
         text = comment_success(verdict, meta, pr_url, branch)
         if dirty:
@@ -1379,7 +1617,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args) -> None:
         if args.prompt_only:
             return
         kaiten.comment(card_id, comment_failed(str(e)))
-        kaiten.move(card_id, cols["failed"])
+        hand_over(kaiten, profile, card_id, "failed", str(e)[:120])
         finish_status(card_id, title, "упало", None)
         log("  -> Упало")
     finally:
@@ -1728,6 +1966,7 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
 
     write_status(phase="разведка инбокса")
     verdict, meta = run_agent(prompt, worktree, cfg["triager"], schema=TRIAGE_SCHEMA)
+    note_spend(meta)
 
     LOGS.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -1817,6 +2056,23 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
 # main
 # --------------------------------------------------------------------------- #
 
+def profile_for_card(kaiten: Kaiten, profiles: list[dict], card_id: int) -> dict:
+    """
+    Какому профилю принадлежит карточка, вызванная руками через --card.
+
+    Досок теперь может быть две, и колонки у них разные: подставить чужой профиль
+    значит увезти карточку в колонку соседней доски.
+    """
+    if len(profiles) == 1:
+        return profiles[0]
+    board_id = (kaiten.card(card_id) or {}).get("board_id")
+    for profile in profiles:
+        if profile["board_id"] == board_id:
+            return profile
+    log(f"#{card_id} лежит на доске {board_id}, профиля для неё нет — беру «{profiles[0]['key']}»")
+    return profiles[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Kaiten -> Claude Code -> PR")
     parser.add_argument("--dry-run", action="store_true",
@@ -1854,8 +2110,9 @@ def main() -> int:
     if args.dry_run:
         log("DRY-RUN: Kaiten и GitHub не трогаем, агент отработает по-настоящему")
 
-    board_id = cfg["kaiten"]["board_id"]
-    cols = cfg["kaiten"]["columns"]
+    profiles = board_profiles(cfg)
+    if len(profiles) > 1:
+        log("досок в работе: " + ", ".join(f"«{p['key']}»" for p in profiles))
 
     if args.link_review:
         return link_review_cards(kaiten, cfg, args.dry_run)
@@ -1876,46 +2133,64 @@ def main() -> int:
     # Ревью идёт раньше работы: оно разблокирует цикл — либо отдаёт карточку человеку,
     # либо кладёт её в «Правки», откуда исполнитель тут же её и подхватит.
     if not args.card and not args.only_work:
-        to_review = kaiten.cards_in_column(board_id, cols["agent_review"])
-        if to_review:
-            limit = args.limit if args.limit is not None else cfg.get("max_cards_per_run", 2)
-            log(f"в «Ревью агента» {len(to_review)} карточек, беру {min(limit, len(to_review))}")
+        limit = args.limit if args.limit is not None else cfg.get("max_cards_per_run", 2)
+        for profile in profiles:
+            # в колонке ревью лежат и карточки, ждущие агента, и те, что он уже
+            # отсмотрел и отдал человеку под блокером — вторые не наши
+            to_review = [c for c in kaiten.cards_in_column(profile["board_id"],
+                                                           role_column(profile, "agent_review"))
+                         if not blocked_by(kaiten, c["id"])]
+            where = f" ({profile['key']})" if len(profiles) > 1 else ""
+            if not to_review:
+                log(f"в «Ревью агента»{where} пусто")
+                continue
+            log(f"в «Ревью агента»{where} {len(to_review)} карточек, "
+                f"беру {min(limit, len(to_review))}")
             for card in to_review[:limit]:
+                if out_of_budget(cfg):
+                    break
                 try:
-                    review_card(card, kaiten, cfg, args)
+                    review_card(card, kaiten, cfg, args, profile)
                 except FactoryError as e:
                     log(f"#{card['id']} ревью не удалось начать: {e}")
-        else:
-            log("в «Ревью агента» пусто")
 
     if args.only_review:
         write_status(card=None, phase=None)
         return 0
 
+    limit = args.limit if args.limit is not None else cfg.get("max_cards_per_run", 2)
+
     if args.card:
-        cards = [{"id": args.card}]
+        # карточку по номеру ищем среди досок: она может лежать и на доске сабтасок
+        profile = profile_for_card(kaiten, profiles, args.card)
+        work = [(profile, [{"id": args.card}])]
+        pending = 1
     else:
-        stuck = kaiten.cards_in_column(board_id, cols["in_progress"])
-        if stuck:
-            log(f"в «В работе» висит {len(stuck)} карточек: "
-                f"{', '.join('#' + str(c['id']) for c in stuck)} — их фабрика не трогает")
-        cards = pick_cards(kaiten, cfg)
-        limit = args.limit if args.limit is not None else cfg.get("max_cards_per_run", 2)
-        if not cards:
-            log("брать нечего")
+        work, pending = [], 0
+        for profile in profiles:
+            cards = pick_cards(kaiten, cfg, profile)
+            pending += len(cards)
+            where = f" ({profile['key']})" if len(profiles) > 1 else ""
+            if not cards:
+                log(f"брать нечего{where}")
+                continue
+            log(f"к работе{where} {len(cards)} карточек, беру {min(limit, len(cards))}")
+            work.append((profile, cards[:limit]))
+        if not work:
             if not args.prompt_only:
                 write_status(card=None, phase=None, queue=0)
             return 0
-        log(f"к работе {len(cards)} карточек, беру {min(limit, len(cards))}")
         if not args.prompt_only:
-            write_status(queue=len(cards))
-        cards = cards[:limit]
+            write_status(queue=pending)
 
-    for card in cards:
-        try:
-            process(card, kaiten, cfg, args)
-        except FactoryError as e:
-            log(f"#{card['id']} не удалось даже начать: {e}")
+    for profile, cards in work:
+        for card in cards:
+            if out_of_budget(cfg):
+                break
+            try:
+                process(card, kaiten, cfg, args, profile)
+            except FactoryError as e:
+                log(f"#{card['id']} не удалось даже начать: {e}")
     if not args.prompt_only:
         write_status(card=None, phase=None)
     return 0
