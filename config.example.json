@@ -1,0 +1,132 @@
+{
+  "//": "Пример конфига. Рабочий config.json собирает `python3 setup.py` — он находит id досок и колонок сам. Руками правят обычно только модели, бюджеты и allowed_tools.",
+
+  "kaiten": {
+    "domain": "company.kaiten.ru",
+    "space_id": 0,
+    "board_id": 0,
+
+    "//lane": "дорожка и тип карточки нужны, когда разведчик сам ставит задачу на рабочую доску",
+    "lane_id": 0,
+    "card_type_id": 1,
+
+    "//columns": "поток карточки. Названия колонок могут быть любыми, важны только id и роли",
+    "columns": {
+      "queue": 0,
+      "in_progress": 0,
+      "question": 0,
+      "failed": 0,
+      "agent_review": 0,
+      "fixes": 0,
+      "review": 0,
+      "done": 0
+    }
+  },
+
+  "//inbox": "Необязательная секция. Доска с сырым потоком задач от команды: разведчик читает новые карточки и пишет комментарий, о чём задача и хватает ли данных. Карточки не двигает и не правит. Убери секцию — разведка выключится.",
+  "inbox": {
+    "board_id": 0,
+    "column_id": 0,
+    "max_cards_per_run": 3,
+    "max_rounds": 2,
+    "max_fails": 2,
+    "create_cards": true
+  },
+
+  "//stop_phrases": "фраза в карточке (заголовок, описание, комментарий) выключает по ней всех агентов",
+  "stop_phrases": [
+    "клод не трогай", "не трогай клод", "клод не бери", "не для клода",
+    "claude не трогай", "не трогай claude"
+  ],
+
+  "default_repo": "myrepo",
+  "repos": {
+    "myrepo": {
+      "path": "~/work/myrepo",
+      "remote": "origin",
+      "base_branch": "main"
+    }
+  },
+
+  "//env": "переменные, которые надо пробросить агенту: без них в некоторых проектах не встанут зависимости. Значения берутся из окружения или из ~/.zshrc, в конфиге только имена.",
+  "pass_env": [],
+
+  "agent": {
+    "model": "claude-opus-5",
+    "effort": "high",
+    "permission_mode": "acceptEdits",
+    "max_budget_usd": 5.0,
+    "timeout_sec": 2700,
+
+    "//allowed_tools": "главный предохранитель: агент может звать только это. Голого Bash здесь нет намеренно — карточку пишет человек, а команды из неё исполняет агент. Под свой стек поменяй строки сборки и тестов.",
+    "allowed_tools": [
+      "Read", "Grep", "Glob", "Edit", "Write", "TodoWrite", "Task", "Skill",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)",
+      "Bash(git commit:*)", "Bash(git log:*)", "Bash(git show:*)",
+      "Bash(git restore:*)", "Bash(git checkout --:*)",
+      "Bash(yarn:*)", "Bash(npx tsc:*)", "Bash(node:*)",
+      "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet format:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+      "Bash(wc:*)", "Bash(find:*)", "Bash(rg:*)", "Bash(grep:*)"
+    ]
+  },
+
+  "reviewer": {
+    "model": "claude-opus-5",
+    "effort": "high",
+    "permission_mode": "acceptEdits",
+    "max_budget_usd": 3.0,
+    "timeout_sec": 1800,
+    "max_rounds": 3,
+    "post_to_pr": true,
+
+    "//allowed_tools": "без Edit и Write: ревьювер не правит код",
+    "allowed_tools": [
+      "Read", "Grep", "Glob", "TodoWrite", "Task", "Skill",
+      "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+      "Bash(wc:*)", "Bash(find:*)", "Bash(rg:*)", "Bash(grep:*)"
+    ]
+  },
+
+  "triager": {
+    "model": "claude-opus-5",
+    "effort": "high",
+    "permission_mode": "acceptEdits",
+    "max_budget_usd": 2.5,
+    "timeout_sec": 900,
+
+    "//allowed_tools": "только чтение: ни Edit, ни Write, ни установки зависимостей",
+    "allowed_tools": [
+      "Read", "Grep", "Glob", "TodoWrite",
+      "Bash(git log:*)", "Bash(git show:*)", "Bash(git diff:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+      "Bash(wc:*)", "Bash(find:*)", "Bash(rg:*)", "Bash(grep:*)"
+    ]
+  },
+
+  "pr": {
+    "draft": true,
+    "branch_prefix": "ai/card-"
+  },
+
+  "//epic": "Необязательная секция. Раз в спринт заводится карточка «Долг <даты>», и всё сделанное вешается на неё дочерними. Убери секцию — привязки не будет.",
+  "epic": {
+    "board_id": 0,
+    "lane_id": 0,
+    "development_column_id": 0,
+    "card_type_id": 1,
+    "title_prefix": "Долг ",
+
+    "//sprint": "любой первый день спринта: от него отсчитываются даты в названии карточки",
+    "sprint_anchor": "2026-01-12",
+    "sprint_days": 14,
+    "keep_in_development": true,
+
+    "//properties": "обязательные поля типа карточки. Если тип их требует, без них Kaiten не даст создать карточку. Узнать id: заведи такую карточку руками и посмотри GET /cards/<id> → properties. Селекты задаются массивом id значений.",
+    "properties": {}
+  },
+
+  "max_cards_per_run": 2,
+  "keep_worktree": false
+}
