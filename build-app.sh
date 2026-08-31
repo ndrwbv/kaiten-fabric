@@ -53,6 +53,9 @@ echo "запустить: open '$APP'"
 # Установка в /Applications: с флагом --install, либо автоматически, если приложение
 # там уже стоит — иначе после пересборки в /Applications осталась бы старая версия.
 INSTALLED="/Applications/$APP"
+# Label из ~/Library/LaunchAgents/<label>.plist, если автозапуск настроен
+AGENT="${FABRICA_AGENT:-local.kaiten-fabrica}"
+[[ -f "$HOME/Library/LaunchAgents/ru.dodo.kaiten-fabrica.plist" ]] && AGENT="ru.dodo.kaiten-fabrica"
 if [[ "${1:-}" == "--install" || -d "$INSTALLED" ]]; then
     # приложение может быть запущено — сначала гасим, иначе перезапись даст битый бандл
     pkill -f "$APP/Contents/MacOS/Fabrica" 2>/dev/null || true
@@ -62,5 +65,17 @@ if [[ "${1:-}" == "--install" || -d "$INSTALLED" ]]; then
     # копию из папки проекта убираем: две одинаковые иконки в меню-баре — плохая идея
     rm -rf "$APP"
     echo "установлено: $INSTALLED"
-    echo "запустить: open '$INSTALLED'"
+
+    # Приложение мы погасили выше, и само оно не вернётся: в LaunchAgent намеренно нет
+    # KeepAlive. Без этого шага пересборка тихо выключала фабрику до следующего входа
+    # в систему — а заметить это можно только по пропавшей иконке в меню-баре.
+    if launchctl print "gui/$(id -u)/$AGENT" >/dev/null 2>&1; then
+        # даём файловой системе доехать: запуск сразу после перезаписи бандла
+        # macOS убивает как OS_REASON_CODESIGNING
+        sleep 1
+        launchctl kickstart -k "gui/$(id -u)/$AGENT" 2>/dev/null && \
+            echo "перезапущено через LaunchAgent"
+    else
+        open "$INSTALLED" && echo "запущено"
+    fi
 fi

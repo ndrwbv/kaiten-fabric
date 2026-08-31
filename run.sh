@@ -34,5 +34,31 @@ for name in json.load(open('config.json')).get('pass_env') or []:
     print(name)
 ")
 
-mkdir -p logs
-exec python3 factory.py "$@" 2>&1 | tee -a "logs/run.log"
+mkdir -p logs state
+
+# Замок от одновременных прогонов. Прогонов теперь два источника — таймер менюбар-
+# приложения и ночной LaunchAgent, — а фабрика на параллельную работу не рассчитана:
+# два прогона поделят карточки как попало и перетрут друг другу state/status.json.
+LOCK="state/run.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  OWNER=$(cat "$LOCK/pid" 2>/dev/null || echo "")
+  if [[ -n "$OWNER" ]] && kill -0 "$OWNER" 2>/dev/null; then
+    echo "прогон уже идёт (pid $OWNER) — выхожу" >&2
+    exit 0
+  fi
+  # владелец умер, не убрав за собой: замок протух, забираем себе
+  echo "снимаю протухший замок от pid ${OWNER:-?}" >&2
+  rm -rf "$LOCK" && mkdir "$LOCK"
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+
+# caffeinate держит ноут бодрствующим ровно пока идёт прогон: -i не даёт заснуть по
+# бездействию (работает и от батареи), -s запрещает системный сон от сети. Без этого
+# машина засыпает через displaysleep+sleep минут после того, как от неё отошли, —
+# и агент, которому отведено 45 минут, до конца не доживает. Сам claude -p ассерта
+# не ставит: тот, что видно в pmset, принадлежит десктопному приложению Claude.
+# Без exec намеренно: с ним оболочка заменяется процессом, и `trap EXIT` не снимает
+# замок. Сейчас это спасает только пайп в tee (он форкает подоболочку), но стоит убрать
+# tee — и замок начнёт протухать после каждого прогона.
+caffeinate -si python3 factory.py "$@" 2>&1 | tee -a "logs/run.log"
