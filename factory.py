@@ -494,6 +494,10 @@ class Kaiten:
     def add_child(self, parent_id: int, child_id: int) -> None:
         self._write("POST", f"/cards/{parent_id}/children", {"card_id": child_id})
 
+    def add_tag(self, card_id: int, name: str) -> None:
+        """Тег добавляется по имени; с tag_id Kaiten отвечает 400."""
+        self._write("POST", f"/cards/{card_id}/tags", {"name": name})
+
     def blockers(self, card_id: int) -> list:
         """
         Только действующие блокеры.
@@ -552,6 +556,87 @@ def flat_columns(board: dict) -> list[dict]:
 
 def column_label(column: dict) -> str:
     return f"{column.get('path') or column.get('title')}  (id {column['id']})"
+
+
+def has_tag(card: dict, name: str) -> bool:
+    """
+    Есть ли на карточке такой тег.
+
+    В выдаче списком ключ `tags` появляется только у карточек, у которых теги реально
+    стоят: у остальных его нет вовсе. Поэтому `or []` здесь обязателен.
+    """
+    wanted = normalize_phrase(name)
+    return any(normalize_phrase(tag.get("name")) == wanted for tag in (card.get("tags") or []))
+
+
+# --------------------------------------------------------------------------- #
+# ночные задачи
+# --------------------------------------------------------------------------- #
+
+# Карточку с этим тегом фабрика берёт только ночью. Смысл — тяжёлые и шумные задачи:
+# долгие прогоны тестов, массовые правки, всё, что мешает работать днём.
+NIGHT_TAG = "claude:night"
+NIGHT_FROM = 22
+NIGHT_TO = 5
+
+
+def night_config(cfg: dict) -> tuple[str, int, int]:
+    night = cfg.get("night") or {}
+    return (night.get("tag") or NIGHT_TAG,
+            int(night.get("from_hour", NIGHT_FROM)),
+            int(night.get("to_hour", NIGHT_TO)))
+
+
+def is_night(cfg: dict, now: datetime | None = None) -> bool:
+    """
+    Ночь ли сейчас по местному времени машины.
+
+    Окно переходит через полночь, поэтому обычное `from <= hour < to` не годится:
+    при 22–5 условие распадается на «после 22» ИЛИ «до 5».
+    """
+    _, start, end = night_config(cfg)
+    hour = (now or datetime.now()).hour
+    if start == end:
+        return True
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def off_hours(card: dict, cfg: dict, now: datetime | None = None) -> str | None:
+    """
+    Причина, по которой ночную карточку сейчас брать нельзя. None — можно.
+
+    Это мягкий стоп, в отличие от стоп-фразы: она значит «никогда», а тег — «не сейчас».
+    Карточка просто ждёт своего часа и ничем не помечается: вешать на неё блокер было бы
+    вредно, человеку пришлось бы снимать его каждое утро.
+    """
+    tag, start, end = night_config(cfg)
+    if not has_tag(card, tag):
+        return None
+    if is_night(cfg, now):
+        return None
+    return f"ночная задача, беру её с {start}:00 до {end}:00"
+
+
+def skip_off_hours(cards: list, cfg: dict) -> list:
+    """Убирает ночные карточки, до которых ещё не дошло время. Возвращает (оставшиеся, сколько отложено)."""
+    kept, waiting = [], 0
+    for card in cards:
+        if off_hours(card, cfg):
+            waiting += 1
+            continue
+        kept.append(card)
+    if waiting:
+        _, start, end = night_config(cfg)
+        log(f"{waiting} ночных карточек ждут окна {start}:00–{end}:00")
+    NIGHT_WAITING["count"] += waiting
+    return kept
+
+
+# Ночные карточки, отложенные за прогон — для человечка в меню-баре
+NIGHT_WAITING = {"count": 0}
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1362,6 +1447,7 @@ def fix_round_cards(kaiten: Kaiten, profile: dict) -> list:
     if fixes_column and fixes_column != in_progress:
         return kaiten.cards_in_column(profile["board_id"], fixes_column)
 
+
     found = []
     for card in kaiten.cards_in_column(profile["board_id"], in_progress):
         if profile.get("own_only") and not own_subtask(card):
@@ -1414,7 +1500,7 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     # правки вперёд: PR уже открыт, домучить его дешевле, чем начинать новую задачу.
     # потом отвеченные вопросы — человек только что написал, ему нужен быстрый отклик
     queue = kaiten.cards_in_column(board_id, cols["queue"])
-    picked = skip_hands_off(kaiten, fixes + answered + queue, cfg)
+    picked = skip_off_hours(skip_hands_off(kaiten, fixes + answered + queue, cfg), cfg)
     if profile.get("own_only"):
         before = len(picked)
         picked = [c for c in picked if own_subtask(c)]
@@ -1506,6 +1592,10 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
     stop = hands_off(card, comments, cfg)
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
+        return
+    wait = off_hours(card, cfg)
+    if wait:
+        log(f"#{card_id} откладываю: {wait}")
         return
     _, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
@@ -1642,6 +1732,10 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     stop = hands_off(card, comments, cfg)
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
+        return
+    wait = off_hours(card, cfg)
+    if wait:
+        log(f"#{card_id} откладываю: {wait}")
         return
     repo_key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
@@ -1860,6 +1954,9 @@ def pick_inbox_cards(kaiten: Kaiten, cfg: dict, state: dict) -> list[tuple[dict,
         stop = hands_off(card, comments, cfg)
         if stop:
             log(f"#{card_id} не трогаю: в карточке «{stop}»")
+            quiet += 1
+            continue
+        if off_hours(card, cfg):
             quiet += 1
             continue
         texts = [strip_html(c.get("text", "")) for c in comments]
@@ -2095,6 +2192,10 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
         return
+    wait = off_hours(card, cfg)
+    if wait:
+        log(f"#{card_id} откладываю: {wait}")
+        return
     repo_key, repo_cfg = resolve_repo(card, cfg)
 
     round_note = f", круг {round_number}" if round_number > 1 else ""
@@ -2257,11 +2358,6 @@ def epic_flow(cfg: dict) -> dict | None:
     return flow
 
 
-def has_tag(card: dict, name: str) -> bool:
-    wanted = normalize_phrase(name)
-    return any(normalize_phrase(tag.get("name")) == wanted for tag in (card.get("tags") or []))
-
-
 def next_column_after(kaiten: Kaiten, board_id: int, column_id: int) -> int | None:
     """
     Колонка справа от указанной.
@@ -2376,7 +2472,7 @@ def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
                 log(f"#{card['id']} не трогаю: в карточке «{stop}»")
                 continue
             found.append(card)
-    return found
+    return skip_off_hours(found, cfg)
 
 
 
@@ -2504,6 +2600,11 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
             log(f"  !! не создалась сабтаска «{item['title'][:40]}»")
             continue
         kaiten.add_child(epic["id"], card["id"])
+        # тег эпика наследуется: иначе эпик помечен «ночью», а код по нему пишется в полдень
+        night_tag, _, _ = night_config(cfg)
+        if has_tag(epic, night_tag):
+            kaiten.add_tag(card["id"], night_tag)
+            log("    тег ночной задачи унаследован от эпика")
         created.append((card, item))
         log(f"  + #{card['id']} «{item['title'][:50]}» ({item.get('kind')})")
 
@@ -2886,10 +2987,11 @@ def main() -> int:
         for profile in profiles:
             # в колонке ревью лежат и карточки, ждущие агента, и те, что он уже
             # отсмотрел и отдал человеку под блокером — вторые не наши
-            to_review = [c for c in kaiten.cards_in_column(profile["board_id"],
-                                                           role_column(profile, "agent_review"))
-                         if not (profile.get("own_only") and not own_subtask(c))
-                         and not blocked_by(kaiten, c["id"])]
+            to_review = skip_off_hours(
+                [c for c in kaiten.cards_in_column(profile["board_id"],
+                                                   role_column(profile, "agent_review"))
+                 if not (profile.get("own_only") and not own_subtask(c))
+                 and not blocked_by(kaiten, c["id"])], cfg)
             where = f" ({profile['key']})" if len(profiles) > 1 else ""
             if not to_review:
                 log(f"в «Ревью агента»{where} пусто")
@@ -2942,7 +3044,7 @@ def main() -> int:
             except FactoryError as e:
                 log(f"#{card['id']} не удалось даже начать: {e}")
     if not args.prompt_only:
-        write_status(card=None, phase=None)
+        write_status(card=None, phase=None, night_waiting=NIGHT_WAITING["count"])
     return 0
 
 

@@ -46,6 +46,7 @@ struct Status {
     var lastCost: Double?
     var inboxPending = 0
     var epicsWaiting = 0
+    var nightWaiting = 0
 }
 
 final class Fabrica: NSObject, NSApplicationDelegate {
@@ -241,6 +242,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         s.awaitingAnswer = (json["awaiting_answer"] as? NSNumber)?.intValue ?? 0
         s.inboxPending = (json["inbox_pending"] as? NSNumber)?.intValue ?? 0
         s.epicsWaiting = (json["epics_waiting"] as? NSNumber)?.intValue ?? 0
+        s.nightWaiting = (json["night_waiting"] as? NSNumber)?.intValue ?? 0
         s.pid = (json["pid"] as? NSNumber)?.int32Value
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
@@ -304,6 +306,14 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             let item = action("В инбоксе не разобрано: \(status.inboxPending)",
                               #selector(openBoard))
             item.toolTip = "Карточки инбокса, до которых разведка ещё не дошла"
+            menu.addItem(item)
+        }
+
+        // Ночные карточки днём молча пропускаются. Без этой строки человек решил бы,
+        // что фабрика их потеряла, и полез бы разбираться.
+        if status.nightWaiting > 0 {
+            let item = action("Ждут ночи: \(status.nightWaiting)", #selector(openBoard))
+            item.toolTip = "Карточки с ночным тегом — фабрика возьмёт их в отведённое окно"
             menu.addItem(item)
         }
 
