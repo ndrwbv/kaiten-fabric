@@ -30,6 +30,16 @@ let inboxIntervalChoices: [(title: String, minutes: Int)] = [
     ("Выключено", 0),
 ]
 
+/// Эпик, который чего-то ждёт от человека. Счётчика мало: нужно видеть, какой именно
+/// эпик и чего он ждёт, иначе всё равно лезть на доску.
+struct EpicWait {
+    var id: Int
+    var title: String
+    var label: String
+    var blocker: String
+    var url: String?
+}
+
 struct Status {
     var phase: String?
     var cardID: Int?
@@ -47,6 +57,7 @@ struct Status {
     var inboxPending = 0
     var epicsWaiting = 0
     var nightWaiting = 0
+    var epics: [EpicWait] = []
 }
 
 final class Fabrica: NSObject, NSApplicationDelegate {
@@ -243,6 +254,16 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         s.inboxPending = (json["inbox_pending"] as? NSNumber)?.intValue ?? 0
         s.epicsWaiting = (json["epics_waiting"] as? NSNumber)?.intValue ?? 0
         s.nightWaiting = (json["night_waiting"] as? NSNumber)?.intValue ?? 0
+        if let epics = json["epics"] as? [[String: Any]] {
+            s.epics = epics.compactMap { item in
+                guard let id = (item["id"] as? NSNumber)?.intValue else { return nil }
+                return EpicWait(id: id,
+                                title: item["title"] as? String ?? "",
+                                label: item["label"] as? String ?? "",
+                                blocker: item["blocker"] as? String ?? "",
+                                url: item["url"] as? String)
+            }
+        }
         s.pid = (json["pid"] as? NSNumber)?.int32Value
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
@@ -266,7 +287,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private func currentMood() -> Mood {
         if runner != nil { return .working }
         if lastError != nil { return .alert }
-        if status.awaitingAnswer > 0 { return .asking }
+        if !status.epics.isEmpty || status.awaitingAnswer > 0 { return .asking }
         return .sleeping
     }
 
@@ -283,9 +304,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         paintIcon()
         statusItem.button?.toolTip = running
             ? "Фабрика работает: \(status.phase ?? "")"
-            : (status.awaitingAnswer > 0
-               ? "Агент ждёт ответа: \(status.awaitingAnswer)"
-               : "Фабрика")
+            : (status.epics.first.map { "Эпик #\($0.id): \($0.blocker.isEmpty ? $0.label : $0.blocker)" }
+               ?? (status.awaitingAnswer > 0
+                   ? "Агент ждёт ответа: \(status.awaitingAnswer)"
+                   : "Фабрика"))
 
         menu.removeAllItems()
         menu.addItem(disabled(headline()))
@@ -296,6 +318,19 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         if let error = lastError {
             menu.addItem(disabled("   ⚠️ \(truncate(error, 50))"))
         }
+        // Эпики идут первыми и с подробностями: по ним человек и принимает решение,
+        // а «ждёт ответа: N» висит почти всегда и потому глаз его не замечает.
+        for epic in status.epics {
+            let item = action("🧩 #\(epic.id) \(truncate(epic.title, 40))",
+                              #selector(openEpicClicked))
+            item.representedObject = epic.url
+            item.toolTip = epic.blocker.isEmpty
+                ? epic.label
+                : "\(epic.blocker). Сними блокер в карточке — фабрика продолжит"
+            menu.addItem(item)
+            menu.addItem(disabled("      \(epic.blocker.isEmpty ? epic.label : epic.blocker)"))
+        }
+
         if status.awaitingAnswer > 0 {
             let item = action("Ждёт твоего ответа: \(status.awaitingAnswer)", #selector(openBoard))
             item.toolTip = "Ответь комментарием в карточке — фабрика возьмёт её сама"
@@ -314,14 +349,6 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         if status.nightWaiting > 0 {
             let item = action("Ждут ночи: \(status.nightWaiting)", #selector(openBoard))
             item.toolTip = "Карточки с ночным тегом — фабрика возьмёт их в отведённое окно"
-            menu.addItem(item)
-        }
-
-        // Эпик в блокере не двигается сам и ничем о себе не напоминает: без этой
-        // строки он молча висит, пока кто-нибудь случайно не откроет доску.
-        if status.epicsWaiting > 0 {
-            let item = action("Эпики ждут тебя: \(status.epicsWaiting)", #selector(openBoard))
-            item.toolTip = "Сними блокер в карточке эпика — фабрика продолжит с того же места"
             menu.addItem(item)
         }
 
@@ -409,6 +436,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         inboxIntervalMinutes = sender.tag
         rescheduleInboxTimer()
         redraw()
+    }
+
+    @objc private func openEpicClicked(_ sender: NSMenuItem) {
+        if let url = sender.representedObject as? String { open(url) } else { openBoard() }
     }
 
     @objc private func openBoard() {

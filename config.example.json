@@ -128,6 +128,14 @@
     "//review_column_id": "куда уехать, когда все сабтаски отревьюены. null — вычислить как следующую колонку справа от development",
     "review_column_id": null,
 
+    "//agent": "агент фаз эпика: критериев и декомпозиции. Отдельно от triager — у эпика тема шире, и лимита разведки ему мало. effort max подписка claude.ai не отдаёт, потолок — high",
+    "agent": {
+      "model": "claude-opus-5",
+      "effort": "high",
+      "max_budget_usd": 6.0,
+      "timeout_sec": 1800
+    },
+
     "max_epics_per_run": 1,
     "max_subtasks": 5,
     "spec_dir": "specs",

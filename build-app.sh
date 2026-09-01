@@ -69,11 +69,14 @@ if [[ "${1:-}" == "--install" || -d "$INSTALLED" ]]; then
     # Приложение мы погасили выше, и само оно не вернётся: в LaunchAgent намеренно нет
     # KeepAlive. Без этого шага пересборка тихо выключала фабрику до следующего входа
     # в систему — а заметить это можно только по пропавшей иконке в меню-баре.
-    if launchctl print "gui/$(id -u)/$AGENT" >/dev/null 2>&1; then
-        # даём файловой системе доехать: запуск сразу после перезаписи бандла
-        # macOS убивает как OS_REASON_CODESIGNING
-        sleep 1
-        launchctl kickstart -k "gui/$(id -u)/$AGENT" 2>/dev/null && \
+    PLIST="$HOME/Library/LaunchAgents/$AGENT.plist"
+    if [[ -f "$PLIST" ]]; then
+        # Именно bootout+bootstrap, а не kickstart: launchd запоминает подпись сервиса
+        # с момента регистрации, и после пересборки запускает бандл с новой подписью
+        # против старой записи — процесс тут же умирает с OS_REASON_CODESIGNING.
+        # Перерегистрация обновляет запись, kickstart — нет.
+        launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && \
             echo "перезапущено через LaunchAgent"
     else
         open "$INSTALLED" && echo "запущено"

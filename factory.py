@@ -2773,6 +2773,25 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
     log(f"  фаза «{phase}» ничего не требует")
 
 
+def epic_status(kaiten: Kaiten, card: dict, title: str, phase: str,
+                blocker: str = "") -> dict:
+    """
+    Строчка про эпик для человечка в меню-баре.
+
+    Счётчика мало: «эпики ждут тебя: 1» не говорит ни какой эпик, ни чего он ждёт,
+    и человек всё равно лезет на доску смотреть. Поэтому кладём заголовок и причину.
+    """
+    return {
+        "id": card["id"],
+        "title": title,
+        "phase": phase,
+        "label": EPIC_PHASE_LABELS.get(phase, phase),
+        # причину чистим от служебной метки: человеку она ничего не говорит
+        "blocker": blocker.replace(BLOCK_MARK, "").strip(" :"),
+        "url": kaiten.card_url(card),
+    }
+
+
 def take_epic(kaiten: Kaiten, flow: dict, card: dict) -> None:
     """Взяли эпик в работу — двигаем в колонку разработки, если он не там."""
     target = flow.get("development_column_id")
@@ -2833,7 +2852,7 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
         log(f"эпиков с тегом: {len(epics)}, беру {min(limit, len(epics))}")
         epics = epics[:limit]
 
-    waiting = 0
+    waiting, pending = 0, []
     for card in epics:
         card_id = card["id"]
         title = (card.get("title") or "").strip()
@@ -2843,9 +2862,10 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
 
         foreign = [b for b in kaiten.blockers(card_id) if not ours(b)]
         if foreign:
-            log(f"#{card_id} «{title[:50]}» — чужой блокер: "
-                f"{foreign[0].get('reason', '')[:60]} — не трогаю")
+            reason = str(foreign[0].get("reason") or "")
+            log(f"#{card_id} «{title[:50]}» — чужой блокер: {reason[:60]} — не трогаю")
             waiting += 1
+            pending.append(epic_status(kaiten, card, title, "чужой блокер", reason))
             continue
 
         phase = epic_phase(kaiten, cfg, flow, card, comments)
@@ -2853,6 +2873,9 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
 
         if phase == "waiting_approval":
             waiting += 1
+            blocker = own_blocker(kaiten, card_id, BLOCK_ACCEPTANCE) or {}
+            pending.append(epic_status(kaiten, card, title, phase,
+                                       str(blocker.get("reason") or "")))
             continue
 
         if not args.prompt_only:
@@ -2881,7 +2904,7 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
             log(f"  !! фаза «{phase}» не удалась: {e}")
 
     if not args.prompt_only:
-        write_status(card=None, phase=None, epics_waiting=waiting)
+        write_status(card=None, phase=None, epics_waiting=waiting, epics=pending)
     return 0
 
 
