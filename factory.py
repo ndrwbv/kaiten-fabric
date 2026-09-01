@@ -800,6 +800,26 @@ GIT_TIMEOUT = 120
 GIT_NETWORK_TIMEOUT = 300
 GIT_NETWORK_OPS = ("push", "fetch", "clone", "pull", "ls-remote")
 
+# Сетевую операцию повторяем: обрыв соединения — штатное событие в корпоративной сети,
+# и из-за него карточка не должна уезжать в «Упало». Все перечисленные операции
+# идемпотентны, повтор ничего не портит: push идёт с --force-with-lease, и если ветку
+# успел изменить кто-то другой, лease не даст перезаписать.
+GIT_NETWORK_RETRIES = 3
+GIT_RETRY_PAUSE = 8
+
+# По этим признакам ошибка считается сетевой и достойной повтора. Всё остальное —
+# отказ по существу (нет прав, конфликт, битая ветка), и повторять его бессмысленно.
+NETWORK_HINTS = (
+    "не ответил", "Connection closed", "Connection reset", "Connection refused",
+    "Could not read from remote", "Operation timed out", "timed out",
+    "Broken pipe", "reset by peer", "kex_exchange", "Temporary failure",
+    "Network is unreachable", "early EOF", "RPC failed", "TLS packet",
+)
+
+
+def looks_like_network(message: str) -> bool:
+    return any(hint.lower() in message.lower() for hint in NETWORK_HINTS)
+
 # ssh не должен ни ждать пароля, ни висеть на мёртвом соединении. BatchMode запрещает
 # любые запросы к терминалу, ServerAlive рвёт зависшую сессию за полминуты.
 GIT_SSH_COMMAND = ("ssh -o BatchMode=yes -o ConnectTimeout=15 "
@@ -809,20 +829,33 @@ GIT_SSH_COMMAND = ("ssh -o BatchMode=yes -o ConnectTimeout=15 "
 def git(cwd: Path, *args: str, check: bool = True) -> str:
     network = bool(args) and args[0] in GIT_NETWORK_OPS
     timeout = GIT_NETWORK_TIMEOUT if network else GIT_TIMEOUT
+    attempts = GIT_NETWORK_RETRIES if network else 1
     env = {**os.environ, "GIT_SSH_COMMAND": GIT_SSH_COMMAND,
            "GIT_TERMINAL_PROMPT": "0"}
-    try:
-        proc = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-            stdin=subprocess.DEVNULL, timeout=timeout, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        raise FactoryError(
-            f"git {' '.join(args)} не ответил за {timeout}с — оборвал. "
-            f"Похоже на зависшую сеть или ssh") from None
-    if check and proc.returncode != 0:
-        raise FactoryError(f"git {' '.join(args)} -> {proc.returncode}: {proc.stderr.strip()[:800]}")
-    return proc.stdout.strip()
+
+    for attempt in range(1, attempts + 1):
+        failure = ""
+        try:
+            proc = subprocess.run(
+                ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip()
+            failure = f"{proc.returncode}: {proc.stderr.strip()[:800]}"
+        except subprocess.TimeoutExpired:
+            failure = f"не ответил за {timeout}с — оборвал"
+
+        last = attempt >= attempts
+        if last or not looks_like_network(failure):
+            if check:
+                raise FactoryError(f"git {' '.join(args)} -> {failure}")
+            return ""
+        pause = GIT_RETRY_PAUSE * attempt
+        log(f"  сеть подвела на git {args[0]} ({failure.splitlines()[0][:90]}), "
+            f"повтор {attempt + 1} из {attempts} через {pause}с")
+        time.sleep(pause)
+    return ""
 
 
 def make_worktree(repo: Path, branch: str, base: str, remote: str, path: Path,
@@ -1425,6 +1458,7 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
         ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url",
          "--jq", ".[0].url"],
         cwd=str(worktree), capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=120,
     ).stdout.strip()
     if existing:
         log(f"  PR для ветки уже открыт: {existing}")
@@ -1775,6 +1809,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
             ["gh", "pr", "list", "--head", branch, "--state", "all",
              "--json", "url", "--jq", ".[0].url"],
             cwd=str(worktree), capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=120,
         ).stdout.strip()
 
         prompt = build_review_prompt(card, card_url, repo_cfg, branch, pr_url,
