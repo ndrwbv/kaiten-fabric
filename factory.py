@@ -3417,6 +3417,26 @@ def main() -> int:
     if len(profiles) > 1:
         log("досок в работе: " + ", ".join(f"«{p['key']}»" for p in profiles))
 
+    # Снимок и на входе, и на выходе. Раньше он собирался только в самом конце полного
+    # прогона, а --only-epics и --epic-card выходят раньше и его минуют: в трее висело
+    # состояние часовой давности, и человек справедливо считал, что ничего не двигается.
+    if not args.prompt_only:
+        refresh_flow(kaiten, cfg, profiles)
+    try:
+        return route(kaiten, cfg, args, profiles)
+    finally:
+        if not args.prompt_only:
+            refresh_flow(kaiten, cfg, profiles)
+
+
+def refresh_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
+    try:
+        snapshot_flow(kaiten, cfg, profiles)
+    except Exception as e:  # noqa: BLE001 — витрина не важнее сделанной работы
+        log(f"снимок состояния не собрался: {e}")
+
+
+def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     if args.link_review:
         return link_review_cards(kaiten, cfg, args.dry_run)
 
@@ -3510,10 +3530,6 @@ def main() -> int:
     if not args.prompt_only:
         write_status(card=None, phase=None, run_started=None,
                      night_waiting=NIGHT_WAITING["count"])
-        try:
-            snapshot_flow(kaiten, cfg, profiles)
-        except Exception as e:  # noqa: BLE001 — витрина не важнее сделанной работы
-            log(f"снимок состояния не собрался: {e}")
     return 0
 
 

@@ -191,14 +191,18 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     // MARK: - запуск прогона
 
     /// Что запускаем. Раньше это были булевы флаги, но их стало три и они путались.
-    enum RunMode {
+    enum RunMode: Equatable {
         case full, inbox, epics
+        /// Одна карточка: у эпика своя фаза, у обычной — обычный поток
+        case one(id: Int, epic: Bool)
 
         var flag: String {
             switch self {
             case .full: return ""
             case .inbox: return " --only-triage"
             case .epics: return " --only-epics"
+            case .one(let id, let epic):
+                return epic ? " --epic-card \(id)" : " --card \(id)"
             }
         }
     }
@@ -414,12 +418,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         if !status.waiting.isEmpty {
             menu.addItem(disabled("Ждут тебя: \(status.waiting.count)"))
             for card in status.waiting {
-                let item = action("   \(card.icon) #\(card.id) \(truncate(card.title, 38))",
-                                  #selector(openCardClicked))
-                item.representedObject = card.url
-                item.toolTip = card.reason.isEmpty
-                    ? "Открыть карточку"
-                    : "\(card.reason). Открыть карточку"
+                let item = NSMenuItem(
+                    title: "   \(card.icon) #\(card.id) \(truncate(card.title, 38))",
+                    action: nil, keyEquivalent: "")
+                item.submenu = cardMenu(id: card.id, url: card.url,
+                                        epic: card.isEpic, running: running)
+                item.toolTip = card.reason
                 menu.addItem(item)
                 if !card.reason.isEmpty {
                     menu.addItem(disabled("        \(truncate(card.reason, 54))"))
@@ -437,14 +441,16 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         if !status.flow.isEmpty {
             menu.addItem(disabled("В потоке: \(status.flow.count)"))
             for card in status.flow {
-                let item = action("   \(card.icon) #\(card.id) \(truncate(card.title, 36))",
-                                  #selector(openCardClicked))
-                item.representedObject = card.url
+                let item = NSMenuItem(
+                    title: "   \(card.icon) #\(card.id) \(truncate(card.title, 36))",
+                    action: nil, keyEquivalent: "")
                 let active = runIsAlive && status.cardID == card.id
                 let note = active
                     ? "сейчас: \(card.state)" + (elapsed().map { ", \($0)" } ?? "")
                     : "следующий шаг: \(card.state)"
-                item.toolTip = "\(note). Открыть карточку"
+                item.toolTip = note
+                item.submenu = cardMenu(id: card.id, url: card.url,
+                                        epic: card.isEpic, running: running)
                 menu.addItem(item)
                 menu.addItem(disabled("        \(note)"))
             }
@@ -468,13 +474,21 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         if running {
             menu.addItem(action("Остановить прогон", #selector(stopClicked)))
-        } else {
-            menu.addItem(action("Проверить доску сейчас", #selector(runClicked)))
-            menu.addItem(action("Разобрать инбокс сейчас", #selector(inboxClicked)))
+        }
+        // Кнопки видны всегда. Раньше во время прогона они пропадали, а прогоны идут
+        // по десять минут каждый час — человек открывал меню и не находил кнопки,
+        // решая, что её просто нет. Пока прогон идёт, они неактивны.
+        do {
+            let check = action("Проверить доску сейчас", #selector(runClicked))
+            let inbox = action("Разобрать инбокс сейчас", #selector(inboxClicked))
             let epics = action("Продвинуть эпики сейчас", #selector(epicsClicked))
             epics.toolTip = "Только фаза эпиков: критерии, спека, декомпозиция. "
                 + "Полный прогон делает это тоже, но сначала проходит инбокс и ревью"
-            menu.addItem(epics)
+            for item in [check, inbox, epics] {
+                item.isEnabled = !running
+                if running { item.toolTip = "Идёт прогон — дождись или останови его" }
+                menu.addItem(item)
+            }
         }
 
         menu.addItem(intervalMenu(title: "Расписание", choices: intervalChoices,
@@ -573,6 +587,34 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     @objc private func openCardClicked(_ sender: NSMenuItem) {
         if let url = sender.representedObject as? String { open(url) } else { openBoard() }
+    }
+
+    /// Продвинуть одну конкретную карточку, не дожидаясь расписания и не гоняя весь
+    /// прогон. Общая кнопка «Продвинуть эпики» берёт все эпики подряд, а тут человек
+    /// показывает пальцем на ту задачу, которая его сейчас интересует.
+    @objc private func pushCardClicked(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? [String: Any],
+              let id = target["id"] as? Int else { return }
+        let isEpic = (target["epic"] as? Bool) ?? false
+        startRun(manual: true, mode: .one(id: id, epic: isEpic))
+    }
+
+    /// Меню действий для одной карточки: открыть или продвинуть.
+    private func cardMenu(id: Int, url: String?, epic: Bool, running: Bool) -> NSMenu {
+        let submenu = NSMenu()
+        let openItem = action("Открыть карточку", #selector(openCardClicked))
+        openItem.representedObject = url
+        submenu.addItem(openItem)
+
+        let push = action(epic ? "Сделать следующий шаг по эпику"
+                               : "Сделать следующий шаг", #selector(pushCardClicked))
+        push.representedObject = ["id": id, "epic": epic] as [String: Any]
+        push.isEnabled = !running
+        push.toolTip = running
+            ? "Идёт прогон — дождись или останови его"
+            : "Запустить фабрику только по этой карточке"
+        submenu.addItem(push)
+        return submenu
     }
 
     @objc private func openBoard() {
