@@ -1069,8 +1069,26 @@ def extract_verdict(payload: dict, key: str = "status"):
 # отведено на день. Считаем по факту, из meta самого агента.
 SPENT = {"usd": 0.0}
 
-# Карточки, ждущие ответа человека, суммарно по всем доскам за прогон
-AWAITING = {"count": 0}
+# Всё, что ждёт человека, за прогон — одним списком со ссылками. Счётчика мало:
+# «ждёт твоего ответа: 2» не говорит, каких карточек это касается, и человек всё
+# равно идёт искать их на доске руками.
+AWAITING: dict = {"count": 0, "cards": []}
+
+
+def note_waiting(kaiten: Kaiten, card: dict, reason: str,
+                 kind: str = "card", asks: list[str] | None = None) -> None:
+    """Запоминает карточку, по которой ход человека, вместе с причиной и ссылкой."""
+    card_id = card["id"]
+    if any(item["id"] == card_id for item in AWAITING["cards"]):
+        return
+    AWAITING["cards"].append({
+        "id": card_id,
+        "title": (card.get("title") or "").strip(),
+        "kind": kind,
+        "reason": reason.replace(BLOCK_MARK, "").strip(" :"),
+        "asks": asks or [],
+        "url": kaiten.card_url(card),
+    })
 
 
 def note_spend(meta: dict | None) -> None:
@@ -1480,8 +1498,11 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     for card in kaiten.cards_in_column(board_id, cols.get("question") or 0):
         # заблокированную карточку не берём, даже если человек уже ответил: блокер
         # снимает он же, и пока он висит — это его ход, а не наш
-        if blocked_by(kaiten, card["id"]):
+        stuck = blocked_by(kaiten, card["id"])
+        if stuck:
             waiting += 1
+            note_waiting(kaiten, card, stuck,
+                         asks=open_questions(kaiten.comments(card["id"])))
             continue
         history = kaiten.comments(card["id"])
         last = strip_html(history[-1].get("text", "")) if history else ""
@@ -1489,6 +1510,14 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
             answered.append(card)
         else:
             waiting += 1
+            # Карточку могли положить сюда руками — тогда никакого вопроса от агента
+            # нет, и писать «ответь комментарием» было бы неправдой
+            asked = any(strip_html(c.get("text", "")).startswith(AGENT_MARKS)
+                        for c in history)
+            note_waiting(kaiten, card,
+                         "не хватило данных, ответь комментарием" if asked
+                         else "лежит в «Вопросе от агента», вопроса от агента нет",
+                         asks=open_questions(history))
     if answered:
         log(f"в «Вопросе от агента» ответили на {len(answered)}: "
             f"{', '.join('#' + str(c['id']) for c in answered)}")
@@ -1497,7 +1526,7 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     # человечек в меню-баре по этому числу решает, вопрошать ему или спать. Досок может
     # быть несколько, поэтому копим, а не перетираем — иначе видно только последнюю
     AWAITING["count"] += waiting
-    write_status(awaiting_answer=AWAITING["count"])
+    write_status(awaiting_answer=AWAITING["count"], waiting=AWAITING["cards"])
 
     fixes = fix_round_cards(kaiten, profile)
     if fixes:
@@ -1512,7 +1541,15 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
         if before != len(picked):
             log(f"на доске «{profile['key']}» {before - len(picked)} чужих карточек — "
                 f"их фабрика не трогает")
-    return [c for c in picked if not blocked_by(kaiten, c["id"])]
+    free = []
+    for card in picked:
+        stuck = blocked_by(kaiten, card["id"])
+        if stuck:
+            note_waiting(kaiten, card, stuck)
+            continue
+        free.append(card)
+    write_status(waiting=AWAITING["cards"])
+    return free
 
 
 # --------------------------------------------------------------------------- #
@@ -2954,27 +2991,6 @@ def open_questions(comments: list, limit: int = 4) -> list[str]:
     return [a[:180] for a in asks[:limit]]
 
 
-def epic_status(kaiten: Kaiten, card: dict, title: str, phase: str,
-                blocker: str = "", asks: list[str] | None = None) -> dict:
-    """
-    Строчка про эпик для человечка в меню-баре.
-
-    Счётчика мало: «эпики ждут тебя: 1» не говорит ни какой эпик, ни чего он ждёт,
-    и человек всё равно лезет на доску смотреть. Поэтому кладём заголовок, причину
-    и сами вопросы.
-    """
-    return {
-        "id": card["id"],
-        "title": title,
-        "phase": phase,
-        "label": EPIC_PHASE_LABELS.get(phase, phase),
-        # причину чистим от служебной метки: человеку она ничего не говорит
-        "blocker": blocker.replace(BLOCK_MARK, "").strip(" :"),
-        "asks": asks or [],
-        "url": kaiten.card_url(card),
-    }
-
-
 def take_epic(kaiten: Kaiten, flow: dict, card: dict) -> None:
     """Взяли эпик в работу — двигаем в колонку разработки, если он не там."""
     target = flow.get("development_column_id")
@@ -3035,7 +3051,7 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
         log(f"эпиков с тегом: {len(epics)}, беру {min(limit, len(epics))}")
         epics = epics[:limit]
 
-    waiting, pending = 0, []
+    waiting = 0
     for card in epics:
         card_id = card["id"]
         title = (card.get("title") or "").strip()
@@ -3048,7 +3064,7 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
             reason = str(foreign[0].get("reason") or "")
             log(f"#{card_id} «{title[:50]}» — чужой блокер: {reason[:60]} — не трогаю")
             waiting += 1
-            pending.append(epic_status(kaiten, card, title, "чужой блокер", reason))
+            note_waiting(kaiten, card, reason, kind="epic")
             continue
 
         phase = epic_phase(kaiten, cfg, flow, card, comments)
@@ -3057,9 +3073,8 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
         if phase == "waiting_answer":
             waiting += 1
             mine = next((b for b in kaiten.blockers(card_id) if ours(b)), {})
-            pending.append(epic_status(kaiten, card, title, phase,
-                                       str(mine.get("reason") or ""),
-                                       asks=open_questions(comments)))
+            note_waiting(kaiten, card, str(mine.get("reason") or EPIC_PHASE_LABELS[phase]),
+                         kind="epic", asks=open_questions(comments))
             continue
 
         if not args.prompt_only:
@@ -3088,7 +3103,8 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
             log(f"  !! фаза «{phase}» не удалась: {e}")
 
     if not args.prompt_only:
-        write_status(card=None, phase=None, epics_waiting=waiting, epics=pending)
+        write_status(card=None, phase=None, epics_waiting=waiting,
+                     waiting=AWAITING["cards"])
     return 0
 
 
