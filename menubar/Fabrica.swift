@@ -47,6 +47,19 @@ struct Waiting {
     var icon: String { isEpic ? "🧩" : "❓" }
 }
 
+/// Карточка, которая прямо сейчас в потоке: пишется, ждёт ревьювера, уехала к человеку.
+/// Нужна, чтобы развернув меню было видно весь фронт работ, а не только текущий прогон.
+struct InFlow {
+    var id: Int
+    var title: String
+    var kind: String
+    var state: String
+    var url: String?
+
+    var isEpic: Bool { kind == "epic" }
+    var icon: String { isEpic ? "🧩" : "•" }
+}
+
 struct Status {
     var phase: String?
     var cardID: Int?
@@ -65,6 +78,7 @@ struct Status {
     var epicsWaiting = 0
     var nightWaiting = 0
     var waiting: [Waiting] = []
+    var flow: [InFlow] = []
 }
 
 final class Fabrica: NSObject, NSApplicationDelegate {
@@ -274,6 +288,16 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             // эпики первыми: они блокируют целый поток, а карточка — только себя
             s.waiting.sort { $0.isEpic && !$1.isEpic }
         }
+        if let flow = json["flow"] as? [[String: Any]] {
+            s.flow = flow.compactMap { item in
+                guard let id = (item["id"] as? NSNumber)?.intValue else { return nil }
+                return InFlow(id: id,
+                              title: item["title"] as? String ?? "",
+                              kind: item["kind"] as? String ?? "card",
+                              state: item["state"] as? String ?? "",
+                              url: item["url"] as? String)
+            }
+        }
         s.pid = (json["pid"] as? NSNumber)?.int32Value
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
@@ -352,6 +376,20 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
 
 
+
+        // Весь фронт работ: что пишется, что ждёт ревьювера, что уехало к человеку.
+        // Раньше в меню была видна одна карточка текущего прогона, и то пока он идёт.
+        if !status.flow.isEmpty {
+            menu.addItem(disabled("В потоке: \(status.flow.count)"))
+            for card in status.flow {
+                let item = action("   \(card.icon) #\(card.id) \(truncate(card.title, 36))",
+                                  #selector(openCardClicked))
+                item.representedObject = card.url
+                item.toolTip = "\(card.state). Открыть карточку"
+                menu.addItem(item)
+                menu.addItem(disabled("        \(card.state)"))
+            }
+        }
 
         if status.inboxPending > 0 {
             let item = action("В инбоксе не разобрано: \(status.inboxPending)",
@@ -440,6 +478,9 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
         guard intervalMinutes > 0 else { return "Расписание выключено" }
         guard let next = nextRun else { return "Ждёт" }
+        if !status.flow.isEmpty {
+            return "В потоке \(status.flow.count), проверка в \(clock(next))"
+        }
         return "Ждёт, следующая проверка в \(clock(next))"
     }
 

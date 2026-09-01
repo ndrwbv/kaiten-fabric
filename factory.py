@@ -1441,6 +1441,18 @@ def own_subtask(card: dict) -> bool:
     return bool(EPIC_ORIGIN_RE.search(strip_html(card.get("description")) or ""))
 
 
+def theirs(profile: dict, card: dict) -> bool:
+    """
+    Чужая ли карточка. На своей доске чужих нет, на доске команды — почти все.
+
+    Проверять надо на каждом обходе колонок, а не только при выборке работы: на общей
+    доске роли делят колонки, и «Вопрос от агента» указывает в ту же «В работе», где
+    лежит живой бэклог команды. Без этого стража фабрика объявляла чужие карточки
+    ждущими её ответа.
+    """
+    return bool(profile.get("own_only")) and not own_subtask(card)
+
+
 def skip_hands_off(kaiten: Kaiten, cards: list, cfg: dict) -> list:
     """
     Убирает карточки, в которых просили не трогать. Комментарий не пишем: просили
@@ -1473,7 +1485,7 @@ def fix_round_cards(kaiten: Kaiten, profile: dict) -> list:
 
     found = []
     for card in kaiten.cards_in_column(profile["board_id"], in_progress):
-        if profile.get("own_only") and not own_subtask(card):
+        if theirs(profile, card):
             continue
         if blocked_by(kaiten, card["id"]):
             continue
@@ -1496,6 +1508,8 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     cols = profile["columns"]
     answered, waiting = [], 0
     for card in kaiten.cards_in_column(board_id, cols.get("question") or 0):
+        if theirs(profile, card):
+            continue
         # заблокированную карточку не берём, даже если человек уже ответил: блокер
         # снимает он же, и пока он висит — это его ход, а не наш
         stuck = blocked_by(kaiten, card["id"])
@@ -1509,14 +1523,13 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
         if history and not last.startswith(AGENT_MARKS):
             answered.append(card)
         else:
+            # Карточку могли положить в эту колонку руками. Если агент по ней ничего
+            # не спрашивал, то и ждать от человека нечего — фабрика к ней не касалась
+            if not any(strip_html(c.get("text", "")).startswith(AGENT_MARKS)
+                       for c in history):
+                continue
             waiting += 1
-            # Карточку могли положить сюда руками — тогда никакого вопроса от агента
-            # нет, и писать «ответь комментарием» было бы неправдой
-            asked = any(strip_html(c.get("text", "")).startswith(AGENT_MARKS)
-                        for c in history)
-            note_waiting(kaiten, card,
-                         "не хватило данных, ответь комментарием" if asked
-                         else "лежит в «Вопросе от агента», вопроса от агента нет",
+            note_waiting(kaiten, card, "не хватило данных, ответь комментарием",
                          asks=open_questions(history))
     if answered:
         log(f"в «Вопросе от агента» ответили на {len(answered)}: "
@@ -1537,7 +1550,7 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
     picked = skip_off_hours(skip_hands_off(kaiten, fixes + answered + queue, cfg), cfg)
     if profile.get("own_only"):
         before = len(picked)
-        picked = [c for c in picked if own_subtask(c)]
+        picked = [c for c in picked if not theirs(profile, c)]
         if before != len(picked):
             log(f"на доске «{profile['key']}» {before - len(picked)} чужих карточек — "
                 f"их фабрика не трогает")
@@ -3112,6 +3125,74 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
 # main
 # --------------------------------------------------------------------------- #
 
+# Что показывать в меню-баре про каждую колонку. Порядок важен: роли на чужой доске
+# делят колонки, и карточку относим к первому подходящему состоянию.
+FLOW_STATES = [
+    ("in_progress", "в работе"),
+    ("agent_review", "ждёт ревьювера"),
+    ("fixes", "правки после ревью"),
+    ("review", "на ревью у человека"),
+]
+
+
+def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
+    """
+    Снимок того, что у фабрики в работе прямо сейчас — для человечка в меню-баре.
+
+    Без него в трее видно только карточку текущего прогона, да и то пока он идёт.
+    А человек хочет развернуть меню и увидеть весь фронт работ: что пишется, что
+    ждёт ревьювера, что уехало к нему самому.
+
+    Заблокированные карточки сюда не попадают: они уже в списке «ждут тебя», и
+    показывать их дважды значит запутать.
+    """
+    flow, seen = [], set()
+
+    for profile in profiles:
+        for role, state in FLOW_STATES:
+            column = role_column(profile, role)
+            if not column:
+                continue
+            for card in kaiten.cards_in_column(profile["board_id"], column):
+                card_id = card["id"]
+                if card_id in seen or theirs(profile, card):
+                    continue
+                if blocked_by(kaiten, card_id):
+                    continue
+                seen.add(card_id)
+                flow.append({
+                    "id": card_id,
+                    "title": (card.get("title") or "").strip(),
+                    "kind": "card",
+                    "state": state,
+                    "url": kaiten.card_url(card),
+                })
+
+    # эпики: у них состояние — это фаза, и она сама по себе объясняет, что происходит
+    flow_cfg = epic_flow(cfg)
+    if flow_cfg:
+        for card in pick_epics(kaiten, cfg, flow_cfg):
+            card_id = card["id"]
+            if card_id in seen:
+                continue
+            full = kaiten.card(card_id)
+            phase = epic_phase(kaiten, cfg, flow_cfg, full, kaiten.comments(card_id))
+            if phase == "waiting_answer":
+                continue  # он уже в списке «ждут тебя»
+            seen.add(card_id)
+            flow.append({
+                "id": card_id,
+                "title": (card.get("title") or "").strip(),
+                "kind": "epic",
+                "state": EPIC_PHASE_LABELS.get(phase, phase),
+                "url": kaiten.card_url(card),
+            })
+
+    write_status(flow=flow)
+    if flow:
+        log("в работе: " + ", ".join(f"#{c['id']} ({c['state']})" for c in flow))
+
+
 def profile_for_card(kaiten: Kaiten, profiles: list[dict], card_id: int) -> dict:
     """
     Какому профилю принадлежит карточка, вызванная руками через --card.
@@ -3213,8 +3294,7 @@ def main() -> int:
             to_review = skip_off_hours(
                 [c for c in kaiten.cards_in_column(profile["board_id"],
                                                    role_column(profile, "agent_review"))
-                 if not (profile.get("own_only") and not own_subtask(c))
-                 and not blocked_by(kaiten, c["id"])], cfg)
+                 if not theirs(profile, c) and not blocked_by(kaiten, c["id"])], cfg)
             where = f" ({profile['key']})" if len(profiles) > 1 else ""
             if not to_review:
                 log(f"в «Ревью агента»{where} пусто")
@@ -3268,6 +3348,10 @@ def main() -> int:
                 log(f"#{card['id']} не удалось даже начать: {e}")
     if not args.prompt_only:
         write_status(card=None, phase=None, night_waiting=NIGHT_WAITING["count"])
+        try:
+            snapshot_flow(kaiten, cfg, profiles)
+        except Exception as e:  # noqa: BLE001 — витрина не важнее сделанной работы
+            log(f"снимок состояния не собрался: {e}")
     return 0
 
 
