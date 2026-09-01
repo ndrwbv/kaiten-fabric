@@ -144,6 +144,10 @@ SPEC_REVIEW_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        # То, что автор закрыть не может: нужен макет, продуктовое решение, доступ.
+        # Без этого поля круг правок упирался в одну и ту же стену, пока не кончались
+        # круги, — по $4 за стену.
+        "needs_human": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["verdict", "summary"],
@@ -215,6 +219,8 @@ REVIEW_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        # см. SPEC_REVIEW_SCHEMA: то, что автор закрыть не может без человека
+        "needs_human": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["verdict", "summary"],
@@ -1889,6 +1895,21 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
         kaiten.comment(card_id, comment_review_short(
             review, meta, round_number, max_rounds, needs_changes, pr_url, findings))
 
+        asks = [a for a in (review.get("needs_human") or []) if str(a).strip()]
+        if asks:
+            # то же, что у спеки: круг правок в эту стену не пробьётся
+            text = (f"{REVIEWER_MARK} **Дальше без тебя не выйдет.**\n\n"
+                    f"{review.get('summary', '')}")
+            for ask in asks[:4]:
+                text += f"\n\n❓ {ask}"
+            if pr_url.startswith("http"):
+                text += f"\n\nОстальные замечания — в PR: {pr_url}"
+            kaiten.comment(card_id, text + "\n\nОтветь комментарием в карточке.")
+            hand_over(kaiten, profile, card_id, "question", asks[0][:90])
+            finish_status(card_id, title, "нужен человек", meta, pr_url)
+            log(f"  -> нужен человек: {len(asks)} вопросов")
+            return
+
         if needs_changes:
             # правки идут в рабочую колонку: агент подхватит карточку следующим прогоном
             kaiten.move(card_id, role_column(profile, "fixes")
@@ -3010,6 +3031,29 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         findings = review.get("findings") or []
         blocking = [f for f in findings if f.get("severity") in ("blocker", "major")]
         spec_pr = spec_pr_url(comments)
+        asks = [a for a in (review.get("needs_human") or []) if str(a).strip()]
+
+        if asks:
+            # Стена, которую автор спеки не пробьёт: нужен макет, продуктовое решение
+            # или доступ. Гонять круги правок в неё бессмысленно — каждый стоит денег
+            # и заканчивается тем же замечанием.
+            full = (f"{REVIEWER_MARK} **Нужен человек.**\n\n{review.get('summary', '')}"
+                    + format_findings(findings))
+            if spec_pr and not args.dry_run:
+                post_pr_review(worktree, spec_pr, full)
+            text = (f"{REVIEWER_MARK} **Дальше без тебя не выйдет.**\n\n"
+                    f"{review.get('summary', '')}")
+            for ask in asks[:4]:
+                text += f"\n\n❓ {ask}"
+            if spec_pr:
+                text += f"\n\nОстальные замечания — в PR: {spec_pr}"
+            text += ("\n\nОтветь комментарием и **сними блокер** — я вернусь и продолжу "
+                     "с того же места.")
+            text += f"\n\n_ревью спеки, {format_meta(meta)}._" + format_joke(review)
+            kaiten.comment(card_id, text)
+            hold(kaiten, card_id, BLOCK_QUESTION, asks[0][:90])
+            log(f"  -> нужен человек: {len(asks)} вопросов")
+            return
 
         if review.get("verdict") == "needs_changes" or blocking:
             # Полное ревью — комментарием в PR спеки: там его читает и человек,
