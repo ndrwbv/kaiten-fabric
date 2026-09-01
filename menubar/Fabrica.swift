@@ -182,7 +182,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         let timer = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.nextInboxRun = Date().addingTimeInterval(seconds)
-            self.startRun(manual: false, inboxOnly: true)
+            self.startRun(manual: false, mode: .inbox)
         }
         RunLoop.main.add(timer, forMode: .common)
         inboxTimer = timer
@@ -190,19 +190,31 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     // MARK: - запуск прогона
 
-    private func startRun(manual: Bool, inboxOnly: Bool = false) {
+    /// Что запускаем. Раньше это были булевы флаги, но их стало три и они путались.
+    enum RunMode {
+        case full, inbox, epics
+
+        var flag: String {
+            switch self {
+            case .full: return ""
+            case .inbox: return " --only-triage"
+            case .epics: return " --only-epics"
+            }
+        }
+    }
+
+    private func startRun(manual: Bool, mode: RunMode = .full) {
         guard runner == nil else {
             if manual { NSSound.beep() }
             // по расписанию — не теряем: запустим сразу после текущего прогона
-            else if inboxOnly { pendingInboxRun = true } else { pendingRun = true }
+            else if mode == .inbox { pendingInboxRun = true } else { pendingRun = true }
             return
         }
         lastError = nil
         // полный прогон сам заходит в инбокс, отдельная разведка после него не нужна
-        if !inboxOnly { pendingInboxRun = false }
+        if mode != .inbox { pendingInboxRun = false }
 
-        let script = "cd \(shellQuote(root.path)) && ./run.sh"
-            + (inboxOnly ? " --only-triage" : "")
+        let script = "cd \(shellQuote(root.path)) && ./run.sh" + mode.flag
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         // -ilc: интерактивный логин-шелл. Только он даёт то же окружение, что и терминал:
@@ -217,17 +229,22 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 self.runner = nil
                 self.pollTimer?.invalidate()
                 self.pollTimer = nil
-                if proc.terminationStatus != 0 && proc.terminationReason != .uncaughtSignal {
+                if proc.terminationStatus == 75 {
+                    // run.sh увидел чужой замок и вышел. Молчать нельзя: человек нажал
+                    // кнопку и ждёт хоть какой-то реакции
+                    self.lastError = "прогон уже идёт — этот запуск пропущен"
+                } else if proc.terminationStatus != 0
+                            && proc.terminationReason != .uncaughtSignal {
                     self.lastError = "run.sh завершился с кодом \(proc.terminationStatus)"
                 }
                 self.readStatusFile()
                 self.redraw()
                 if self.pendingRun || self.pendingInboxRun {
-                    let inboxOnly = !self.pendingRun
+                    let mode: RunMode = self.pendingRun ? .full : .inbox
                     self.pendingRun = false
                     self.pendingInboxRun = false
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                        self.startRun(manual: false, inboxOnly: inboxOnly)
+                        self.startRun(manual: false, mode: mode)
                     }
                 }
             }
@@ -454,6 +471,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         } else {
             menu.addItem(action("Проверить доску сейчас", #selector(runClicked)))
             menu.addItem(action("Разобрать инбокс сейчас", #selector(inboxClicked)))
+            let epics = action("Продвинуть эпики сейчас", #selector(epicsClicked))
+            epics.toolTip = "Только фаза эпиков: критерии, спека, декомпозиция. "
+                + "Полный прогон делает это тоже, но сначала проходит инбокс и ревью"
+            menu.addItem(epics)
         }
 
         menu.addItem(intervalMenu(title: "Расписание", choices: intervalChoices,
@@ -533,7 +554,8 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     // MARK: - действия
 
     @objc private func runClicked() { startRun(manual: true) }
-    @objc private func inboxClicked() { startRun(manual: true, inboxOnly: true) }
+    @objc private func inboxClicked() { startRun(manual: true, mode: .inbox) }
+    @objc private func epicsClicked() { startRun(manual: true, mode: .epics) }
     @objc private func stopClicked() { stopRun(); redraw() }
     @objc private func quitClicked() { NSApp.terminate(nil) }
 

@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -793,6 +794,55 @@ def hand_over(kaiten: Kaiten, profile: dict, card_id: int, role: str,
 # git
 # --------------------------------------------------------------------------- #
 
+def run_bounded(cmd: list[str], cwd: Path | str, timeout: int,
+                env: dict | None = None) -> subprocess.CompletedProcess:
+    """
+    Внешняя команда с таймаутом, которую действительно можно оборвать.
+
+    Обычный `subprocess.run(timeout=…)` тут не спасает: он убивает только прямого
+    ребёнка, а внуки живут дальше и держат открытым pipe, который питон читает.
+    Ловили вживую — убил `git push`, его `ssh` осиротел и продолжал держать stderr,
+    и питон навсегда завис в select() без единого процесса-ребёнка.
+
+    Поэтому команда запускается в своей группе процессов (start_new_session), а по
+    таймауту гасится вся группа целиком.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        # добираем то, что успело выйти: после гибели группы pipe закрыт и чтение
+        # уже не может заблокироваться
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    """Гасит всю группу процессов, а не только прямого ребёнка."""
+    try:
+        group = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, signal_number)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 # Таймаут на git. Без него один зависший ssh морозит прогон навсегда: agent.timeout_sec
 # покрывает только вызов claude. Ловили вживую — `git push` провисел 27 минут на ssh,
 # фабрика всё это время держала замок и показывала в трее работу, которой не было.
@@ -836,10 +886,7 @@ def git(cwd: Path, *args: str, check: bool = True) -> str:
     for attempt in range(1, attempts + 1):
         failure = ""
         try:
-            proc = subprocess.run(
-                ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=timeout, env=env,
-            )
+            proc = run_bounded(["git", *args], cwd, timeout, env)
             if proc.returncode == 0:
                 return proc.stdout.strip()
             failure = f"{proc.returncode}: {proc.stderr.strip()[:800]}"
@@ -1070,10 +1117,9 @@ def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=env, capture_output=True, text=True,
-            stdin=subprocess.DEVNULL, timeout=agent_cfg["timeout_sec"],
-        )
+        # через run_bounded: claude поднимает свои подпроцессы, и по таймауту надо
+        # гасить всю группу — иначе внук переживёт родителя и повесит чтение pipe
+        proc = run_bounded(cmd, cwd, agent_cfg["timeout_sec"], env)
     except subprocess.TimeoutExpired as e:
         raise FactoryError(f"агент не уложился в {agent_cfg['timeout_sec']}с") from e
 
@@ -1454,11 +1500,10 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
             f"(тело {len(body)} символов)")
         return "(dry-run, PR не создан)"
 
-    existing = subprocess.run(
+    existing = run_bounded(
         ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url",
          "--jq", ".[0].url"],
-        cwd=str(worktree), capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        timeout=120,
+        worktree, 120,
     ).stdout.strip()
     if existing:
         log(f"  PR для ветки уже открыт: {existing}")
@@ -1473,8 +1518,7 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
                "--title", title, "--body-file", handle.name]
         if pr_cfg.get("draft", True):
             cmd.append("--draft")
-        proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=120)
+        proc = run_bounded(cmd, worktree, 120)
     finally:
         os.unlink(handle.name)
 
@@ -1691,9 +1735,8 @@ def post_pr_review(worktree: Path, pr_url: str, body: str) -> None:
     try:
         handle.write(body)
         handle.close()
-        proc = subprocess.run(["gh", "pr", "comment", pr_url, "--body-file", handle.name],
-                              cwd=str(worktree), capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=120)
+        proc = run_bounded(["gh", "pr", "comment", pr_url, "--body-file", handle.name],
+                           worktree, 120)
         if proc.returncode != 0:
             log(f"  !! не смог оставить комментарий в PR: {proc.stderr.strip()[:200]}")
     finally:
@@ -1710,11 +1753,10 @@ def fetch_pr_notes(worktree: Path, pr_url: str) -> str:
     """
     if not pr_url.startswith("http"):
         return ""
-    proc = subprocess.run(
+    proc = run_bounded(
         ["gh", "pr", "view", pr_url, "--json", "comments",
          "--jq", '.comments[] | select(.body | startswith("' + REVIEWER_MARK + '")) | .body'],
-        cwd=str(worktree), capture_output=True, text=True,
-        stdin=subprocess.DEVNULL, timeout=120)
+        worktree, 120)
     if proc.returncode != 0:
         log(f"  !! не смог забрать замечания с PR: {proc.stderr.strip()[:160]}")
         return ""
@@ -1805,11 +1847,10 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
 
         # ветка в ревью-worktree своя (review/card-N), поэтому PR ищем по имени
         # ревьюемой ветки, а не по текущей: `gh pr view` без --head смотрит на текущую
-        pr_url = subprocess.run(
+        pr_url = run_bounded(
             ["gh", "pr", "list", "--head", branch, "--state", "all",
              "--json", "url", "--jq", ".[0].url"],
-            cwd=str(worktree), capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=120,
+            worktree, 120,
         ).stdout.strip()
 
         prompt = build_review_prompt(card, card_url, repo_cfg, branch, pr_url,

@@ -39,15 +39,39 @@ mkdir -p logs state
 # Замок от одновременных прогонов. Прогонов теперь два источника — таймер менюбар-
 # приложения и ночной LaunchAgent, — а фабрика на параллельную работу не рассчитана:
 # два прогона поделят карточки как попало и перетрут друг другу state/status.json.
+# Ни один прогон столько не длится: агенту отведено 45 минут, плюс запас на ревью.
+# Замок старше этого — след прогона, который умер, не убрав за собой.
 LOCK="state/run.lock"
+LOCK_MAX_MINUTES=75
 if ! mkdir "$LOCK" 2>/dev/null; then
   OWNER=$(cat "$LOCK/pid" 2>/dev/null || echo "")
-  if [[ -n "$OWNER" ]] && kill -0 "$OWNER" 2>/dev/null; then
-    echo "прогон уже идёт (pid $OWNER) — выхожу" >&2
-    exit 0
+  AGE=$(( ($(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s)) / 60 ))
+
+  # Живость владельца одна ничего не доказывает: обёртка может осиротеть и висеть
+  # часами, пока её внук держит открытым pipe. Поймали вживую — два часа простоя,
+  # все запуски молча выходили. Поэтому решает ещё и возраст замка.
+  if [[ -n "$OWNER" ]] && kill -0 "$OWNER" 2>/dev/null && (( AGE < LOCK_MAX_MINUTES )); then
+    echo "прогон уже идёт (pid $OWNER, ${AGE} мин) — выхожу" >&2
+    exit 75
   fi
-  # владелец умер, не убрав за собой: замок протух, забираем себе
-  echo "снимаю протухший замок от pid ${OWNER:-?}" >&2
+  if [[ -n "$OWNER" ]] && kill -0 "$OWNER" 2>/dev/null; then
+    # Гасим только если это точно наш зависший прогон. Pid переиспользуются, и
+    # убивать группу по одному номеру — верный способ прибить что-то чужое:
+    # при отладке этой самой ветки я так погасил собственную оболочку.
+    OWNER_CMD=$(ps -o command= -p "$OWNER" 2>/dev/null || echo "")
+    OWNER_PGID=$(ps -o pgid= -p "$OWNER" 2>/dev/null | tr -d ' ')
+    if [[ "$OWNER_CMD" == *run.sh* || "$OWNER_CMD" == *factory.py* ]] \
+       && [[ -n "$OWNER_PGID" && "$OWNER_PGID" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]]; then
+      echo "замку ${AGE} мин, зависший прогон $OWNER — гашу его группу" >&2
+      kill -TERM -- "-$OWNER_PGID" 2>/dev/null || true
+      sleep 2
+      kill -KILL -- "-$OWNER_PGID" 2>/dev/null || true
+    else
+      echo "замку ${AGE} мин, но pid $OWNER занят чем-то другим — просто забираю замок" >&2
+    fi
+  else
+    echo "снимаю протухший замок от pid ${OWNER:-?} (${AGE} мин)" >&2
+  fi
   rm -rf "$LOCK" && mkdir "$LOCK"
 fi
 echo $$ > "$LOCK/pid"
