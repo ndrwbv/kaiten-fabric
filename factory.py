@@ -356,6 +356,10 @@ def split_comment(text: str, limit: int = COMMENT_LIMIT) -> list[str]:
 
 def write_status(**fields) -> None:
     """
+    Состояние для менюбар-приложения. Смена фазы отмечается временем: по нему видно,
+    сколько шаг уже длится, а значит и что он завис.
+    """
+    """
     Состояние для менюбар-приложения: что фабрика делает прямо сейчас.
     Пишем через временный файл — читатель не должен поймать половину JSON.
     """
@@ -366,8 +370,11 @@ def write_status(**fields) -> None:
             data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             data = {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if "phase" in fields and fields.get("phase") != data.get("phase"):
+        data["phase_since"] = now if fields.get("phase") else None
     data.update(fields)
-    data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    data["updated"] = now
     tmp = STATUS_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATUS_FILE)
@@ -786,10 +793,33 @@ def hand_over(kaiten: Kaiten, profile: dict, card_id: int, role: str,
 # git
 # --------------------------------------------------------------------------- #
 
+# Таймаут на git. Без него один зависший ssh морозит прогон навсегда: agent.timeout_sec
+# покрывает только вызов claude. Ловили вживую — `git push` провисел 27 минут на ssh,
+# фабрика всё это время держала замок и показывала в трее работу, которой не было.
+GIT_TIMEOUT = 120
+GIT_NETWORK_TIMEOUT = 300
+GIT_NETWORK_OPS = ("push", "fetch", "clone", "pull", "ls-remote")
+
+# ssh не должен ни ждать пароля, ни висеть на мёртвом соединении. BatchMode запрещает
+# любые запросы к терминалу, ServerAlive рвёт зависшую сессию за полминуты.
+GIT_SSH_COMMAND = ("ssh -o BatchMode=yes -o ConnectTimeout=15 "
+                   "-o ServerAliveInterval=10 -o ServerAliveCountMax=3")
+
+
 def git(cwd: Path, *args: str, check: bool = True) -> str:
-    proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL
-    )
+    network = bool(args) and args[0] in GIT_NETWORK_OPS
+    timeout = GIT_NETWORK_TIMEOUT if network else GIT_TIMEOUT
+    env = {**os.environ, "GIT_SSH_COMMAND": GIT_SSH_COMMAND,
+           "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise FactoryError(
+            f"git {' '.join(args)} не ответил за {timeout}с — оборвал. "
+            f"Похоже на зависшую сеть или ssh") from None
     if check and proc.returncode != 0:
         raise FactoryError(f"git {' '.join(args)} -> {proc.returncode}: {proc.stderr.strip()[:800]}")
     return proc.stdout.strip()
@@ -2434,7 +2464,13 @@ ACCEPTANCE_LIST = "Приёмочные критерии"
 # прогон идёт раз в час, человек между прогонами двигает карточки руками, и любое
 # состояние, которое фабрика держала бы у себя, разъехалось бы с доской в первый же раз.
 SPEC_LINE = "Спека:"
+SPEC_FIXED_LINE = "Спека поправлена:"
 SPEC_OK_LINE = "Спека отревьюена."
+
+# Оба заголовка значат «спека лежит на гите и её можно ревьюить». Держим их одним
+# списком: иначе после круга правок фаза не сдвигалась и агент переписывал спеку
+# каждый прогон — рассинхрон маркеров второй раз стоил денег.
+SPEC_HEADS = (SPEC_LINE, SPEC_FIXED_LINE)
 SUBTASKS_LINE = "Разложил на сабтаски:"
 
 # Строка в описании сабтаски: из какого эпика она выросла. По ней же считаются свои
@@ -2447,15 +2483,17 @@ EPIC_ORIGIN_RE = re.compile(r"Из эпика:\s*#(\d+)")
 EPIC_PHASES = ("acceptance", "waiting_answer", "spec", "spec_review", "spec_fix",
                "decompose", "working", "closing")
 
+# Формулировки нарочно безличные: фаза висит в трее и когда прогон не идёт, а
+# «правлю спеку» в этот момент врёт — человек видит работу, которой нет.
 EPIC_PHASE_LABELS = {
-    "acceptance": "пишу приёмочные критерии",
+    "acceptance": "написать приёмочные критерии",
     "waiting_answer": "ждёт твоего ответа",
-    "spec": "пишу спеку",
-    "spec_review": "ревью спеки",
-    "spec_fix": "правлю спеку по замечаниям",
-    "decompose": "раскладываю на сабтаски",
+    "spec": "написать спеку",
+    "spec_review": "отревьюить спеку",
+    "spec_fix": "поправить спеку по замечаниям",
+    "decompose": "разложить на сабтаски",
     "working": "сабтаски в работе",
-    "closing": "закрываю эпик",
+    "closing": "закрыть эпик",
 }
 
 
@@ -2535,7 +2573,7 @@ def last_word_is_review(comments: list) -> bool:
             return True
         if text.startswith(REVIEWER_MARK):
             return True
-        if text.startswith(EPIC_MARK) and SPEC_LINE in text:
+        if text.startswith(EPIC_MARK) and any(h in text for h in SPEC_HEADS):
             return False
     return False
 
@@ -2555,7 +2593,7 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
         return "waiting_answer"
     if not acceptance_items(card):
         return "acceptance"
-    if not said(comments, SPEC_LINE):
+    if not any(said(comments, head) for head in SPEC_HEADS):
         return "spec"
     if not said(comments, SPEC_OK_LINE):
         # Замечания к спеке адресованы её автору, а не человеку: спеку правит агент,
@@ -2774,7 +2812,7 @@ def spec_pr_url(comments: list) -> str:
     """Ссылка на PR спеки из комментария, которым фабрика о нём объявила."""
     for comment in reversed(comments):
         text = strip_html(comment.get("text", ""))
-        if text.startswith(EPIC_MARK) and ("Спека" in text[:40]):
+        if text.startswith(EPIC_MARK) and any(h in text[:60] for h in SPEC_HEADS):
             found = re.search(r"https://\S+/pull/\d+", text)
             if found:
                 return found.group(0)
@@ -2867,7 +2905,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
         pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
                          verdict, cfg["pr"], args.dry_run) if not args.no_pr else "(без PR)"
-        head = "Спека поправлена:" if fixing else SPEC_LINE
+        head = SPEC_FIXED_LINE if fixing else SPEC_LINE
         kaiten.comment(card_id,
                        f"{EPIC_MARK} **{head}** {pr_url}\n\n"
                        f"{verdict.get('summary', '')}\n\n"
@@ -3247,8 +3285,11 @@ def main() -> int:
     WORKTREES.mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     if not args.prompt_only:
-        # pid нужен менюбар-приложению, чтобы при выходе прибить и питон, и агента
-        write_status(pid=os.getpid(), card=None, phase="смотрю доску")
+        # pid нужен менюбар-приложению, чтобы при выходе прибить и питон, и агента.
+        # run_started — чтобы оно могло сказать, сколько прогон уже идёт: без этого
+        # зависший git выглядел в трее как обычная работа
+        write_status(pid=os.getpid(), card=None, phase="смотрю доску",
+                     run_started=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     if args.dry_run:
         log("DRY-RUN: Kaiten и GitHub не трогаем, агент отработает по-настоящему")
 
@@ -3347,7 +3388,8 @@ def main() -> int:
             except FactoryError as e:
                 log(f"#{card['id']} не удалось даже начать: {e}")
     if not args.prompt_only:
-        write_status(card=None, phase=None, night_waiting=NIGHT_WAITING["count"])
+        write_status(card=None, phase=None, run_started=None,
+                     night_waiting=NIGHT_WAITING["count"])
         try:
             snapshot_flow(kaiten, cfg, profiles)
         except Exception as e:  # noqa: BLE001 — витрина не важнее сделанной работы
@@ -3364,7 +3406,7 @@ def clear_phase() -> None:
     """
     try:
         if STATUS_FILE.is_file():
-            write_status(card=None, phase=None)
+            write_status(card=None, phase=None, run_started=None)
     except Exception:  # noqa: BLE001 — на выходе падать уже незачем
         pass
 

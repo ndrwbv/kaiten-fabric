@@ -68,6 +68,10 @@ struct Status {
     var returning = false
     var awaitingAnswer = 0
     var pid: Int32?
+    /// Когда начался прогон и когда сменилась фаза. По ним видно, сколько шаг длится:
+    /// без этого зависший git выглядел в трее как обычная работа.
+    var runStarted: Date?
+    var phaseSince: Date?
     var lastOutcome: String?
     var lastTitle: String?
     var lastCardID: Int?
@@ -299,6 +303,9 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             }
         }
         s.pid = (json["pid"] as? NSNumber)?.int32Value
+        let stamps = ISO8601DateFormatter()
+        s.runStarted = (json["run_started"] as? String).flatMap { stamps.date(from: $0) }
+        s.phaseSince = (json["phase_since"] as? String).flatMap { stamps.date(from: $0) }
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
             s.cardTitle = card["title"] as? String
@@ -318,8 +325,32 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     // MARK: - отрисовка меню
 
     /// Настроение человечка. Работа важнее всего, дальше — авария, потом висящие вопросы.
+    /// Идёт ли прогон на самом деле. Свой процесс видно напрямую, чужой (запущенный
+    /// из терминала или ночным агентом) — только по pid из статуса.
+    private var runIsAlive: Bool {
+        if runner != nil { return true }
+        guard let pid = status.pid else { return false }
+        return kill(pid, 0) == 0
+    }
+
+    /// Сколько идёт текущий шаг, словами. nil — если шага нет.
+    private func elapsed() -> String? {
+        guard let since = status.phaseSince ?? status.runStarted else { return nil }
+        let minutes = Int(Date().timeIntervalSince(since) / 60)
+        if minutes < 1 { return "меньше минуты" }
+        return "\(minutes) мин"
+    }
+
+    /// Прогон идёт подозрительно долго. Ни один шаг столько не занимает: значит
+    /// что-то зависло — чаще всего сеть в git push.
+    private var runLooksStuck: Bool {
+        guard runIsAlive, let since = status.runStarted else { return false }
+        return Date().timeIntervalSince(since) > 50 * 60
+    }
+
     private func currentMood() -> Mood {
-        if runner != nil { return .working }
+        if runLooksStuck { return .alert }
+        if runIsAlive { return .working }
         if lastError != nil { return .alert }
         // Эпик важнее обычного вопроса: вопросов в «Вопросе от агента» может висеть
         // сколько угодно и подолгу, а эпик заблокирован и ждёт решения именно сейчас.
@@ -353,6 +384,13 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         if let error = lastError {
             menu.addItem(disabled("   ⚠️ \(truncate(error, 50))"))
         }
+        if runLooksStuck {
+            let item = action("⚠️ Прогон висит \(elapsed() ?? "долго") — остановить",
+                             #selector(stopClicked))
+            item.toolTip = "Ни один шаг столько не занимает. Чаще всего зависает сеть "
+                + "в git push; лог: logs/run.log"
+            menu.addItem(item)
+        }
         // Всё, чего ждут от человека, — одной секцией и ссылками на сами карточки.
         // Голый счётчик «ждёт ответа: N» открывал доску, и карточки приходилось
         // искать глазами; теперь каждая строка ведёт прямо в свою.
@@ -385,9 +423,13 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 let item = action("   \(card.icon) #\(card.id) \(truncate(card.title, 36))",
                                   #selector(openCardClicked))
                 item.representedObject = card.url
-                item.toolTip = "\(card.state). Открыть карточку"
+                let active = runIsAlive && status.cardID == card.id
+                let note = active
+                    ? "сейчас: \(card.state)" + (elapsed().map { ", \($0)" } ?? "")
+                    : "следующий шаг: \(card.state)"
+                item.toolTip = "\(note). Открыть карточку"
                 menu.addItem(item)
-                menu.addItem(disabled("        \(card.state)"))
+                menu.addItem(disabled("        \(note)"))
             }
         }
 
@@ -465,8 +507,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     private func headline() -> String {
-        if runner != nil {
-            return "Работает: \(status.phase ?? "запускаюсь")"
+        if runIsAlive {
+            let phase = status.phase ?? "запускаюсь"
+            let age = elapsed().map { ", \($0)" } ?? ""
+            return runLooksStuck
+                ? "Похоже, завис: \(phase)\(age)"
+                : "Работает: \(phase)\(age)"
         }
         // Прогон не идёт. Если по эпику ждут ответа — говорим об этом, а не про
         // расписание: иначе выходит, что фабрика «чем-то занята», хотя она стоит.
