@@ -37,6 +37,9 @@ struct EpicWait {
     var title: String
     var label: String
     var blocker: String
+    /// Конкретные вопросы и замечания, на которые ждут ответа. Без них строка
+    /// «ждёт твоего ответа» бесполезна: непонятно, на что отвечать.
+    var asks: [String]
     var url: String?
 }
 
@@ -261,6 +264,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                                 title: item["title"] as? String ?? "",
                                 label: item["label"] as? String ?? "",
                                 blocker: item["blocker"] as? String ?? "",
+                                asks: item["asks"] as? [String] ?? [],
                                 url: item["url"] as? String)
             }
         }
@@ -332,6 +336,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 : "\(epic.blocker). Сними блокер в карточке — фабрика продолжит"
             menu.addItem(item)
             menu.addItem(disabled("      \(epic.blocker.isEmpty ? epic.label : epic.blocker)"))
+            // Сами вопросы: человек должен понять, на что отвечать, не открывая доску
+            for ask in epic.asks {
+                menu.addItem(disabled("      • \(truncate(ask, 58))"))
+            }
         }
 
         if status.awaitingAnswer > 0 {
@@ -416,6 +424,13 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private func headline() -> String {
         if runner != nil {
             return "Работает: \(status.phase ?? "запускаюсь")"
+        }
+        // Прогон не идёт. Если по эпику ждут ответа — говорим об этом, а не про
+        // расписание: иначе выходит, что фабрика «чем-то занята», хотя она стоит.
+        if let epic = status.epics.first {
+            return status.epics.count > 1
+                ? "Ждёт твоего ответа по \(status.epics.count) эпикам"
+                : "Ждёт твоего ответа по эпику #\(epic.id)"
         }
         guard intervalMinutes > 0 else { return "Расписание выключено" }
         guard let next = nextRun else { return "Ждёт" }

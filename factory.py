@@ -66,8 +66,13 @@ REVIEWER_MARK = "🔍"
 # Разведчик инбокса — своей. Без вариационного селектора: эмодзи ездит через два API,
 # и лишний невидимый символ ломал бы сравнение startswith
 TRIAGE_MARK = "🧭"
+# Метка эпик-агента. Объявлена здесь, а не в разделе эпиков, потому что входит
+# в AGENT_MARKS: без неё фабрика принимала свои же комментарии по эпику за реплику
+# человека — и «последнее слово за человеком» ломалось на каждом эпике.
+EPIC_MARK = "🧩"
+
 # всё, что написано роботами. Комментарий не с этой метки — реплика человека
-AGENT_MARKS = (AGENT_MARK, REVIEWER_MARK, TRIAGE_MARK)
+AGENT_MARKS = (AGENT_MARK, REVIEWER_MARK, TRIAGE_MARK, EPIC_MARK)
 
 # Строка в описании рабочей карточки: из какой карточки инбокса она выросла. По ней же
 # ловится дубль, если разведка почему-то зайдёт на ту карточку второй раз.
@@ -1581,6 +1586,58 @@ def post_pr_review(worktree: Path, pr_url: str, body: str) -> None:
         os.unlink(handle.name)
 
 
+def fetch_pr_notes(worktree: Path, pr_url: str) -> str:
+    """
+    Замечания ревьювера с PR.
+
+    Подробное ревью живёт на гите, а не в карточке: в карточке от него один шум,
+    его читают люди. Но круг правок этими замечаниями и живёт, поэтому перед правкой
+    фабрика забирает их обратно с PR и кладёт в промпт сама.
+    """
+    if not pr_url.startswith("http"):
+        return ""
+    proc = subprocess.run(
+        ["gh", "pr", "view", pr_url, "--json", "comments",
+         "--jq", '.comments[] | select(.body | startswith("' + REVIEWER_MARK + '")) | .body'],
+        cwd=str(worktree), capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=120)
+    if proc.returncode != 0:
+        log(f"  !! не смог забрать замечания с PR: {proc.stderr.strip()[:160]}")
+        return ""
+    return proc.stdout.strip()
+
+
+def comment_review_short(review: dict, meta: dict, round_number: int, max_rounds: int,
+                         needs_changes: bool, pr_url: str, findings: list) -> str:
+    """
+    Короткий отчёт в карточку. Подробности остаются на гите.
+
+    Раньше сюда уезжало ревью целиком, разрезанное на три комментария по 4096 символов.
+    Человеку в карточке нужно другое: есть ли вопрос, какой именно, и куда идти читать.
+    """
+    if not needs_changes:
+        text = f"{REVIEWER_MARK} **Замечаний нет.**\n\n{review.get('summary', '')}"
+        if findings:
+            text += f"\n\nМелочи ({len(findings)}) оставил комментарием в PR, они не блокируют."
+    else:
+        blocking = [f for f in findings if f.get("severity") in ("blocker", "major")]
+        text = (f"{REVIEWER_MARK} **Нужны правки: {len(blocking)} "
+                f"из {len(findings)}.**\n\n{review.get('summary', '')}")
+        # только сами замечания, без причин и «как чинить» — это уже на гите
+        for item in blocking[:4]:
+            icon = SEVERITY_ICON.get(item.get("severity", ""), "•")
+            where = item.get("where") or ""
+            text += f"\n\n{icon} {item.get('what', '')}" + (f"\n  `{where}`" if where else "")
+        if len(blocking) > 4:
+            text += f"\n\n…и ещё {len(blocking) - 4}."
+    if pr_url.startswith("http"):
+        text += f"\n\nПодробно, с причинами и что делать: {pr_url}"
+    tail = format_meta(meta)
+    line = f"ревью, круг {round_number} из {max_rounds}"
+    text += f"\n\n_{line}{': ' + tail if tail else ''}._"
+    return text + format_joke(review)
+
+
 def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> None:
     card_id = card_stub["id"]
     reviewer_cfg = cfg["reviewer"]
@@ -1667,10 +1724,14 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
         log(f"  вердикт: {review.get('verdict')}, замечаний {len(findings)} "
             f"(блокирующих {len(blocking)})")
 
-        body = comment_review(review, meta, round_number, max_rounds, needs_changes)
-        kaiten.comment(card_id, body)
+        # На гит уходит полное ревью, в карточку — короткая выжимка. Порядок важен:
+        # если PR не принял комментарий, в карточке хотя бы останется ссылка на него,
+        # а сами замечания уже не потеряются — они в logs/review-*.json
+        full = comment_review(review, meta, round_number, max_rounds, needs_changes)
         if pr_url and reviewer_cfg.get("post_to_pr") and not args.dry_run:
-            post_pr_review(worktree, pr_url, body)
+            post_pr_review(worktree, pr_url, full)
+        kaiten.comment(card_id, comment_review_short(
+            review, meta, round_number, max_rounds, needs_changes, pr_url, findings))
 
         if needs_changes:
             # правки идут в рабочую колонку: агент подхватит карточку следующим прогоном
@@ -2315,9 +2376,6 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
 # режим эпиков: АЦ -> спека -> сабтаски -> ревью
 # --------------------------------------------------------------------------- #
 
-# Метка комментариев эпик-агента. Своя, чтобы не путать с исполнителем и ревьювером
-EPIC_MARK = "🧩"
-
 # Как называется чек-лист приёмочных критериев. По имени же его и находим обратно:
 # другого признака «АЦ уже написаны» у нас нет
 ACCEPTANCE_LIST = "Приёмочные критерии"
@@ -2336,14 +2394,15 @@ EPIC_ORIGIN = "Из эпика:"
 EPIC_ORIGIN_RE = re.compile(r"Из эпика:\s*#(\d+)")
 
 # Фазы. Порядок важен: фаза выводится первым совпавшим условием
-EPIC_PHASES = ("acceptance", "waiting_approval", "spec", "spec_review",
+EPIC_PHASES = ("acceptance", "waiting_answer", "spec", "spec_review", "spec_fix",
                "decompose", "working", "closing")
 
 EPIC_PHASE_LABELS = {
     "acceptance": "пишу приёмочные критерии",
-    "waiting_approval": "жду апрува АЦ",
+    "waiting_answer": "ждёт твоего ответа",
     "spec": "пишу спеку",
     "spec_review": "ревью спеки",
+    "spec_fix": "правлю спеку по замечаниям",
     "decompose": "раскладываю на сабтаски",
     "working": "сабтаски в работе",
     "closing": "закрываю эпик",
@@ -2417,6 +2476,20 @@ def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> list:
     return own
 
 
+def last_word_is_review(comments: list) -> bool:
+    """Последним по эпику высказался ревьювер — значит его замечания ещё не отработаны."""
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if not text.startswith(AGENT_MARKS):
+            # человек ответил после ревью: его реплика тоже пойдёт в правку спеки
+            return True
+        if text.startswith(REVIEWER_MARK):
+            return True
+        if text.startswith(EPIC_MARK) and SPEC_LINE in text:
+            return False
+    return False
+
+
 def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list) -> str:
     """
     В какой фазе эпик прямо сейчас. Выводится целиком из Kaiten — чек-лист, блокеры,
@@ -2424,14 +2497,24 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
     от того, что фабрика помнит о прошлом разе.
     """
     card_id = card["id"]
+    # Любой наш действующий блокер значит одно: ход человека, агентов не запускаем.
+    # Раньше проверялся только блокер апрува АЦ, и эпик, заблокированный на вопросе,
+    # каждый прогон заново входил в ту же фазу — ревьювер часами пересматривал одну
+    # и ту же неизменённую спеку по $1.3 за круг.
+    if any(ours(b) for b in kaiten.blockers(card_id)):
+        return "waiting_answer"
     if not acceptance_items(card):
         return "acceptance"
-    if own_blocker(kaiten, card_id, BLOCK_ACCEPTANCE):
-        return "waiting_approval"
     if not said(comments, SPEC_LINE):
         return "spec"
     if not said(comments, SPEC_OK_LINE):
-        return "spec_review"
+        # Замечания к спеке адресованы её автору, а не человеку: спеку правит агент,
+        # ровно как код в круге правок. Раньше фабрика вешала блокер и ждала человека,
+        # а он ничего поправить не мог — спека лежит в репозитории.
+        rounds = count_review_rounds(comments)
+        if rounds >= (cfg.get("reviewer") or {}).get("max_rounds", 3):
+            return "waiting_answer"
+        return "spec_fix" if last_word_is_review(comments) else "spec_review"
 
     children = kaiten.children(card_id)
     own = epic_subtasks(kaiten, card_id, children)
@@ -2475,6 +2558,19 @@ def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
     return skip_off_hours(found, cfg)
 
 
+
+# Врезка в промпт спеки, когда идёт круг правок. Замечания ревьювера и реплики
+# человека уже лежат в {{COMMENTS}} — здесь только объясняем, что с ними делать.
+SPEC_FIX_NOTE = """
+## Это круг правок
+
+Спека уже написана и отревьюена, замечания лежат в комментариях выше — их оставил
+ревьювер с меткой 🔍. Если после них писал человек, его слово важнее замечаний.
+
+Не переписывай спеку с нуля: открой существующий файл, поправь ровно то, на что
+указали, и закоммить поверх. Ветка та же, PR тот же — иначе ревью пойдёт по кругу
+с чистого листа. По каждому замечанию либо сделай, либо объясни в `risks`, почему нет.
+"""
 
 # Предупреждение про мок бека. Едет в описание сабтаски, в тело PR и отдельным
 # комментарием в PR: раскатывать такую правку до релиза бека нельзя, и человек,
@@ -2624,6 +2720,17 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
     kaiten.comment(epic["id"], text)
 
 
+def spec_pr_url(comments: list) -> str:
+    """Ссылка на PR спеки из комментария, которым фабрика о нём объявила."""
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(EPIC_MARK) and ("Спека" in text[:40]):
+            found = re.search(r"https://\S+/pull/\d+", text)
+            if found:
+                return found.group(0)
+    return ""
+
+
 def epic_worktree(kaiten: Kaiten, cfg: dict, repo_cfg: dict, repo_key: str,
                   card_id: int, writable: bool) -> Path:
     """
@@ -2678,16 +2785,20 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         log(f"  -> АЦ на апруве: {len(criteria)} пунктов")
         return
 
-    if phase == "spec":
+    if phase in ("spec", "spec_fix"):
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=True)
         criteria = acceptance_items(card)
+        fixing = phase == "spec_fix"
         prompt = epic_prompt(SPEC_TEMPLATE_PATH, card, card_url, repo_cfg, {
             "{{COMMENTS}}": format_comments(comments),
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}" for i in criteria),
             "{{SPEC_DIR}}": flow.get("spec_dir") or "specs",
             "{{BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{SPEC_NOTE}}": SPEC_FIX_NOTE if fixing else "",
+            "{{REVIEW_NOTES}}": (fetch_pr_notes(worktree, spec_pr_url(comments))
+                                 if fixing else ""),
         })
-        if show_prompt(prompt, args, "спеки"):
+        if show_prompt(prompt, args, "правки спеки" if fixing else "спеки"):
             return
         verdict, meta = run_agent(prompt, worktree, cfg["agent"], schema=SPEC_SCHEMA)
         note_spend(meta)
@@ -2706,10 +2817,12 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
         pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
                          verdict, cfg["pr"], args.dry_run) if not args.no_pr else "(без PR)"
+        head = "Спека поправлена:" if fixing else SPEC_LINE
         kaiten.comment(card_id,
-                       f"{EPIC_MARK} **{SPEC_LINE}** {pr_url}\n\n"
+                       f"{EPIC_MARK} **{head}** {pr_url}\n\n"
                        f"{verdict.get('summary', '')}\n\n"
-                       f"_спека, {format_meta(meta)}. Дальше её посмотрит ревьювер._"
+                       f"_{'правка спеки' if fixing else 'спека'}, {format_meta(meta)}. "
+                       f"Дальше её посмотрит ревьювер._"
                        + format_joke(verdict))
         log(f"  -> спека: {pr_url}")
         if not (args.keep_worktree or cfg.get("keep_worktree")):
@@ -2732,16 +2845,32 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
 
         findings = review.get("findings") or []
         blocking = [f for f in findings if f.get("severity") in ("blocker", "major")]
+        spec_pr = spec_pr_url(comments)
+
         if review.get("verdict") == "needs_changes" or blocking:
-            text = (f"{REVIEWER_MARK} **Спеку надо поправить.**\n\n"
-                    f"{review.get('summary', '')}")
-            for f in findings:
-                text += (f"\n\n{SEVERITY_ICON.get(f.get('severity', ''), '•')} "
-                         f"{f.get('what')}\n  → {f.get('fix')}")
+            # Полное ревью — комментарием в PR спеки: там его читает и человек,
+            # и следующий круг правок (фабрика забирает его обратно через gh)
+            full = (f"{REVIEWER_MARK} **Спеку надо поправить.**\n\n"
+                    f"{review.get('summary', '')}" + format_findings(findings))
+            if spec_pr and not args.dry_run:
+                post_pr_review(worktree, spec_pr, full)
+
+            text = (f"{REVIEWER_MARK} **Спеку надо поправить: {len(blocking)} "
+                    f"из {len(findings)}.**\n\n{review.get('summary', '')}")
+            for item in blocking[:3]:
+                icon = SEVERITY_ICON.get(item.get("severity", ""), "•")
+                text += f"\n\n{icon} {item.get('what', '')}"
+            if len(blocking) > 3:
+                text += f"\n\n…и ещё {len(blocking) - 3}."
+            if spec_pr:
+                text += f"\n\nПодробно, с причинами и что делать: {spec_pr}"
+            text += ("\n\nПоправит агент следующим прогоном — от тебя ничего не нужно. "
+                     "Хочешь вмешаться — напиши комментарием, твоя реплика уедет "
+                     "в правку вместе с замечаниями.")
             kaiten.comment(card_id, text)
-            hold(kaiten, card_id, BLOCK_QUESTION, "ревьювер вернул замечания к спеке")
-            log("  -> спека вернулась на правки")
+            log("  -> спека вернулась на правки к агенту")
             return
+
         kaiten.comment(card_id,
                        f"{EPIC_MARK} **{SPEC_OK_LINE}** {review.get('summary', '')}\n\n"
                        f"_ревью спеки, {format_meta(meta)}._" + format_joke(review))
@@ -2773,13 +2902,66 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
     log(f"  фаза «{phase}» ничего не требует")
 
 
+# Строки, по которым узнаём вопрос или замечание в комментарии агента. Ищем именно
+# их, а не весь текст: человеку в меню нужен вопрос, а не пересказ исследования.
+ASK_HEADS = ("Что нужно уточнить", "Замечания", "Что уточнить")
+ASK_BULLETS = ("- ", "• ", "🛑 ", "⚠️ ", "💬 ")
+
+
+def open_questions(comments: list, limit: int = 4) -> list[str]:
+    """
+    Чего именно фабрика ждёт от человека — по последнему комментарию агента.
+
+    Без этого «ждёт твоего ответа» бесполезно: вопросы лежат в карточке, иногда
+    разрезанные на три комментария по 4096 символов, и человек не понимает,
+    на что отвечать. Берём последний агентский комментарий и вытаскиваем из него
+    пункты списка.
+    """
+    # Берём всё, что агент сказал после последней реплики человека: длинный ответ
+    # Kaiten режет на несколько комментариев по 4096 символов, и блокеры оказываются
+    # в первой части, а не в последней. Один последний комментарий давал только хвост.
+    round_texts = []
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if not text.startswith(AGENT_MARKS):
+            break
+        round_texts.append(text)
+    round_texts.reverse()
+    if not round_texts:
+        return []
+
+    asks = []
+    for text in round_texts:
+        in_list = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if any(head.lower() in line.lower() for head in ASK_HEADS):
+                in_list = True
+                continue
+            if line.startswith(ASK_BULLETS):
+                # маркер severity оставляем: по нему сразу видно, что блокирует
+                asks.append(re.sub(r"^[-•]\s*", "", line))
+                in_list = True
+                continue
+            if in_list and not line.startswith(" "):
+                in_list = False
+
+    # блокеры вперёд: человек должен сначала увидеть то, из-за чего всё встало
+    order = {"🛑": 0, "⚠️": 1, "💬": 2}
+    asks.sort(key=lambda a: order.get(a[:2].strip(), 1))
+    return [a[:180] for a in asks[:limit]]
+
+
 def epic_status(kaiten: Kaiten, card: dict, title: str, phase: str,
-                blocker: str = "") -> dict:
+                blocker: str = "", asks: list[str] | None = None) -> dict:
     """
     Строчка про эпик для человечка в меню-баре.
 
     Счётчика мало: «эпики ждут тебя: 1» не говорит ни какой эпик, ни чего он ждёт,
-    и человек всё равно лезет на доску смотреть. Поэтому кладём заголовок и причину.
+    и человек всё равно лезет на доску смотреть. Поэтому кладём заголовок, причину
+    и сами вопросы.
     """
     return {
         "id": card["id"],
@@ -2788,6 +2970,7 @@ def epic_status(kaiten: Kaiten, card: dict, title: str, phase: str,
         "label": EPIC_PHASE_LABELS.get(phase, phase),
         # причину чистим от служебной метки: человеку она ничего не говорит
         "blocker": blocker.replace(BLOCK_MARK, "").strip(" :"),
+        "asks": asks or [],
         "url": kaiten.card_url(card),
     }
 
@@ -2871,11 +3054,12 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
         phase = epic_phase(kaiten, cfg, flow, card, comments)
         log(f"#{card_id} «{title[:50]}» — фаза: {EPIC_PHASE_LABELS.get(phase, phase)}")
 
-        if phase == "waiting_approval":
+        if phase == "waiting_answer":
             waiting += 1
-            blocker = own_blocker(kaiten, card_id, BLOCK_ACCEPTANCE) or {}
+            mine = next((b for b in kaiten.blockers(card_id) if ours(b)), {})
             pending.append(epic_status(kaiten, card, title, phase,
-                                       str(blocker.get("reason") or "")))
+                                       str(mine.get("reason") or ""),
+                                       asks=open_questions(comments)))
             continue
 
         if not args.prompt_only:
@@ -3071,12 +3255,31 @@ def main() -> int:
     return 0
 
 
+def clear_phase() -> None:
+    """
+    Убирает «чем занята» из статуса.
+
+    Без этого прерванный или упавший прогон оставляет в status.json последнюю фазу,
+    и человечек в меню-баре показывает работу, которой давно нет.
+    """
+    try:
+        if STATUS_FILE.is_file():
+            write_status(card=None, phase=None)
+    except Exception:  # noqa: BLE001 — на выходе падать уже незачем
+        pass
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except FactoryError as e:
         log(f"фатально: {e}")
+        clear_phase()
         sys.exit(1)
     except KeyboardInterrupt:
         log("прервано")
+        clear_phase()
         sys.exit(130)
+    except BaseException:
+        clear_phase()
+        raise
