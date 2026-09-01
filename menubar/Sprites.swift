@@ -14,6 +14,7 @@ enum Mood {
     case working   // агент работает — человечек стучит по клавиатуре
     case sleeping  // делать нечего — спит, над головой «z»
     case asking    // ждёт ответа на вопрос — над головой «?»
+    case epicAsking // ждёт ответа по эпику — рядом кусочек пазла, как 🧩 в меню
     case alert     // прошлый прогон свалился — «!»
 }
 
@@ -54,6 +55,7 @@ enum Sprites {
         case .working:  drawWorking()
         case .sleeping: drawSleeping()
         case .asking:   drawFigure(); glyph("?", size: 12, x: 13.2, top: 2.4, alpha: 1)
+        case .epicAsking: drawFigure(); drawPuzzle()
         case .alert:    drawFigure(); glyph("!", size: 12, x: 13.2, top: 2.4, alpha: 1)
         }
     }
@@ -120,6 +122,22 @@ enum Sprites {
         NSColor.black.setFill()
 
         context?.restoreGraphicsState()
+    }
+
+    /// Кусочек пазла — знак того, что ответа ждёт эпик, а не обычная карточка.
+    /// Рисуется вектором, а не эмодзи: иконка шаблонная, и 🧩 в ней превратился бы
+    /// в бесформенное пятно. Выступ добавляем заливкой, выемку — стиранием альфы.
+    private static func drawPuzzle() {
+        rounded(x: 13.8, top: 5.0, width: 7.0, height: 7.0, radius: 1.1)
+        circle(centerX: 17.6, centerTop: 5.0, diameter: 3.4)   // выступ сверху
+
+        // Выемка слева: destinationOut выедает уже нарисованное. Обычная заливка
+        // цветом фона тут не сработала бы — картинка это маска, а не пиксели.
+        // Диаметр крупный намеренно: в 18pt мелкая выемка сливается, и пазл
+        // становится неотличим от простого квадрата.
+        NSGraphicsContext.current?.compositingOperation = .destinationOut
+        circle(centerX: 13.8, centerTop: 9.2, diameter: 3.8)
+        NSGraphicsContext.current?.compositingOperation = .sourceOver
     }
 
     private static func arm(x: CGFloat, top: CGFloat) {

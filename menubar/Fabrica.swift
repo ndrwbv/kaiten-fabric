@@ -287,7 +287,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private func currentMood() -> Mood {
         if runner != nil { return .working }
         if lastError != nil { return .alert }
-        if !status.epics.isEmpty || status.awaitingAnswer > 0 { return .asking }
+        // Эпик важнее обычного вопроса: вопросов в «Вопросе от агента» может висеть
+        // сколько угодно и подолгу, а эпик заблокирован и ждёт решения именно сейчас.
+        if !status.epics.isEmpty { return .epicAsking }
+        if status.awaitingAnswer > 0 { return .asking }
         return .sleeping
     }
 

@@ -15,6 +15,7 @@ enum Preview {
             ("working", .working),
             ("sleeping", .sleeping),
             ("asking", .asking),
+            ("epicAsking", .epicAsking),
             ("alert", .alert),
         ]
 
