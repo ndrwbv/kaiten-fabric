@@ -14,7 +14,9 @@ spec = importlib.util.spec_from_file_location(
 f = importlib.util.module_from_spec(spec); spec.loader.exec_module(f)
 
 GOT = []          # что фальшивый сервер получил
-QUESTION = ["регистр поехал и в шапке тоже, поправь и там"]   # что человек написал в тред
+# что человек написал в тред. Фабрика реагирует только на обращение к себе,
+# а бот в фальшивом Mattermost зовётся fabrica
+QUESTION = ["@fabrica регистр поехал и в шапке тоже, поправь и там"]
 BOT_ID = "bot-000"
 
 
@@ -162,6 +164,7 @@ check("это человеческий комментарий, не агентс
       not text.startswith(f.AGENT_MARKS) and text.startswith(f.FROM_TIME_MARK))
 check("виден автор", "Андрей" in text)
 check("текст перенесён целиком", "поправь и там" in text)
+check("обращение к боту в карточку не тащим", "@fabrica" not in text, text)
 check("карточка уехала в «Правки»", kaiten.moves == [(555, 106)], str(kaiten.moves))
 check("системное сообщение не перенесено", "system_join" not in text)
 check("своё сообщение не перенесено", "PR: ..." not in text)
@@ -262,7 +265,7 @@ print("=== 13. «как дела» — ответ в тред, карточку 
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
     "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
-QUESTION[0] = "как дела?"
+QUESTION[0] = "@fabrica как дела?"
 GOT.clear()
 asker = FakeKaiten()
 f.follow_time_threads(asker, cfg, Args(), profiles)
@@ -275,7 +278,7 @@ check("в карточку вопрос не тащил", asker.comments_written
 check("карточку не двигал", asker.moves == [], str(asker.moves))
 
 print("=== 14. а правку по-прежнему переносит ===")
-QUESTION[0] = "поправь ещё заголовок, он тоже в нижнем регистре"
+QUESTION[0] = "@fabrica поправь ещё заголовок, он тоже в нижнем регистре"
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
     "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
@@ -286,7 +289,7 @@ check("перенёс в карточку", len(fixer.comments_written) == 1, st
 check("и взял в правки", fixer.moves == [(555, 106)], str(fixer.moves))
 
 print("=== 15. длинное сообщение с «как дела» внутри — это задача ===")
-QUESTION[0] = ("как дела? и заодно поправь, пожалуйста, заголовок промо-экрана — "
+QUESTION[0] = ("@fabrica как дела? и заодно поправь, пожалуйста, заголовок промо-экрана — "
                "он тоже приводится к нижнему регистру, а должен быть как есть")
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
@@ -295,6 +298,22 @@ long_one = FakeKaiten()
 f.follow_time_threads(long_one, cfg, Args(), profiles)
 check("не принято за вопрос", len(long_one.comments_written) == 1,
       str(long_one.comments_written))
+
+print("=== 16. чужой разговор в треде фабрика не трогает ===")
+QUESTION[0] = "@s.volkov брат, дай апрувчик плз, и там выше прчики посмотри"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+bystander = FakeKaiten()
+f.follow_time_threads(bystander, cfg, Args(), profiles)
+check("в карточку не тащит", bystander.comments_written == [],
+      str(bystander.comments_written))
+check("карточку не двигает", bystander.moves == [], str(bystander.moves))
+check("в тред не отвечает",
+      [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
+check("но сообщение считает прочитанным", json.loads(f.TIME_STATE_FILE.read_text())
+      ["threads"]["555"]["last_post_id"] == "reply")
 
 srv.shutdown()
 print("\nвсё сошлось")

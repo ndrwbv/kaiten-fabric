@@ -760,6 +760,13 @@ TIME_ASK_WORDS = ("как дела", "что там", "как продвигае
 TIME_ASK_LIMIT = 80
 
 
+def strip_mention(text: str, handle: str) -> str:
+    """Убрать обращение к боту: в карточку и в разбор оно уже ни к чему."""
+    if not handle:
+        return text.strip()
+    return re.sub(rf"(?i){re.escape(handle)}[:,]?\s*", "", text).strip()
+
+
 def looks_like_question(text: str) -> bool:
     if len(text.strip()) > TIME_ASK_LIMIT:
         return False
@@ -1247,10 +1254,14 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         return 0
 
     try:
-        bot_id = client.me().get("id") or ""
+        me = client.me()
     except FactoryError as e:
         log(f"Time: не смог узнать себя ({e}) — треды не читаю")
         return 0
+    bot_id = me.get("id") or ""
+    # По этому обращению фабрика понимает, что говорят с ней. Берём из токена, а не
+    # из конфига: имя бота знает он сам, и лишней настройке тут делать нечего
+    handle = f"@{me.get('username')}".lower() if me.get("username") else ""
 
     allowed = [name.lstrip("@").lower() for name in (conf.get("allow_from") or [])]
     note_phase(args, "читаю треды в Time")
@@ -1357,11 +1368,22 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 save_time_state(state)
                 continue
 
+        # В треде люди говорят и между собой: тегают друг друга, обсуждают релиз,
+        # просят апрув. Фабрика вмешивается только когда обратились к ней — иначе она
+        # уносила бы в карточку чужой разговор и заводила по нему правки.
+        addressed = [(post, strip_mention(post.get("message") or "", handle))
+                     for post in human
+                     if handle and handle in (post.get("message") or "").lower()]
+        if not addressed:
+            if human:
+                log(f"  #{card_key}: в треде говорят не со мной — не трогаю")
+            save_time_state(state)
+            continue
+
         # «Как дела» — это вопрос, а не задача: отвечаем из карточки и ничего не двигаем.
         # Иначе такой вопрос уезжал бы правкой, и следующий прогон тратил бы на него
         # настоящего агента.
-        questions = [post for post in human
-                     if looks_like_question(post.get("message") or "")]
+        questions = [pair for pair in addressed if looks_like_question(pair[1])]
         if questions:
             try:
                 client.post(info.get("channel_id", ""),
@@ -1370,19 +1392,18 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 log(f"  #{card_key}: ответил в тред, что с задачей")
             except FactoryError as e:
                 log(f"  !! не смог ответить в тред по #{card_key}: {e}")
-        human = [post for post in human if post not in questions]
-        if not human:
+        tasks = [pair for pair in addressed if pair not in questions and pair[1]]
+        if not tasks:
             save_time_state(state)
             continue
 
-        for post in human:
+        for post, text in tasks:
             user = names.get(post.get("user_id"), {})
             author = (user.get("nickname") or user.get("username")
                       or user.get("first_name") or "кто-то в Time")
-            kaiten.comment(card["id"], from_thread_comment(author,
-                                                           (post.get("message") or "").strip()))
-        log(f"  #{card_key}: перенёс из треда {len(human)} "
-            f"{'сообщение' if len(human) == 1 else 'сообщений'}")
+            kaiten.comment(card["id"], from_thread_comment(author, text))
+        log(f"  #{card_key}: перенёс из треда {len(tasks)} "
+            f"{'сообщение' if len(tasks) == 1 else 'сообщений'}")
 
         moved += 1
         stuck = blocked_by(kaiten, card["id"])
@@ -3374,7 +3395,11 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         if status is None and commits:
             first = commits.splitlines()[0].split(" ", 1)
             if len(first) > 1:
-                verdict["summary"] = first[1]
+                # «#69826636 Включить обязательный ввод…» -> «Включить обязательный ввод…»:
+                # по правилам промпта первая строка коммита начинается с номера карточки,
+                # а фраза уезжает в комментарий этой же карточки и в сообщение со ссылкой
+                # на неё — номер там только мешает
+                verdict["summary"] = re.sub(r"^#\d+\s+", "", first[1])
 
         # Агента оборвали снаружи — он не «ничего не сделал», он не доработал.
         # Раньше это выглядело как «агент не внёс изменений и не объяснил почему»:
