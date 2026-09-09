@@ -887,6 +887,55 @@ def save_time_state(state: dict) -> None:
     tmp.replace(TIME_STATE_FILE)
 
 
+def time_announce(kaiten: Kaiten, cfg: dict, args, card_id: int) -> int:
+    """
+    Объявить в канал PR карточки, у которой он уже открыт.
+
+    Обычно сообщение уходит само, из `open_pr`. Но бывает, что PR старше самой отправки:
+    бота настроили позже, чем сделали задачу; или отправка сорвалась на сети — ошибки там
+    только в лог, потому что открытый PR важнее отчёта в мессенджер. Тогда объявление
+    некому послать второй раз, и корня треда не появится — а без него не работают
+    и правки из треда. Эта команда его и создаёт.
+    """
+    conf = time_config(cfg)
+    if not conf:
+        print("Секции notify.time в конфиге нет — фабрика в Time не пишет.")
+        return 1
+    known = (load_time_state().get("threads") or {}).get(str(card_id))
+    if known and known.get("root_id"):
+        print(f"По #{card_id} тред уже есть: сообщение в канале не дублируем.")
+        return 0
+
+    card = kaiten.card(card_id)
+    repo_key, repo_cfg = resolve_repo(card, cfg)
+    repo = Path(repo_cfg["path"]).expanduser()
+    branch = remote_branch_for_card(repo, repo_cfg["remote"],
+                                    (cfg.get("pr") or {}).get("branch_prefix", "ai/card-"),
+                                    card_id)
+    if not branch:
+        print(f"Ветки по #{card_id} в {repo_cfg['remote']} нет — объявлять нечего.")
+        return 1
+    pr_url = run_bounded(
+        ["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "url",
+         "--jq", ".[0].url"], repo, 120).stdout.strip()
+    if not pr_url.startswith("http"):
+        print(f"PR для ветки {branch} не нашёлся.")
+        return 1
+
+    # summary берём из отчёта агента в карточке: verdict давно отработал, а фраза
+    # «что сделано» осталась там же, где её читает человек
+    summary = ""
+    for comment in kaiten.comments(card_id):
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(AGENT_MARK) and "PR:" in text:
+            tail = text.split("Ветка:", 1)[-1].split("\n", 1)[-1].strip()
+            summary = tail.split("_Агент:")[0].strip()
+    notify_pr(cfg, repo_key, card, kaiten.card_url(card), pr_url,
+              {"summary": summary}, args.dry_run)
+    print(f"Объявил #{card_id}: {pr_url}")
+    return 0
+
+
 def time_channels(cfg: dict, args) -> int:
     """
     Список каналов бота машинным JSON. Этим пользуется окно настроек: человеку остаётся
@@ -954,23 +1003,21 @@ def time_test(cfg: dict, args) -> int:
     return 0
 
 
-def time_pr_message(card: dict, card_url: str, pr_url: str, branch: str,
-                    verdict: dict, epic_id: int | None) -> str:
-    title = (card.get("title") or "").strip()
-    lines = [f"**#{card['id']} {title}**", f"PR: {pr_url}", f"Карточка: {card_url}"]
-    if epic_id:
-        lines.append(f"Эпик: #{epic_id}")
-    summary = brief(verdict.get("summary") or "")
+def time_pr_message(card_url: str, pr_url: str, summary: str) -> str:
+    """
+    Две строки, и всё: ссылка на PR с одной фразой о том, что он делает, и ссылка
+    на карточку. Заголовок карточки не нужен — фраза агента говорит больше, а номер
+    и так виден по ссылке. Приглашения «ответь в треде» тоже нет: учить этому в каждом
+    сообщении дорого, а знают об этом и так.
+    """
+    head = f"[PR]({pr_url})"
     if summary:
-        lines.append("")
-        lines.append(summary)
-    lines.append("")
-    lines.append("_Что поправить — ответь в этом треде._")
-    return "\n".join(lines)
+        head += f" {summary}"
+    return f"{head}\n[Карточка]({card_url})"
 
 
 def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
-              pr_url: str, branch: str, verdict: dict, dry_run: bool,
+              pr_url: str, verdict: dict, dry_run: bool,
               updated: bool = False, env: dict | None = None) -> None:
     """
     Сообщение про PR в канал Time. Ошибки только в лог: PR уже открыт, и отчёт
@@ -993,8 +1040,8 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         if updated:
             if not known.get("root_id"):
                 return  # корня нет — отвечать некуда, а новым сообщением шуметь незачем
-            summary = brief(verdict.get("summary") or "") or "Поправил."
-            client.post(known.get("channel_id", ""), f"Поправил: {summary}\n{pr_url}",
+            summary = brief(verdict.get("summary") or "") or "без описания"
+            client.post(known.get("channel_id", ""), f"Поправил: {summary}",
                         root_id=known["root_id"])
             log("  написал в тред Time про правку")
             return
@@ -1003,7 +1050,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             log("Time: не задан канал (notify.time.channels) — не пишу")
             return
         post = client.post(channel, time_pr_message(
-            card, card_url, pr_url, branch, verdict, epic_of_card(card)))
+            card_url, pr_url, brief(verdict.get("summary") or "")))
         if post and post.get("id"):
             state.setdefault("threads", {})[str(card["id"])] = {
                 "channel_id": post.get("channel_id") or channel,
@@ -2547,8 +2594,7 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
     ).stdout.strip()
     if existing:
         log(f"  PR для ветки уже открыт: {existing}")
-        notify_pr(cfg, repo_key, card, card_url, existing, branch, verdict, dry_run,
-                  updated=True)
+        notify_pr(cfg, repo_key, card, card_url, existing, verdict, dry_run, updated=True)
         return existing
 
     # тело отдаём файлом: шаблоны бывают на десятки килобайт, в argv их тащить незачем
@@ -2571,7 +2617,7 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
         raise FactoryError("gh pr create отработал, но не вернул ссылку на PR")
     # отправка живёт здесь, а не у вызывающих: open_pr зовут из двух мест, завтра
     # появится третье — и его забудут подключить. Одна точка, из которой нельзя не написать
-    notify_pr(cfg, repo_key, card, card_url, lines[-1], branch, verdict, dry_run)
+    notify_pr(cfg, repo_key, card, card_url, lines[-1], verdict, dry_run)
     return lines[-1]
 
 
@@ -4732,6 +4778,8 @@ def main() -> int:
                         help="послать в канал Time тестовое сообщение и выйти")
     parser.add_argument("--time-channels", action="store_true",
                         help="показать каналы бота списком (JSON) и выйти")
+    parser.add_argument("--time-announce", type=int, metavar="CARD_ID",
+                        help="объявить в канал уже открытый PR карточки и выйти")
     parser.add_argument("--epic-card", type=int,
                         help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
@@ -4784,7 +4832,8 @@ def main() -> int:
     # состояние часовой давности, и человек справедливо считал, что ничего не двигается.
     # Проверке связи снимок не нужен вовсе: она ничего не берёт из Kaiten, а обход досок
     # добавил бы к нажатию кнопки в окне настроек двадцать секунд ожидания.
-    snapshot = not (args.prompt_only or args.time_test or args.time_channels)
+    snapshot = not (args.prompt_only or args.time_test or args.time_channels
+                    or args.time_announce)
     if snapshot:
         refresh_flow(kaiten, cfg, profiles)
     try:
@@ -4817,6 +4866,8 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         return time_test(cfg, args)
     if args.time_channels:
         return time_channels(cfg, args)
+    if args.time_announce:
+        return time_announce(kaiten, cfg, args, args.time_announce)
     if args.only_time:
         return follow_time_threads(kaiten, cfg, args, profiles)
 

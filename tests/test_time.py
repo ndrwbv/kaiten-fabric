@@ -91,7 +91,7 @@ check("Keychain без записи молчит", f.keychain_secret("TIME_NOPE_
 
 print("=== 2. без секции notify фабрика в Time не ходит ===")
 before = len(GOT)
-f.notify_pr({}, "kiosk", {"id": 1, "title": "т"}, "url", "https://pr/1", "br", {}, False)
+f.notify_pr({}, "kiosk", {"id": 1, "title": "т"}, "url", "https://pr/1", {}, False)
 check("notify_pr молчит", len(GOT) == before)
 check("клиента нет", f.time_client({}, {}) is None)
 
@@ -105,23 +105,27 @@ cfg = {"notify": {"time": {"transport": "bot", "base_url": BASE,
 env = {"TIME_BOT_TOKEN": "tok-123"}
 card = {"id": 555, "title": "Поправить текст в дринкит в банере"}
 f.notify_pr(cfg, "kiosk", card, "https://kaiten/card/555",
-            "https://github.com/o/r/pull/7", "ai/card-555", {"summary": "Убрал lowercase."},
+            "https://github.com/o/r/pull/7", {"summary": "Убрал lowercase."},
             False, env=env)
 sent = [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")]
 check("сообщение ушло", len(sent) == 1)
 body = json.loads(sent[-1][2])
 check("в нужный канал", body["channel_id"] == "chan-1", body.get("channel_id"))
 check("не в тред (это корень)", "root_id" not in body)
-check("есть номер карточки", "#555" in body["message"])
-check("есть ссылка на PR", "pull/7" in body["message"])
-check("есть приглашение отвечать в тред", "ответь в этом треде" in body["message"])
+check("ссылка на PR подписана словом PR", "[PR](https://github.com/o/r/pull/7)"
+      in body["message"], body["message"])
+check("рядом фраза, что он делает", "Убрал lowercase." in body["message"])
+check("вторая строка — ссылка на карточку",
+      body["message"].splitlines()[-1].startswith("[Карточка](https://kaiten"))
+check("и больше ничего: две строки", len(body["message"].splitlines()) == 2,
+      body["message"])
 check("токен ушёл заголовком", sent[-1][3] == "Bearer tok-123", sent[-1][3])
 saved = json.loads(state_file.read_text())["threads"]["555"]
 check("корень треда запомнен", saved["root_id"] == "new-post", str(saved))
 
 print("=== 4. правка по тому же PR — ответом в тот же тред ===")
 f.notify_pr(cfg, "kiosk", card, "https://kaiten/card/555",
-            "https://github.com/o/r/pull/7", "ai/card-555",
+            "https://github.com/o/r/pull/7",
             {"summary": "Поправил шапку."}, False, updated=True, env=env)
 body = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")][-1][2])
 check("ушло в тред", body.get("root_id") == "new-post", str(body))
@@ -167,7 +171,7 @@ print("=== 8. вебхук: пишет, но тред читать нечем ==
 GOT.clear()
 hook = {"notify": {"time": {"transport": "webhook", "base_url": BASE,
                             "channels": {"default": "chan-1"}}}}
-f.notify_pr(hook, "kiosk", card, "https://kaiten/card/1", "https://pr/9", "br",
+f.notify_pr(hook, "kiosk", card, "https://kaiten/card/1", "https://pr/9",
             {"summary": "Сделал."}, False, env={"TIME_WEBHOOK_URL": BASE + "/hooks/abc"})
 hooked = [g for g in GOT if g[1] == "/hooks/abc"]
 check("ушло на адрес вебхука", len(hooked) == 1, str(GOT))
