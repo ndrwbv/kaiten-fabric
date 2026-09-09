@@ -923,13 +923,17 @@ def time_announce(kaiten: Kaiten, cfg: dict, args, card_id: int) -> int:
         return 1
 
     # summary берём из отчёта агента в карточке: verdict давно отработал, а фраза
-    # «что сделано» осталась там же, где её читает человек
+    # «что сделано» осталась там же, где её читает человек. Нужен ровно первый абзац
+    # после строки с веткой: дальше в комментарии идут «Риски» и предупреждения,
+    # и без этого в канал уехала бы стена текста
     summary = ""
     for comment in kaiten.comments(card_id):
         text = strip_html(comment.get("text", ""))
         if text.startswith(AGENT_MARK) and "PR:" in text:
-            tail = text.split("Ветка:", 1)[-1].split("\n", 1)[-1].strip()
-            summary = tail.split("_Агент:")[0].strip()
+            after = text.split("Ветка:", 1)[-1]
+            after = after.split("\n", 1)[-1] if "\n" in after else ""
+            blocks = [block.strip() for block in after.split("\n\n") if block.strip()]
+            summary = blocks[0] if blocks else ''
     notify_pr(cfg, repo_key, card, kaiten.card_url(card), pr_url,
               {"summary": summary}, args.dry_run)
     print(f"Объявил #{card_id}: {pr_url}")
