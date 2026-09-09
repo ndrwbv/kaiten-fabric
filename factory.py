@@ -57,6 +57,9 @@ STATE = ROOT / "state"
 STATUS_FILE = STATE / "status.json"
 # счётчик неудач разведки по карточкам: не долбить одну и ту же карточку каждые 10 минут
 TRIAGE_STATE_FILE = STATE / "triage.json"
+# треды в Time: по какой карточке в каком канале лежит корневое сообщение и до какого
+# ответа в нём мы уже дочитали
+TIME_STATE_FILE = STATE / "time.json"
 
 ENV_CANDIDATES = [ROOT / ".env", Path.home() / ".claude" / ".env"]
 
@@ -75,6 +78,11 @@ EPIC_MARK = "🧩"
 
 # всё, что написано роботами. Комментарий не с этой метки — реплика человека
 AGENT_MARKS = (AGENT_MARK, REVIEWER_MARK, TRIAGE_MARK, EPIC_MARK)
+
+# Метка комментария, перенесённого из треда в Time. В AGENT_MARKS её намеренно нет:
+# это слова человека, просто сказанные в другом месте, и вся машина — «ответили ли
+# на вопрос», «чей сейчас ход», стоп-фраза — должна считать их человеческими.
+FROM_TIME_MARK = "💬"
 
 # Строка в описании рабочей карточки: из какой карточки инбокса она выросла. По ней же
 # ловится дубль, если разведка почему-то зайдёт на ту карточку второй раз.
@@ -429,6 +437,45 @@ def load_env() -> dict:
         "KAITEN_TOKEN не найден. Положи его в " + " или ".join(str(p) for p in ENV_CANDIDATES)
     )
 
+# Имя записи в Keychain, куда меню-бар кладёт секреты из окна настроек.
+KEYCHAIN_SERVICE = "kaiten-fabrica"
+
+
+def keychain_secret(name: str) -> str:
+    """
+    Секрет из Keychain. Не на маке — пусто, и это не ошибка.
+
+    Окно настроек пишет сюда, а не в файл: токен в открытом виде на диске — то, чего
+    в публичном репозитории не должно появиться даже случайно.
+    """
+    if sys.platform != "darwin":
+        return ""
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def resolve_secret(name: str, env: dict | None = None) -> str:
+    """
+    Секрет ищется в одном порядке на всё: окружение, Keychain, `.env`.
+
+    Порядок выбран под переезд на сервер: там нет ни Keychain, ни профиля, зато есть
+    переменные окружения из systemd — и они должны выигрывать, не требуя правки конфига.
+    На маке секрет кладёт окно настроек в Keychain. `.env` остаётся третьим, потому что
+    так сейчас лежит KAITEN_TOKEN, и ломать это незачем.
+    """
+    from_env = (os.environ.get(name) or "").strip()
+    if from_env:
+        return from_env
+    from_keychain = keychain_secret(name)
+    if from_keychain:
+        return from_keychain
+    return ((env or {}).get(name) or "").strip()
+
 
 # --------------------------------------------------------------------------- #
 # Kaiten
@@ -626,6 +673,372 @@ def has_tag(card: dict, name: str) -> bool:
     """
     wanted = normalize_phrase(name)
     return any(normalize_phrase(tag.get("name")) == wanted for tag in (card.get("tags") or []))
+
+
+# --------------------------------------------------------------------------- #
+# Time
+# --------------------------------------------------------------------------- #
+
+# Какие события уезжают в канал, если в конфиге не сказано иное.
+TIME_EVENTS = ("pr_opened", "pr_updated", "fix_taken")
+
+
+class Time:
+    """
+    Клиент Time — это Mattermost, обычный `/api/v4`.
+
+    Ходим curl'ом по той же причине, что и в Kaiten: на рабочих маках корпоративный
+    MITM-прокси, и python падает на проверке сертификата.
+
+    Два транспорта. С токеном бота доступно всё: и писать, и читать тред. С incoming
+    webhook — только писать: тред он создать не умеет, id своего сообщения не отдаёт,
+    а читать канал им нельзя вообще. Поэтому `can_read` — это ещё и «умеем ли мы
+    вторую половину работы».
+    """
+
+    def __init__(self, base_url: str, token: str = "", webhook_url: str = "",
+                 dry_run: bool = False):
+        self.api = (base_url or "").rstrip("/") + "/api/v4"
+        self.token = token
+        self.webhook_url = webhook_url
+        self.dry_run = dry_run
+
+    @property
+    def can_read(self) -> bool:
+        return bool(self.token)
+
+    def _request(self, method: str, url: str, body=None, config: str = ""):
+        """
+        Секреты уходят в curl через stdin (-K -), а не в argv: и токен, и URL вебхука
+        видны были бы в `ps` любому пользователю машины. У вебхука URL и есть секрет,
+        поэтому в его случае через stdin едет сам адрес.
+        """
+        cmd = ["curl", "-sS", "-K", "-", "--max-time", "30", "-X", method,
+               "-H", "Content-Type: application/json", "-w", "\n%{http_code}"]
+        if url:
+            cmd.append(url)
+        if body is not None:
+            cmd += ["--data-raw", json.dumps(body, ensure_ascii=False)]
+        proc = subprocess.run(cmd, input=config or "\n", capture_output=True,
+                              text=True, timeout=60)
+        if proc.returncode != 0:
+            raise FactoryError(f"Time {method} -> curl {proc.returncode}: "
+                               f"{proc.stderr.strip()[:200]}")
+        raw, _, code = proc.stdout.rpartition("\n")
+        if code.strip() and int(code) >= 400:
+            raise FactoryError(f"Time {method} -> HTTP {code}: {raw[:300]}")
+        try:
+            return json.loads(raw) if raw.strip() else None
+        except json.JSONDecodeError:
+            # вебхук на успех отвечает не JSON, а словом ok — это не ошибка
+            return None
+
+    def _auth(self) -> str:
+        return f'header = "Authorization: Bearer {self.token}"\n'
+
+    def post(self, channel_id: str, text: str, root_id: str = "") -> dict | None:
+        """Сообщение в канал или ответ в тред. Возвращает пост — у вебхука его нет."""
+        if self.dry_run:
+            where = f"тред {root_id}" if root_id else f"канал {channel_id}"
+            log(f"  [dry-run] Time -> {where}: {text[:120]}")
+            return None
+        if self.webhook_url:
+            if root_id:
+                log("  вебхук не умеет отвечать в тред — сообщение уйдёт в канал")
+            return self._request("POST", "", {"text": text},
+                                 config=f'url = "{self.webhook_url}"\n')
+        body = {"channel_id": channel_id, "message": text}
+        if root_id:
+            body["root_id"] = root_id
+        return self._request("POST", f"{self.api}/posts", body, config=self._auth())
+
+    def thread(self, root_id: str) -> list:
+        """Сообщения треда по времени. Ответ Mattermost — словарь постов плюс порядок."""
+        data = self._request("GET", f"{self.api}/posts/{root_id}/thread",
+                             config=self._auth()) or {}
+        posts = list((data.get("posts") or {}).values())
+        return sorted(posts, key=lambda post: post.get("create_at") or 0)
+
+    def me(self) -> dict:
+        return self._request("GET", f"{self.api}/users/me", config=self._auth()) or {}
+
+    def users(self, ids: list[str]) -> dict:
+        """id -> пользователь. Одним запросом на всех, а не по одному на автора."""
+        if not ids:
+            return {}
+        found = self._request("POST", f"{self.api}/users/ids", sorted(set(ids)),
+                              config=self._auth()) or []
+        return {user.get("id"): user for user in found}
+
+
+def time_config(cfg: dict) -> dict:
+    return ((cfg.get("notify") or {}).get("time") or {})
+
+
+def time_client(cfg: dict, env: dict, dry_run: bool = False) -> Time | None:
+    """
+    Клиент или None, если отправка не настроена.
+
+    Нет секции `notify.time` — молчим: фабрика должна вести себя ровно так, как до
+    появления бота. Секция есть, а секрета нет — говорим, это уже опечатка в настройке.
+    """
+    conf = time_config(cfg)
+    if not conf:
+        return None
+    if (conf.get("transport") or "bot") == "webhook":
+        url = resolve_secret("TIME_WEBHOOK_URL", env)
+        if not url:
+            log("Time настроен на вебхук, но TIME_WEBHOOK_URL не найден — не пишу")
+            return None
+        return Time(conf.get("base_url", ""), webhook_url=url, dry_run=dry_run)
+    token = resolve_secret("TIME_BOT_TOKEN", env)
+    if not token:
+        log("Time настроен на бота, но TIME_BOT_TOKEN не найден — не пишу")
+        return None
+    if not conf.get("base_url"):
+        log("Time: не задан notify.time.base_url — не пишу")
+        return None
+    return Time(conf["base_url"], token=token, dry_run=dry_run)
+
+
+def time_channel(conf: dict, repo_key: str | None) -> str:
+    """Канал под репозиторий, иначе общий: два проекта в один канал сваливать незачем."""
+    channels = conf.get("channels") or {}
+    return channels.get(repo_key or "") or channels.get("default") or ""
+
+
+def time_wants(conf: dict, event: str) -> bool:
+    return event in (conf.get("events") or TIME_EVENTS)
+
+
+def load_time_state() -> dict:
+    if TIME_STATE_FILE.is_file():
+        try:
+            return json.loads(TIME_STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"threads": {}}
+
+
+def save_time_state(state: dict) -> None:
+    STATE.mkdir(exist_ok=True)
+    tmp = TIME_STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(TIME_STATE_FILE)
+
+
+def time_pr_message(card: dict, card_url: str, pr_url: str, branch: str,
+                    verdict: dict, epic_id: int | None) -> str:
+    title = (card.get("title") or "").strip()
+    lines = [f"**#{card['id']} {title}**", f"PR: {pr_url}", f"Карточка: {card_url}"]
+    if epic_id:
+        lines.append(f"Эпик: #{epic_id}")
+    summary = brief(verdict.get("summary") or "")
+    if summary:
+        lines.append("")
+        lines.append(summary)
+    lines.append("")
+    lines.append("_Что поправить — ответь в этом треде._")
+    return "\n".join(lines)
+
+
+def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
+              pr_url: str, branch: str, verdict: dict, dry_run: bool,
+              updated: bool = False, env: dict | None = None) -> None:
+    """
+    Сообщение про PR в канал Time. Ошибки только в лог: PR уже открыт, и отчёт
+    в мессенджер не важнее того, что работа сделана.
+
+    Новый PR — корневое сообщение, и его id запоминается: он же корень треда, в который
+    человек напишет правки. Обновление PR (круг «Правки») — ответ в тот же тред, чтобы
+    канал не зарастал одной и той же задачей.
+    """
+    conf = time_config(cfg)
+    event = "pr_updated" if updated else "pr_opened"
+    if not conf or not time_wants(conf, event) or not pr_url.startswith("http"):
+        return
+    client = time_client(cfg, env or load_env(), dry_run)
+    if not client:
+        return
+    state = load_time_state()
+    known = (state.get("threads") or {}).get(str(card["id"])) or {}
+    try:
+        if updated:
+            if not known.get("root_id"):
+                return  # корня нет — отвечать некуда, а новым сообщением шуметь незачем
+            summary = brief(verdict.get("summary") or "") or "Поправил."
+            client.post(known.get("channel_id", ""), f"Поправил: {summary}\n{pr_url}",
+                        root_id=known["root_id"])
+            log("  написал в тред Time про правку")
+            return
+        channel = time_channel(conf, repo_key)
+        if not channel and not client.webhook_url:
+            log("Time: не задан канал (notify.time.channels) — не пишу")
+            return
+        post = client.post(channel, time_pr_message(
+            card, card_url, pr_url, branch, verdict, epic_of_card(card)))
+        if post and post.get("id"):
+            state.setdefault("threads", {})[str(card["id"])] = {
+                "channel_id": post.get("channel_id") or channel,
+                "root_id": post["id"],
+                "last_post_id": post["id"],
+                "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            save_time_state(state)
+        log("  написал про PR в Time")
+    except Exception as e:  # noqa: BLE001 — PR уже открыт, отправка не важнее
+        log(f"  !! в Time не написал: {e}")
+
+
+def from_thread_comment(author: str, text: str) -> str:
+    """
+    Комментарий в карточку из треда.
+
+    Метка FROM_TIME_MARK, а не AGENT_MARK: это слова человека, и вся машина — «ответили
+    ли на вопрос», «чей ход», стоп-фраза — должна считать их человеческими. Иначе ответ
+    в треде выглядел бы для фабрики её собственной репликой и ничего не двигал.
+    """
+    return f"{FROM_TIME_MARK} **Из треда в Time** ({author}):\n\n{text}"
+
+
+def profile_for_board(profiles: list[dict], board_id: int) -> dict | None:
+    return next((p for p in profiles if p["board_id"] == board_id), None)
+
+
+def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
+    """
+    Фаза чтения тредов: что человек написал в треде — то и станет правкой.
+
+    Тред здесь — второй вход в ту же машину, а не своя. Сообщение переносится
+    комментарием в карточку, карточка уезжает в «Правки», и дальше всё идёт обычным
+    порядком: исполнитель, ревьювер, тот же PR в той же ветке. Прямой путь
+    «сообщение → агент» пришлось бы снабдить своим счётчиком кругов, стоп-фразой,
+    бюджетом и ночным тегом — и через месяц он разъехался бы с оригиналом.
+
+    Опрос, а не входящий вебхук: фабрика — пакетный процесс по расписанию, принимать
+    входящий HTTP ей некуда. На сервере можно будет реагировать сразу, но опрос
+    останется — он же и восстановление после простоя.
+    """
+    conf = time_config(cfg)
+    if not conf or not conf.get("follow_threads", True):
+        return 0
+    env = load_env()
+    client = time_client(cfg, env, args.dry_run)
+    if not client:
+        return 0
+    if not client.can_read:
+        log("Time на вебхуке: тред читать нечем, правки из треда не заработают")
+        return 0
+
+    state = load_time_state()
+    threads = state.get("threads") or {}
+    if not threads:
+        return 0
+
+    try:
+        bot_id = client.me().get("id") or ""
+    except FactoryError as e:
+        log(f"Time: не смог узнать себя ({e}) — треды не читаю")
+        return 0
+
+    allowed = [name.lstrip("@").lower() for name in (conf.get("allow_from") or [])]
+    note_phase(args, "читаю треды в Time")
+    moved = 0
+
+    for card_key, info in list(threads.items()):
+        root_id = info.get("root_id")
+        if not root_id:
+            continue
+        try:
+            posts = client.thread(root_id)
+        except FactoryError as e:
+            log(f"  !! тред по #{card_key} не прочитался: {e}")
+            continue
+
+        seen = info.get("last_post_id")
+        fresh, passed = [], not seen
+        for post in posts:
+            if passed:
+                fresh.append(post)
+            elif post.get("id") == seen:
+                passed = True
+        if not passed:
+            # запомненного сообщения в треде уже нет (удалили) — считаем прочитанным всё,
+            # иначе на следующем прогоне перенесём весь тред заново. Записать это надо
+            # сразу: без записи поправка теряется и повторяется каждый прогон
+            fresh = []
+            if posts:
+                info["last_post_id"] = posts[-1].get("id")
+                save_time_state(state)
+        if not fresh:
+            continue
+
+        # системные сообщения («такой-то присоединился») у Mattermost со своим type
+        human = [post for post in fresh
+                 if post.get("user_id") != bot_id
+                 and not (post.get("type") or "")
+                 and (post.get("message") or "").strip()]
+        info["last_post_id"] = fresh[-1].get("id")
+
+        if not human:
+            save_time_state(state)
+            continue
+
+        names = client.users([post.get("user_id") for post in human])
+        if allowed:
+            human = [post for post in human
+                     if (names.get(post.get("user_id"), {}).get("username") or "").lower()
+                     in allowed]
+            if not human:
+                log(f"  #{card_key}: в треде писали не те, кому можно (allow_from)")
+                save_time_state(state)
+                continue
+
+        try:
+            card = kaiten.card(int(card_key))
+        except FactoryError:
+            log(f"  #{card_key} больше нет — убираю тред из состояния")
+            threads.pop(card_key, None)
+            save_time_state(state)
+            continue
+
+        for post in human:
+            user = names.get(post.get("user_id"), {})
+            author = (user.get("nickname") or user.get("username")
+                      or user.get("first_name") or "кто-то в Time")
+            kaiten.comment(card["id"], from_thread_comment(author,
+                                                           (post.get("message") or "").strip()))
+        log(f"  #{card_key}: перенёс из треда {len(human)} "
+            f"{'сообщение' if len(human) == 1 else 'сообщений'}")
+
+        moved += 1
+        profile = profile_for_board(profiles, card.get("board_id"))
+        stuck = blocked_by(kaiten, card["id"])
+        target = role_column(profile, "fixes") if profile else None
+        active = [role_column(profile, role) for role in ACTIVE_ROLES] if profile else []
+
+        if stuck:
+            # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
+            log(f"  #{card_key} заблокирована ({stuck}) — комментарий записал, "
+                f"карточку не двигаю")
+            reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
+                     "его снимает человек.")
+        elif not target or card.get("column_id") in active:
+            reply = "Записал в карточку, задача и так в работе."
+        else:
+            kaiten.move(card["id"], target)
+            reply = "Записал в карточку и взял в правки."
+
+        if time_wants(conf, "fix_taken"):
+            try:
+                client.post(info.get("channel_id", ""), reply, root_id=root_id)
+            except FactoryError as e:
+                log(f"  !! не смог ответить в тред: {e}")
+        save_time_state(state)
+
+    if moved:
+        log(f"из тредов Time пришло правок по {moved} карточкам")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1989,7 +2402,7 @@ def compose_pr_body(worktree: Path, card: dict, card_url: str, verdict: dict) ->
 
 
 def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
-            verdict: dict, pr_cfg: dict, dry_run: bool) -> str:
+            verdict: dict, cfg: dict, dry_run: bool, repo_key: str | None = None) -> str:
     title = f"#{card['id']} {(card.get('title') or '').strip()[:70]}"
     body = compose_pr_body(worktree, card, card_url, verdict)
     template = find_pr_template(worktree)
@@ -2007,6 +2420,8 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
     ).stdout.strip()
     if existing:
         log(f"  PR для ветки уже открыт: {existing}")
+        notify_pr(cfg, repo_key, card, card_url, existing, branch, verdict, dry_run,
+                  updated=True)
         return existing
 
     # тело отдаём файлом: шаблоны бывают на десятки килобайт, в argv их тащить незачем
@@ -2016,7 +2431,7 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
         handle.close()
         cmd = ["gh", "pr", "create", "--base", base, "--head", branch,
                "--title", title, "--body-file", handle.name]
-        if pr_cfg.get("draft", True):
+        if (cfg.get("pr") or {}).get("draft", True):
             cmd.append("--draft")
         proc = run_bounded(cmd, worktree, 120)
     finally:
@@ -2027,6 +2442,9 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
     lines = proc.stdout.strip().splitlines()
     if not lines:
         raise FactoryError("gh pr create отработал, но не вернул ссылку на PR")
+    # отправка живёт здесь, а не у вызывающих: open_pr зовут из двух мест, завтра
+    # появится третье — и его забудут подключить. Одна точка, из которой нельзя не написать
+    notify_pr(cfg, repo_key, card, card_url, lines[-1], branch, verdict, dry_run)
     return lines[-1]
 
 
@@ -2663,7 +3081,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             pr_url = "(PR не создавался, --no-pr)"
         else:
             pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
-                             verdict, cfg["pr"], args.dry_run)
+                             verdict, cfg, args.dry_run, repo_key)
 
         epic_note = ""
         if profile.get("attach_to_debt"):
@@ -3734,7 +4152,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         if not args.dry_run:
             git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
         pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
-                         verdict, cfg["pr"], args.dry_run) if not args.no_pr else "(без PR)"
+                         verdict, cfg, args.dry_run, repo_key) if not args.no_pr else "(без PR)"
         head = SPEC_FIXED_LINE if fixing else SPEC_LINE
         kaiten.comment(card_id,
                        f"{EPIC_MARK} **{head}** {pr_url}\n\n"
@@ -4179,6 +4597,10 @@ def main() -> int:
     parser.add_argument("--only-epics", action="store_true",
                         help="только фаза эпиков: продвинуть их и выйти")
     parser.add_argument("--no-epics", action="store_true", help="пропустить фазу эпиков")
+    parser.add_argument("--only-time", action="store_true",
+                        help="только прочитать треды в Time и выйти")
+    parser.add_argument("--no-time", action="store_true",
+                        help="полный прогон без чтения тредов в Time")
     parser.add_argument("--epic-card", type=int,
                         help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
@@ -4252,9 +4674,19 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         return run_epics(kaiten, cfg, args, only_card=args.epic_card)
     if args.only_epics:
         return run_epics(kaiten, cfg, args)
+    if args.only_time:
+        return follow_time_threads(kaiten, cfg, args, profiles)
 
-    # Разведка идёт первой: она дешёвая и быстрая, а на другом конце сидит человек,
-    # который только что закинул карточку в инбокс и ждёт, что ему ответят.
+    # Треды в Time — раньше всего: это дешёвый запрос без агента, а карточка после него
+    # уезжает в «Правки», и работа в этом же прогоне её подхватит.
+    if not (args.card or args.no_time):
+        try:
+            follow_time_threads(kaiten, cfg, args, profiles)
+        except Exception as e:  # noqa: BLE001 — мессенджер не должен ронять поток
+            log(f"треды в Time не задались: {e}")
+
+    # Разведка идёт первой из агентов: она дешёвая и быстрая, а на другом конце сидит
+    # человек, который только что закинул карточку в инбокс и ждёт, что ему ответят.
     if not (args.card or args.only_review or args.only_work or args.no_triage):
         try:
             triage_inbox(kaiten, cfg, args)
