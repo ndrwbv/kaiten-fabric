@@ -736,6 +736,67 @@ TIME_STATUSES = {
 # а строка в канале объясняет, зачем туда идти.
 TIME_STATUS_ASKED = "пацанчики, позырьте плз, есть вопросики"
 
+# То же самое, но обычными словами: статус-фраза хороша в конце сообщения и плохо
+# читается внутри предложения, а на вопрос «как дела» отвечать надо предложением.
+TIME_PLAIN_STATUSES = {
+    "queue": "в очереди",
+    "in_progress": "в работе, пишу код",
+    "agent_review": "ждёт ревьювера",
+    "fixes": "правлю по замечаниям ревью",
+    "review": "на ревью у человека",
+    "question": "жду ответа на вопросы",
+    "failed": "упало, нужен человек",
+    "done": "готово",
+}
+
+# По этим словам сообщение в треде считается вопросом «что там с задачей», а не
+# постановкой правки. Список короткий и намеренно грубый: ошибиться в другую сторону
+# дороже — правка, принятая за вопрос, потерялась бы молча.
+TIME_ASK_WORDS = ("как дела", "что там", "как продвигается", "как успехи", "статус",
+                  "на каком этапе", "что по задаче", "есть новости", "ну как")
+
+# Сообщение длиннее этого вопросом не считается, даже если начинается с «как дела»:
+# в «как дела? и поправь ещё заголовок» главное — вторая половина.
+TIME_ASK_LIMIT = 80
+
+
+def looks_like_question(text: str) -> bool:
+    if len(text.strip()) > TIME_ASK_LIMIT:
+        return False
+    low = normalize_phrase(text)
+    return any(word in low for word in TIME_ASK_WORDS)
+
+
+def time_status_answer(profile: dict | None, card: dict, comments: list,
+                       asks: list) -> str:
+    """
+    Ответ на «как дела» — из карточки, без запуска агента.
+
+    Спросить в треде «что там» стоит человеку одну строку, а прогон агента — минуты
+    и деньги. Всё, что нужно для ответа, и так лежит в Kaiten: колонка, число кругов
+    ревью и заголовок последнего отчёта.
+    """
+    role, _ = time_status(profile, card, asks)
+    where = TIME_PLAIN_STATUSES.get(role, "не пойму, где карточка")
+    lines = [f"Сейчас: {where}."]
+
+    rounds = sum(1 for comment in comments
+                 if strip_html(comment.get("text", "")).startswith(REVIEWER_MARK))
+    if rounds:
+        lines.append(f"Кругов ревью: {rounds}.")
+
+    # заголовок последнего отчёта — первая строка агентского комментария без разметки
+    headline = ""
+    for comment in comments:
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(AGENT_MARKS):
+            headline = text.splitlines()[0].lstrip("".join(AGENT_MARKS)).strip(" *")
+    if headline:
+        lines.append(f"Последнее: {headline}")
+    if asks:
+        lines.append("Вопросы — выше в треде, жду ответа.")
+    return " ".join(lines)
+
 
 class Time:
     """
@@ -1295,6 +1356,24 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 log(f"  #{card_key}: в треде писали не те, кому можно (allow_from)")
                 save_time_state(state)
                 continue
+
+        # «Как дела» — это вопрос, а не задача: отвечаем из карточки и ничего не двигаем.
+        # Иначе такой вопрос уезжал бы правкой, и следующий прогон тратил бы на него
+        # настоящего агента.
+        questions = [post for post in human
+                     if looks_like_question(post.get("message") or "")]
+        if questions:
+            try:
+                client.post(info.get("channel_id", ""),
+                            time_status_answer(profile, card, comments, asks),
+                            root_id=root_id)
+                log(f"  #{card_key}: ответил в тред, что с задачей")
+            except FactoryError as e:
+                log(f"  !! не смог ответить в тред по #{card_key}: {e}")
+        human = [post for post in human if post not in questions]
+        if not human:
+            save_time_state(state)
+            continue
 
         for post in human:
             user = names.get(post.get("user_id"), {})

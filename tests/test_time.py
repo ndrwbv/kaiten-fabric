@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location(
 f = importlib.util.module_from_spec(spec); spec.loader.exec_module(f)
 
 GOT = []          # что фальшивый сервер получил
+QUESTION = ["регистр поехал и в шапке тоже, поправь и там"]   # что человек написал в тред
 BOT_ID = "bot-000"
 
 
@@ -42,7 +43,7 @@ class Fake(BaseHTTPRequestHandler):
                 "join":  {"id": "join", "user_id": "u-1", "message": "",
                           "create_at": 2, "type": "system_join_channel"},
                 "reply": {"id": "reply", "user_id": "u-1", "create_at": 3, "type": "",
-                          "message": "регистр поехал и в шапке тоже, поправь и там"},
+                          "message": QUESTION[0]},
             }})
         return self._reply({})
 
@@ -256,6 +257,44 @@ GOT.clear()
 f.follow_time_threads(asking, cfg, Args(), profiles)
 check("те же вопросы второй раз не пишутся",
       [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
+
+print("=== 13. «как дела» — ответ в тред, карточку не двигаем ===")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+QUESTION[0] = "как дела?"
+GOT.clear()
+asker = FakeKaiten()
+f.follow_time_threads(asker, cfg, Args(), profiles)
+replies = [json.loads(g[2])["message"] for g in GOT
+           if g[0] == "POST" and g[1].endswith("/posts")]
+check("ответил в тред", any("Сейчас:" in r for r in replies), str(replies))
+check("сказал, где карточка", any("на ревью у человека" in r for r in replies), str(replies))
+check("в карточку вопрос не тащил", asker.comments_written == [],
+      str(asker.comments_written))
+check("карточку не двигал", asker.moves == [], str(asker.moves))
+
+print("=== 14. а правку по-прежнему переносит ===")
+QUESTION[0] = "поправь ещё заголовок, он тоже в нижнем регистре"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+fixer = FakeKaiten()
+f.follow_time_threads(fixer, cfg, Args(), profiles)
+check("перенёс в карточку", len(fixer.comments_written) == 1, str(fixer.comments_written))
+check("и взял в правки", fixer.moves == [(555, 106)], str(fixer.moves))
+
+print("=== 15. длинное сообщение с «как дела» внутри — это задача ===")
+QUESTION[0] = ("как дела? и заодно поправь, пожалуйста, заголовок промо-экрана — "
+               "он тоже приводится к нижнему регистру, а должен быть как есть")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+long_one = FakeKaiten()
+f.follow_time_threads(long_one, cfg, Args(), profiles)
+check("не принято за вопрос", len(long_one.comments_written) == 1,
+      str(long_one.comments_written))
 
 srv.shutdown()
 print("\nвсё сошлось")
