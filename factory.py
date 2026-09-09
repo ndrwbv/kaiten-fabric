@@ -61,6 +61,11 @@ TRIAGE_STATE_FILE = STATE / "triage.json"
 # ответа в нём мы уже дочитали
 TIME_STATE_FILE = STATE / "time.json"
 
+# Сухой прогон. Флаг лежит в модуле, а не ходит аргументом: состояние пишется из
+# десятка мест, и протаскивать args в каждое — верный способ однажды забыть.
+# Ставится один раз, в main, из `--dry-run`.
+DRY_RUN = False
+
 ENV_CANDIDATES = [ROOT / ".env", Path.home() / ".claude" / ".env"]
 
 # Комментарии агента помечаем, чтобы отличать их от человеческих: и агент, и человек
@@ -984,6 +989,17 @@ def load_time_state() -> dict:
 
 
 def save_time_state(state: dict) -> None:
+    """
+    Запомнить треды. В сухом прогоне — ничего не пишем.
+
+    Сухой прогон не отправляет сообщений, а состояние тредов — это ровно «что уже
+    сказано и что уже прочитано»: `asked` и `last_post_id`. Запиши их — и настоящий
+    прогон промолчит, считая работу сделанной: вопросы в тред не уедут, а сообщения
+    людей будут помечены прочитанными, хотя в карточку их никто не переносил.
+    Внутри самого прогона состояние живёт в памяти как обычно.
+    """
+    if DRY_RUN:
+        return
     STATE.mkdir(exist_ok=True)
     tmp = TIME_STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3561,6 +3577,16 @@ def load_triage_state() -> dict:
 
 
 def save_triage_state(state: dict) -> None:
+    """
+    Счётчик неудач разведки. В сухом прогоне — тоже ничего не пишем.
+
+    Тот же уговор, что и в `save_time_state`, и цена ошибки здесь выше: дойдя до
+    предела, счётчик ставит `told` — «человеку про это сказали». Сказать должен
+    комментарий в карточке, а в сухом прогоне он не уходит. Карточка после такого
+    навсегда выпадает из выборки `pick_inbox_cards`, и никто про неё не узнаёт.
+    """
+    if DRY_RUN:
+        return
     STATE.mkdir(exist_ok=True)
     tmp = TRIAGE_STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -5033,6 +5059,10 @@ def main() -> int:
     parser.add_argument("--epic-card", type=int,
                         help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
+
+    # Отсюда про сухой прогон узнают те, кто пишет состояние на диск
+    global DRY_RUN
+    DRY_RUN = args.dry_run
 
     if args.time_channels:
         # печатаем JSON — значит в stdout не должно быть ничего, кроме него

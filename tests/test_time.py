@@ -347,5 +347,38 @@ check("вопрос ревьювера на месте", "Какой unitId у �
 check("замечание тоже", "Быстрый заказ обходит обязательный телефон" in asked[0], asked[0])
 check("и ни одного значка", not any(m in asked[0] for m in ("❓", "⚠️", "🔍")), asked[0])
 
+print("=== 18. сухой прогон состояние не трогает ===")
+
+
+class DryArgs: dry_run = True; prompt_only = True
+
+
+before = json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}})
+f.TIME_STATE_FILE.write_text(before, encoding="utf-8")
+QUESTION[0] = "@fabrica поправь ещё заголовок, он тоже в нижнем регистре"
+GOT.clear()
+f.DRY_RUN = True          # так же, как это делает main из --dry-run
+try:
+    dry = FakeKaiten()
+    dry.asks = ["Какой текст у подписи?"]
+    f.follow_time_threads(dry, cfg, DryArgs(), profiles)
+    sent = [g for g in GOT if (g[0] == "POST" and g[1].endswith("/posts")) or g[0] == "PUT"]
+    check("в Time ничего не ушло", sent == [], str(sent))
+    check("состояние не тронуто",
+          f.TIME_STATE_FILE.read_text(encoding="utf-8") == before,
+          f.TIME_STATE_FILE.read_text(encoding="utf-8"))
+
+    # счётчик неудач разведки — тот же уговор, и цена ошибки там выше: «told»
+    # выставляется один раз, а сказать об этом человеку в сухом прогоне некому
+    f.TRIAGE_STATE_FILE = f.STATE / "triage.json"
+    f.note_triage_fail({"cards": {}}, 555, "агент упал", 2)
+    check("счёт неудач разведки не пишется", not f.TRIAGE_STATE_FILE.exists())
+finally:
+    f.DRY_RUN = False
+f.note_triage_fail({"cards": {}}, 555, "агент упал", 2)
+check("а в настоящем прогоне пишется", f.TRIAGE_STATE_FILE.is_file())
+
 srv.shutdown()
 print("\nвсё сошлось")
