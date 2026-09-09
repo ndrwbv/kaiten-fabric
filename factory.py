@@ -459,22 +459,49 @@ def keychain_secret(name: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def env_file_values(path: Path) -> dict:
+    """Пары ключ-значение из .env. Файла нет или он битый — пустой словарь."""
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
 def resolve_secret(name: str, env: dict | None = None) -> str:
     """
-    Секрет ищется в одном порядке на всё: окружение, Keychain, `.env`.
+    Секрет ищется в одном порядке на всё: окружение, `.env`, Keychain.
 
-    Порядок выбран под переезд на сервер: там нет ни Keychain, ни профиля, зато есть
-    переменные окружения из systemd — и они должны выигрывать, не требуя правки конфига.
-    На маке секрет кладёт окно настроек в Keychain. `.env` остаётся третьим, потому что
-    так сейчас лежит KAITEN_TOKEN, и ломать это незачем.
+    Первым окружение — под будущий сервер: там нет ни Keychain, ни профиля, зато есть
+    переменные из systemd, и они должны выигрывать, не требуя правки конфига.
+
+    Дальше все `.env` из ENV_CANDIDATES, а не только тот словарь, что передали. Иначе
+    была бы ловушка: `load_env` выбирает первый файл, в котором есть KAITEN_TOKEN, и
+    секрет, положенный в другой файл, оказался бы невидим без единого сообщения.
+
+    Keychain последним. Смысла в нём меньше, чем кажется: чтобы фабрика читала оттуда
+    без диалога подтверждения, запись надо открыть всем программам пользователя — а тогда
+    защита ровно та же, что у файла с правами 0600. Оставлен на случай, когда кому-то так
+    удобнее, но окно настроек пишет в `.env`.
     """
     from_env = (os.environ.get(name) or "").strip()
     if from_env:
         return from_env
-    from_keychain = keychain_secret(name)
-    if from_keychain:
-        return from_keychain
-    return ((env or {}).get(name) or "").strip()
+    passed = ((env or {}).get(name) or "").strip()
+    if passed:
+        return passed
+    for path in ENV_CANDIDATES:
+        found = (env_file_values(path).get(name) or "").strip()
+        if found:
+            return found
+    return keychain_secret(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -825,6 +852,51 @@ def save_time_state(state: dict) -> None:
     tmp = TIME_STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(TIME_STATE_FILE)
+
+
+def time_test(cfg: dict, args) -> int:
+    """
+    Отправить в канал тестовое сообщение и рассказать, что вышло.
+
+    Проверяет ровно тот путь, которым потом пойдут настоящие сообщения: те же секреты,
+    тот же транспорт, тот же curl. Этим же занимается кнопка «Проверить» в окне настроек —
+    она просто зовёт эту команду, чтобы проверка и работа не разъезжались.
+    """
+    conf = time_config(cfg)
+    if not conf:
+        print("Секции notify.time в конфиге нет — фабрика в Time не пишет.")
+        return 1
+    client = time_client(cfg, load_env(), args.dry_run)
+    if not client:
+        print("Секрет не найден. Положи TIME_BOT_TOKEN (или TIME_WEBHOOK_URL) "
+              "в .env, окружение или Keychain.")
+        return 1
+
+    transport = "вебхук" if client.webhook_url else "бот"
+    channel = time_channel(conf, None)
+    print(f"Транспорт: {transport}")
+    if client.can_read:
+        try:
+            who = client.me()
+            print(f"Бот: {who.get('username') or '?'} (id {who.get('id') or '?'})")
+        except FactoryError as e:
+            print(f"Токен не подошёл: {e}")
+            return 1
+        if not channel:
+            print("Канал не задан (notify.time.channels.default) — писать некуда.")
+            return 1
+    try:
+        post = client.post(channel, "Проверка связи из фабрики.")
+    except FactoryError as e:
+        print(f"Не отправилось: {e}")
+        return 1
+    if post and post.get("id"):
+        print(f"Отправлено, id сообщения {post['id']}. Посмотри в канале, "
+              f"от чьего имени оно пришло.")
+    else:
+        print("Отправлено. Ответа с id нет — так и должно быть у вебхука; "
+              "посмотри в канале, от чьего имени оно пришло.")
+    return 0
 
 
 def time_pr_message(card: dict, card_url: str, pr_url: str, branch: str,
@@ -4601,6 +4673,8 @@ def main() -> int:
                         help="только прочитать треды в Time и выйти")
     parser.add_argument("--no-time", action="store_true",
                         help="полный прогон без чтения тредов в Time")
+    parser.add_argument("--time-test", action="store_true",
+                        help="послать в канал Time тестовое сообщение и выйти")
     parser.add_argument("--epic-card", type=int,
                         help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
@@ -4646,12 +4720,15 @@ def main() -> int:
     # Снимок и на входе, и на выходе. Раньше он собирался только в самом конце полного
     # прогона, а --only-epics и --epic-card выходят раньше и его минуют: в трее висело
     # состояние часовой давности, и человек справедливо считал, что ничего не двигается.
-    if not args.prompt_only:
+    # Проверке связи снимок не нужен вовсе: она ничего не берёт из Kaiten, а обход досок
+    # добавил бы к нажатию кнопки в окне настроек двадцать секунд ожидания.
+    snapshot = not (args.prompt_only or args.time_test)
+    if snapshot:
         refresh_flow(kaiten, cfg, profiles)
     try:
         return route(kaiten, cfg, args, profiles)
     finally:
-        if not args.prompt_only:
+        if snapshot:
             refresh_flow(kaiten, cfg, profiles)
 
 
@@ -4674,6 +4751,8 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         return run_epics(kaiten, cfg, args, only_card=args.epic_card)
     if args.only_epics:
         return run_epics(kaiten, cfg, args)
+    if args.time_test:
+        return time_test(cfg, args)
     if args.only_time:
         return follow_time_threads(kaiten, cfg, args, profiles)
 

@@ -175,6 +175,94 @@ def find_env() -> tuple[dict, Path | None]:
     return {}, None
 
 
+def secret_env_path() -> Path:
+    """
+    Куда писать секрет: в тот `.env`, который фабрика и читает.
+
+    Если KAITEN_TOKEN уже где-то лежит — туда же, чтобы у секретов был один дом.
+    Иначе первый кандидат, то есть файл рядом со скриптом; он в .gitignore.
+    """
+    _, path = find_env()
+    return path or ENV_CANDIDATES[0]
+
+
+def set_secret(name: str) -> int:
+    """
+    Записать секрет в `.env`, прочитав значение со stdin.
+
+    Со stdin, а не из аргумента: аргументы видны в `ps` любому процессу пользователя.
+    Этим пользуется окно настроек в меню-баре — оно передаёт токен сюда через канал,
+    а не пишет файл само.
+    """
+    value = sys.stdin.read().strip()
+    if not value:
+        bad("пустое значение — ничего не записал")
+        return 1
+    if "\n" in value or "\r" in value:
+        bad("в значении перевод строки — это не токен")
+        return 1
+
+    path = secret_env_path()
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    # старое значение выкидываем, а не дописываем второе: иначе кто выиграет, зависело бы
+    # от того, чей парсер читает файл
+    kept = [line for line in lines
+            if line.strip().removeprefix("export ").split("=", 1)[0].strip() != name]
+    replaced = len(kept) != len(lines)
+    kept.append(f"{name}={value}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    # 0600: файл лежит в открытом виде, и читать его должен только хозяин
+    path.chmod(0o600)
+    ok(f"{name} {'обновлён' if replaced else 'записан'} в {path}")
+    return 0
+
+
+def get_notify() -> int:
+    """Текущие настройки notify.time — чтобы окно настроек показало, что уже задано."""
+    config = {}
+    if CONFIG_PATH.is_file():
+        config = json.loads(strip_jsonc(CONFIG_PATH.read_text(encoding="utf-8")))
+    conf = dict(((config.get("notify") or {}).get("time") or {}))
+    # секрет наружу не отдаём: окно показывает лишь то, задан он или нет
+    from_env, _ = find_env()
+    for name in ("TIME_BOT_TOKEN", "TIME_WEBHOOK_URL"):
+        conf[f"has_{name.lower()}"] = bool(os.environ.get(name) or from_env.get(name))
+    print(json.dumps(conf, ensure_ascii=False, indent=2))
+    return 0
+
+
+def set_notify() -> int:
+    """
+    Слить пришедший со stdin JSON в секцию notify.time конфига.
+
+    Пишем питоном, а не из приложения: `config.json` руками читают и правят, в нём
+    комментарии ключами и осмысленный порядок. JSONSerialization из Swift перетасовал
+    бы ключи, и файл перестал бы читаться человеком.
+    """
+    if not CONFIG_PATH.is_file():
+        bad(f"{CONFIG_PATH.name} не найден — сначала пройди мастер")
+        return 1
+    try:
+        incoming = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as e:
+        bad(f"на входе не JSON: {e}")
+        return 1
+    if not isinstance(incoming, dict):
+        bad("на входе ожидается объект")
+        return 1
+
+    config = json.loads(strip_jsonc(CONFIG_PATH.read_text(encoding="utf-8")))
+    notify = config.setdefault("notify", {})
+    section = notify.setdefault("time", {})
+    section.update(incoming)
+    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+    ok(f"notify.time обновлён: {', '.join(sorted(incoming)) or 'без изменений'}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # ввод-вывод мастера
 # --------------------------------------------------------------------------- #
@@ -1110,12 +1198,24 @@ def main() -> int:
     parser.add_argument("--card-types", nargs="?", const="", metavar="СТРОКА",
                         help="типы карточек, можно с поиском")
     parser.add_argument("--json", action="store_true", help="машинный вывод")
+    parser.add_argument("--set-secret", metavar="ИМЯ",
+                        help="записать секрет в .env, значение приходит со stdin")
+    parser.add_argument("--set-notify", action="store_true",
+                        help="слить JSON со stdin в секцию notify.time конфига")
+    parser.add_argument("--get-notify", action="store_true",
+                        help="показать настройки notify.time (без секретов)")
     args = parser.parse_args()
 
     if args.check:
         return check()
     if args.audit:
         return audit()
+    if args.set_secret:
+        return set_secret(args.set_secret)
+    if args.set_notify:
+        return set_notify()
+    if args.get_notify:
+        return get_notify()
 
     if args.spaces is not None:
         query = normalize(args.spaces)

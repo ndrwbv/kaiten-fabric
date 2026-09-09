@@ -135,6 +135,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     private let root: URL
     private let defaults = UserDefaults.standard
+    private var timeSettings: TimeSettings?
 
     /// Ответ `security` про свежесть сессии и когда мы его получили. Спрашивать на
     /// каждую отрисовку меню незачем: это подпроцесс, а меню перерисовывается часто.
@@ -690,6 +691,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
         menu.addItem(action("Открыть доску", #selector(openBoard)))
         menu.addItem(action("Показать лог", #selector(openLog)))
+        menu.addItem(action("Настройки Time…", #selector(timeSettingsClicked)))
         menu.addItem(authMenu())
 
         menu.addItem(.separator())
@@ -896,6 +898,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     // MARK: - мелочи
 
+    /// Окно настроек Time. Живёт между открытиями, чтобы не собирать его заново.
+    @objc private func timeSettingsClicked() {
+        if timeSettings == nil { timeSettings = TimeSettings(root: root) }
+        timeSettings?.show()
+    }
+
     private func open(_ string: String) {
         if let url = URL(string: string) { NSWorkspace.shared.open(url) }
     }
@@ -947,5 +955,224 @@ enum Main {
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
         app.run()
+    }
+}
+
+// --------------------------------------------------------------------------- #
+// Настройки Time
+// --------------------------------------------------------------------------- #
+
+/// Окно «Настройки Time»: транспорт, адрес, секрет, канал.
+///
+/// Само оно не пишет ни конфиг, ни файл с секретом: сохранение — это
+/// `setup.py --set-notify` и `--set-secret`, проверка — `factory.py --time-test`.
+/// Так у настроек одна реализация на приложение и на терминал, и config.json пишет
+/// питон: там комментарии лежат ключами и порядок осмысленный, а JSONSerialization
+/// перетасовала бы их так, что файл перестал бы читаться человеком.
+///
+/// Секрет уходит в питон через stdin, а не аргументом: аргументы видны в `ps` любому
+/// процессу пользователя.
+final class TimeSettings: NSObject {
+    private let root: URL
+    private var window: NSWindow?
+
+    private let transport = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let address = NSTextField()
+    private let secret = NSSecureTextField()
+    private let channel = NSTextField()
+    private let note = NSTextField(wrappingLabelWithString: "")
+    private var rows: NSStackView?
+
+    init(root: URL) {
+        self.root = root
+        super.init()
+    }
+
+    func show() {
+        if window == nil { window = build() }
+        load()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - сборка окна
+
+    private func build() -> NSWindow {
+        transport.addItems(withTitles: ["Бот", "Вебхук"])
+        transport.target = self
+        transport.action = #selector(transportChanged)
+        address.placeholderString = "https://company.time-messenger.ru"
+        secret.placeholderString = "токен бота"
+        channel.placeholderString = "id канала, 26 символов"
+        note.textColor = .secondaryLabelColor
+
+        let save = NSButton(title: "Сохранить", target: self, action: #selector(saveClicked))
+        let test = NSButton(title: "Проверить", target: self, action: #selector(testClicked))
+        save.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [test, save])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+
+        let rows = NSStackView(views: [
+            row("Транспорт", transport),
+            row("Адрес Time", address),
+            row("Секрет", secret),
+            row("Канал", channel),
+            row("", buttons),
+            note,
+        ])
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 10
+        rows.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        note.translatesAutoresizingMaskIntoConstraints = false
+        note.widthAnchor.constraint(equalToConstant: 440).isActive = true
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+                              styleMask: [.titled, .closable],
+                              backing: .buffered, defer: false)
+        window.title = "Настройки Time"
+        window.isReleasedWhenClosed = false
+        // Окно по содержимому, а не наоборот: высота полей зависит от системного шрифта,
+        // а строка результата — от длины ответа. Захардкоженная высота оставляла снизу
+        // пустую треть, а длинный ответ обрезала.
+        window.contentView = rows
+        self.rows = rows
+        fit(window)
+        return window
+    }
+
+    /// Подогнать окно под содержимое. Зовётся и после сборки, и после каждого ответа:
+    /// строка результата многострочная, и от неё высота меняется.
+    private func fit(_ window: NSWindow?) {
+        guard let window, let rows else { return }
+        rows.layoutSubtreeIfNeeded()
+        window.setContentSize(rows.fittingSize)
+    }
+
+    private func row(_ title: String, _ field: NSView) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.alignment = .right
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 100).isActive = true
+        field.translatesAutoresizingMaskIntoConstraints = false
+        if field is NSTextField || field is NSPopUpButton {
+            field.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        }
+        let stack = NSStackView(views: [label, field])
+        stack.orientation = .horizontal
+        stack.spacing = 10
+        return stack
+    }
+
+    private var isBot: Bool { transport.indexOfSelectedItem == 0 }
+
+    private var secretName: String { isBot ? "TIME_BOT_TOKEN" : "TIME_WEBHOOK_URL" }
+
+    @objc private func transportChanged() {
+        secret.placeholderString = isBot ? "токен бота" : "URL вебхука"
+        // у вебхука канал зашит в сам URL, спрашивать его второй раз незачем
+        address.isEnabled = isBot
+        channel.isEnabled = isBot
+        note.stringValue = isBot ? "" : "У вебхука канал зашит в URL, и тред он читать "
+            + "не умеет: сообщения про PR пойдут, а правки из треда — нет."
+        fit(window)
+    }
+
+    // MARK: - чтение и запись
+
+    private func load() {
+        let shown = run(["setup.py", "--get-notify"]).out
+        guard let data = shown.data(using: .utf8),
+              let conf = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            note.stringValue = "Не смог прочитать настройки: " + shown
+            fit(window)
+            return
+        }
+        defer { fit(window) }
+        transport.selectItem(at: (conf["transport"] as? String) == "webhook" ? 1 : 0)
+        address.stringValue = (conf["base_url"] as? String) ?? ""
+        channel.stringValue = ((conf["channels"] as? [String: Any])?["default"] as? String) ?? ""
+        secret.stringValue = ""
+        transportChanged()
+        let key = "has_" + secretName.lowercased()
+        if (conf[key] as? Bool) == true {
+            secret.placeholderString = "уже задан, можно не вводить"
+        }
+    }
+
+    /// Сохраняет и возвращает, что сказал питон. Пустой секрет — не ошибка: значит его
+    /// уже задали раньше и трогать не надо.
+    private func save() -> String {
+        var conf: [String: Any] = ["transport": isBot ? "bot" : "webhook"]
+        if isBot {
+            conf["base_url"] = address.stringValue.trimmingCharacters(in: .whitespaces)
+            let id = channel.stringValue.trimmingCharacters(in: .whitespaces)
+            if !id.isEmpty { conf["channels"] = ["default": id] }
+        }
+        guard let json = try? JSONSerialization.data(withJSONObject: conf),
+              let text = String(data: json, encoding: .utf8)
+        else { return "не собрал настройки" }
+
+        var said = run(["setup.py", "--set-notify"], input: text).out
+        let value = secret.stringValue.trimmingCharacters(in: .whitespaces)
+        if !value.isEmpty {
+            said += "\n" + run(["setup.py", "--set-secret", secretName], input: value).out
+            secret.stringValue = ""
+            secret.placeholderString = "уже задан, можно не вводить"
+        }
+        return said
+    }
+
+    @objc private func saveClicked() {
+        note.stringValue = save()
+        fit(window)
+    }
+
+    @objc private func testClicked() {
+        // сначала сохраняем: проверять надо то, что человек видит в полях, а проверка
+        // идёт тем же кодом, которым потом пишет фабрика, — он читает конфиг с диска
+        note.stringValue = save() + "\n\n" + run(["factory.py", "--time-test"]).out
+        fit(window)
+    }
+
+    // MARK: - запуск питона
+
+    private func run(_ arguments: [String], input: String? = nil) -> (out: String, code: Int32) {
+        let task = Process()
+        // /usr/bin/python3 есть на маке всегда; в логин-шелл лезть незачем — этим
+        // командам не нужны ни nvm, ни токены из профиля
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        task.arguments = arguments
+        task.currentDirectoryURL = root
+
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = output
+        if let input {
+            let stdin = Pipe()
+            task.standardInput = stdin
+            guard (try? task.run()) != nil else { return ("не смог запустить python3", -1) }
+            stdin.fileHandleForWriting.write(Data(input.utf8))
+            stdin.fileHandleForWriting.closeFile()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            return (clean(data), task.terminationStatus)
+        }
+        guard (try? task.run()) != nil else { return ("не смог запустить python3", -1) }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return (clean(data), task.terminationStatus)
+    }
+
+    /// Питон красит вывод для терминала — в окне эти escape-последовательности лишние.
+    private func clean(_ data: Data) -> String {
+        let text = String(data: data, encoding: .utf8) ?? ""
+        return text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "",
+                                         options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
