@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
@@ -105,6 +106,7 @@ ACCEPTANCE_SCHEMA = {
         "criteria": {"type": "array", "items": {"type": "string"}},
         "questions": {"type": "array", "items": {"type": "string"}},
         "backend_needed": {"type": "boolean"},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
@@ -119,6 +121,7 @@ SPEC_SCHEMA = {
         "spec_path": {"type": "string"},
         "questions": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "string"},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
@@ -176,6 +179,7 @@ DECOMPOSE_SCHEMA = {
             },
         },
         "questions": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
@@ -193,6 +197,7 @@ VERDICT_SCHEMA = {
         # checks в карточку не пишем, но спрашиваем: агент, которого просят отчитаться
         # о проверках, чаще их и запускает. Оседает в logs/card-*.json
         "checks": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
         "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
@@ -287,6 +292,17 @@ class ScoutSetupError(RuntimeError):
 
 class FactoryError(RuntimeError):
     """Ошибка обёртки — карточка уедет в 'Упало'."""
+
+
+class AgentAuthError(FactoryError):
+    """
+    claude не смог авторизоваться: беда окружения, как и ScoutSetupError, и точно
+    так же не вина карточки.
+
+    Наследуется от FactoryError намеренно: все существующие ловушки продолжают
+    работать, и прогон не разваливается трейсбеком. Разведка ловит этот класс
+    отдельно — ей важно не записать протухший токен в счёт карточке.
+    """
 
 
 def utf16_len(text: str) -> int:
@@ -387,6 +403,16 @@ def write_status(**fields) -> None:
     tmp.replace(STATUS_FILE)
 
 
+def note_phase(args, text: str) -> None:
+    """
+    Отметить шаг фабрики. Тонкая обёртка над write_status: без неё каждый вызов
+    приходится оборачивать в `if not args.prompt_only`, и о нём легко забыть —
+    в фазе эпиков так и вышло, там весь шаг проходил молча.
+    """
+    if not getattr(args, "prompt_only", False):
+        write_status(phase=text)
+
+
 def load_env() -> dict:
     """Первый .env, в котором есть KAITEN_TOKEN, выигрывает. Иначе — окружение."""
     for path in ENV_CANDIDATES:
@@ -458,6 +484,16 @@ class Kaiten:
 
     # -- чтение ------------------------------------------------------------- #
 
+    def board(self, board_id: int) -> dict:
+        """
+        Доска целиком: колонки и дорожки приезжают прямо в ответе.
+
+        Отдельного запроса за колонками нет — `GET /boards/{id}/columns` не показывает
+        подколонки, а `GET /boards/{id}/columns/{id}` отвечает 405. Разбирает ответ
+        flat_columns, там же и подробности.
+        """
+        return self._request("GET", f"/boards/{board_id}")
+
     def cards_on_board(self, board_id: int, with_description: bool = False) -> list:
         """Все живые карточки доски. API отдаёт максимум 100 за раз."""
         found, offset = [], 0
@@ -488,8 +524,19 @@ class Kaiten:
         return self._request("GET", f"/cards/{card_id}")
 
     def comments(self, card_id: int) -> list:
+        """
+        Комментарии людей и фабрики, по времени. Интеграции отсюда вычищены.
+
+        У системных аккаунтов Kaiten отрицательный id: у GitHub-бота Octocat это -3.
+        Его комментарий про коммит прилетает через доли секунды после нашего — и
+        оказывается последним. Фаза эпика читается из комментариев, «последним
+        высказался не агент» значит «человек что-то ответил», и эпик после каждой
+        правки спеки заново уходил в правку вместо ревью: два круга по $4 подряд
+        первого сентября. Заодно из промпта уходит шум, который агенту не нужен.
+        """
         data = self._request("GET", f"/cards/{card_id}/comments") or []
-        return sorted(data, key=lambda c: c.get("created") or "")
+        human = [c for c in data if (c.get("author") or {}).get("id", 0) >= 0]
+        return sorted(human, key=lambda c: c.get("created") or "")
 
     # -- запись ------------------------------------------------------------- #
 
@@ -691,6 +738,44 @@ def blocked_by(kaiten: Kaiten, card_id: int) -> str | None:
     return None
 
 
+# Сколько эпик ждёт ответа, прежде чем фабрика пойдёт дальше сама. 0 — ждать вечно,
+# как было раньше. Смысл не в том, чтобы обойтись без человека, а в том, чтобы задача
+# не стояла сутки из-за вопроса вроде «какой текст у подписи»: агент примет решение,
+# явно перечислит, что додумал, и человек поправит это на ревью — если захочет.
+DEFAULT_ANSWER_WAIT_HOURS = 4
+
+
+def parse_stamp(value) -> datetime | None:
+    """Дата из Kaiten ('2026-09-01T05:01:02.600Z') в aware datetime. None — не разобрали."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def stale_holds(kaiten: Kaiten, flow: dict, card_id: int) -> tuple[list, list]:
+    """
+    Наши блокеры на карточке и те из них, что уже просрочены.
+
+    Просроченными считаем, только если просрочены **все**: пока висит хоть один
+    свежий вопрос, ответ ещё может прийти, и начинать додумывать рано.
+    """
+    held = [b for b in kaiten.blockers(card_id) if ours(b)]
+    hours = flow.get("answer_wait_hours", DEFAULT_ANSWER_WAIT_HOURS)
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = DEFAULT_ANSWER_WAIT_HOURS
+    if not held or hours <= 0:
+        return held, []
+    deadline = datetime.now(timezone.utc) - timedelta(hours=hours)
+    stale = [b for b in held
+             if (parse_stamp(b.get("created")) or datetime.now(timezone.utc)) < deadline]
+    return held, (stale if len(stale) == len(held) else [])
+
+
 def hold(kaiten: Kaiten, card_id: int, kind: str, detail: str = "") -> None:
     """
     Вешает блокер, если такого ещё нет.
@@ -876,6 +961,124 @@ NETWORK_HINTS = (
 def looks_like_network(message: str) -> bool:
     return any(hint.lower() in message.lower() for hint in NETWORK_HINTS)
 
+
+# Признаки того, что claude не смог авторизоваться. Токен подписки живёт считанные дни
+# и протухает молча: сам claude отвечает честным 401, но делает это на каждом запросе
+# внутри агента. Агент перебирает попытки, упирается в свой таймаут — и наружу это
+# выглядит как «агент не уложился», хотя ни агент, ни карточка ни при чём. Ровно так
+# фабрика неделю складывала карточки в «Упало» и вычёркивала их из разведки.
+# Это claude говорит от своего имени, и только в stderr: в stdout у него поток
+# событий, и туда те же слова может занести сам агент.
+AUTH_HINTS = (
+    "OAuth access token has expired", "Failed to authenticate",
+    "Please run /login", "Invalid API key",
+)
+
+AUTH_BROKEN = ("claude не авторизован — авторизация протухла. Почини её "
+               "(`claude auth login`) и запусти прогон заново")
+
+
+def auth_failed_event(line: str) -> bool:
+    """
+    Строка потока, в которой claude сознаётся, что его не пустили.
+
+    Смотрим на поле `error` самого события, а не на текст: про 401 агент способен
+    написать и сам — читая чужой лог или правя код авторизации, — а цена ошибки тут
+    высокая, мы по этому признаку убиваем работающего агента. Вывод инструментов
+    лежит вложенно, в `message.content`, и наверх не всплывает.
+    """
+    if "authentication" not in line:
+        return False
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(event, dict) and event.get("error") == "authentication_failed"
+
+
+def looks_like_auth(out: str | None, err: str | None) -> bool:
+    """Похоже ли, что агент не начался, потому что claude не пустили."""
+    if any(auth_failed_event(line) for line in (out or "").splitlines()):
+        return True
+    text = (err or "").lower()
+    return any(hint.lower() in text for hint in AUTH_HINTS)
+
+
+def agent_session_expires() -> datetime | None:
+    """
+    Когда протухает авторизация claude. None — узнать не удалось.
+
+    Читаем только срок: сам токен нам не нужен и в лог попасть не должен. На маке
+    claude держит авторизацию в связке ключей, иначе — файлом в ~/.claude.
+
+    Ничего не блокирует и ни на что не влияет: claude обычно продлевает токен сам,
+    и «протух по часам» ещё не значит «не работает». Это для витрины — чтобы в
+    меню-баре была кнопка входа, а не полдня догадок, почему фабрика молчит.
+    Приговор выносит AgentAuthError на живом запросе, а не эта функция.
+    """
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return None  # с долгоживущим токеном сессия из связки ключей не при делах
+    raw = ""
+    if sys.platform == "darwin":
+        try:
+            found = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=10)
+            raw = found.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            raw = ""
+    if not raw:
+        stored = Path.home() / ".claude" / ".credentials.json"
+        raw = stored.read_text(encoding="utf-8") if stored.is_file() else ""
+    try:
+        stamp = (json.loads(raw or "{}").get("claudeAiOauth") or {}).get("expiresAt")
+        return datetime.fromtimestamp(stamp / 1000, timezone.utc) if stamp else None
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+
+
+def note_auth(ok: bool) -> None:
+    """
+    Записать в статус, пускает ли claude агента. Меню-бар по этому флагу рисует
+    кнопку входа: сам он про авторизацию ничего не знает и знать не должен.
+    """
+    expires = agent_session_expires()
+    write_status(auth={
+        "ok": ok,
+        "expires": expires.isoformat(timespec="seconds") if expires else None,
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+
+
+def auth_broken() -> AgentAuthError:
+    """Одной строкой: и в статус записали, и готовое исключение вернули."""
+    note_auth(False)
+    return AgentAuthError(AUTH_BROKEN)
+
+
+def forget_auth_note() -> None:
+    """
+    Снять отметку «не авторизован», если причина явно ушла.
+
+    Нужно ради одного случая: человек нажал в меню-баре «войти», вошёл — а работы на
+    доске нет, агент не запускается, и красная строка висела бы до первой карточки.
+    Свежая сессия (или заведённый долгоживущий токен) — достаточный повод её снять;
+    если авторизация всё-таки не работает, ближайший же агент вернёт отметку назад.
+    """
+    if not STATUS_FILE.is_file():
+        return
+    try:
+        current = json.loads(STATUS_FILE.read_text(encoding="utf-8")).get("auth") or {}
+    except (json.JSONDecodeError, OSError):
+        return
+    if current.get("ok", True):
+        return
+    expires = agent_session_expires()
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or (
+            expires and expires > datetime.now(timezone.utc)):
+        note_auth(True)
+
 # ssh не должен ни ждать пароля, ни висеть на мёртвом соединении. BatchMode запрещает
 # любые запросы к терминалу, ServerAlive рвёт зависшую сессию за полминуты.
 GIT_SSH_COMMAND = ("ssh -o BatchMode=yes -o ConnectTimeout=15 "
@@ -930,6 +1133,12 @@ def make_worktree(repo: Path, branch: str, base: str, remote: str, path: Path,
         git(repo, "fetch", remote, continue_from)
         start = f"{remote}/{continue_from}"
     git(repo, "worktree", "add", "-B", branch, str(path), start)
+
+
+def epic_of_card(card: dict) -> int | None:
+    """Номер эпика, из которого выросла сабтаска. None — карточка сама по себе."""
+    match = EPIC_ORIGIN_RE.search(strip_html(card.get("description")) or "")
+    return int(match.group(1)) if match else None
 
 
 def remote_branch_for_card(repo: Path, remote: str, prefix: str, card_id: int) -> str | None:
@@ -1098,13 +1307,199 @@ def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_u
 # агент
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Пульс агента
+# --------------------------------------------------------------------------- #
+
+# Как назвать по-русски то, что агент делает прямо сейчас: глагол и поле ввода,
+# из которого берётся уточнение. Инструмент, которого тут нет, покажется своим именем —
+# это честнее, чем молчать.
+AGENT_VERBS = {
+    "Read": ("читает", "file_path"),
+    "Edit": ("правит", "file_path"),
+    "MultiEdit": ("правит", "file_path"),
+    "Write": ("пишет", "file_path"),
+    "NotebookEdit": ("правит", "notebook_path"),
+    "Grep": ("ищет", "pattern"),
+    "Glob": ("ищет", "pattern"),
+    "Bash": ("запускает", "command"),
+    "Task": ("поднимает субагента", None),
+    "Skill": ("берёт скилл", "skill"),
+    "TodoWrite": ("раскладывает план", None),
+    "WebFetch": ("читает страницу", "url"),
+    "WebSearch": ("ищет в интернете", "query"),
+    # служебный инструмент схемы: им агент оформляет вердикт в самом конце
+    "StructuredOutput": ("оформляет ответ", None),
+}
+
+
+def short_value(value, field: str) -> str:
+    """Путь ужимаем до хвоста, всё остальное просто подрезаем: в меню-бар влезает мало."""
+    text = str(value).strip()
+    if "path" in field:
+        parts = [p for p in text.split("/") if p]
+        text = "/".join(parts[-2:]) if len(parts) > 1 else text
+    return text[:44]
+
+
+class AgentPulse:
+    """
+    Живой след работы агента: что он делает прямо сейчас.
+
+    Без него `claude -p` — чёрный ящик: наружу не выходит ничего, пока агент не
+    закончит, а это по нашим логам шесть минут в среднем и двадцать шесть в худшем
+    случае. Всё это время в меню-баре висела одна и та же строка, и отличить работу
+    от зависшей сети было нечем.
+    """
+
+    # Статус пишется на диск, поэтому не на каждое событие: в разгоне их несколько
+    # в секунду, а человек всё равно читает глазами.
+    THROTTLE_SEC = 2.0
+
+    def __init__(self, publish: bool = True):
+        self.result: dict | None = None
+        self.steps = 0
+        self.action: str | None = None
+        self.publish = publish
+        self._last_write = 0.0
+        self._written_action: str | None = None
+
+    def feed(self, line: str) -> None:
+        """Строка NDJSON из claude. Ошибки глотаем: витрина не важнее сделанной работы."""
+        line = line.strip()
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        # Итог приходит последним событием — в нём и вердикт, и стоимость.
+        if event.get("type") == "result":
+            self.result = event
+            return
+        action = self.describe(event)
+        if action:
+            self.steps += 1
+            self.action = action
+        # Бьёмся на любом событии, не только на понятном: важно само «он жив».
+        self.beat()
+
+    def describe(self, event: dict) -> str | None:
+        """Из события — строчка на русском. None, если показывать нечего."""
+        if event.get("type") != "assistant":
+            return None
+        blocks = (event.get("message") or {}).get("content")
+        if not isinstance(blocks, list):
+            return None
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name") or "")
+            verb, field = AGENT_VERBS.get(name, (None, None))
+            if verb is None:
+                # в том числе MCP-инструменты: mcp__figma__get_screenshot -> get_screenshot
+                return name.split("__")[-1] or None
+            value = (block.get("input") or {}).get(field) if field else None
+            return f"{verb} {short_value(value, field)}".strip() if value else verb
+        return None
+
+    def beat(self, force: bool = False) -> None:
+        now = time.time()
+        # Смену действия показываем почти сразу — ради неё всё и затевалось.
+        # Повторные события просто подтверждают «агент жив», им хватает и пары секунд.
+        wait = 0.5 if self.action != self._written_action else self.THROTTLE_SEC
+        if not force and now - self._last_write < wait:
+            return
+        self._last_write = now
+        self._written_action = self.action
+        if not self.publish:
+            return
+        write_status(agent={
+            "action": self.action,
+            "steps": self.steps,
+            "beat": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
+
+def clear_pulse() -> None:
+    """Агент отработал — убираем его след, иначе он переживёт прогон."""
+    try:
+        write_status(agent=None)
+    except Exception:  # noqa: BLE001 — на выходе падать уже незачем
+        pass
+
+
+def run_streaming(cmd: list[str], cwd: Path | str, timeout: int,
+                  env: dict | None, on_line, stop_when=None) -> subprocess.CompletedProcess:
+    """
+    То же, что run_bounded, но stdout отдаётся построчно по мере поступления.
+
+    Читают отдельные потоки: главный ждёт сам процесс и по таймауту гасит всю группу.
+    Читатели демонические и join-ятся с таймаутом намеренно — внук, переживший
+    родителя, держит pipe открытым, и без этого мы бы снова навсегда зависли в чтении
+    (ровно тот случай, ради которого появился run_bounded).
+
+    `stop_when` — предикат на строку потока: True значит «ждать больше нечего, гаси».
+    Нужен потому, что не всякая безнадёга кончается ошибкой процесса: на протухшей
+    авторизации claude не падает, а молча ходит по кругу ретраев до самого таймаута.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True,
+        bufsize=1,
+    )
+    out: list[str] = []
+    err: list[str] = []
+
+    def pump_out() -> None:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            out.append(line)
+            try:
+                on_line(line)
+            except Exception:  # noqa: BLE001 — витрина не должна ронять прогон
+                pass
+            if stop_when and stop_when(line):
+                # Гасим прямо отсюда и без wait: ждать процесс из потока-читателя,
+                # пока его ждёт главный, — лишний способ поймать себя за хвост.
+                # Главному хватит того, что группа умерла: его wait вернётся сам.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                return
+
+    def pump_err() -> None:
+        err.append(proc.stderr.read())  # type: ignore[union-attr]
+
+    readers = [threading.Thread(target=pump_out, daemon=True),
+               threading.Thread(target=pump_err, daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        for reader in readers:
+            reader.join(timeout=15)
+        raise subprocess.TimeoutExpired(cmd, timeout, output="".join(out),
+                                        stderr="".join(err)) from None
+    for reader in readers:
+        reader.join(timeout=15)
+    return subprocess.CompletedProcess(cmd, proc.returncode, "".join(out), "".join(err))
+
+
 def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
               schema: dict | None = None, verdict_key: str = "status") -> tuple[dict, dict]:
     """Возвращает (verdict, meta). Кидает FactoryError, если claude не отработал."""
     schema = schema or VERDICT_SCHEMA
     cmd = [
         "claude", "-p", prompt,
-        "--output-format", "json",
+        # Потоком, а не одним куском в конце: только так видно, что агент жив.
+        # Разбирает поток AgentPulse, он же пишет «что делает сейчас» в статус.
+        # --verbose обязателен: без него claude не отдаёт stream-json в режиме -p.
+        "--output-format", "stream-json", "--verbose",
         "--json-schema", json.dumps(schema),
         "--permission-mode", agent_cfg["permission_mode"],
         "--allowedTools", ",".join(agent_cfg["allowed_tools"]),
@@ -1122,36 +1517,89 @@ def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
+    pulse = AgentPulse()
     try:
-        # через run_bounded: claude поднимает свои подпроцессы, и по таймауту надо
+        # через run_streaming: claude поднимает свои подпроцессы, и по таймауту надо
         # гасить всю группу — иначе внук переживёт родителя и повесит чтение pipe
-        proc = run_bounded(cmd, cwd, agent_cfg["timeout_sec"], env)
+        proc = run_streaming(cmd, cwd, agent_cfg["timeout_sec"], env, pulse.feed,
+                             stop_when=auth_failed_event)
     except subprocess.TimeoutExpired as e:
+        if looks_like_auth(e.output, e.stderr):
+            raise auth_broken() from e
         raise FactoryError(f"агент не уложился в {agent_cfg['timeout_sec']}с") from e
+    finally:
+        clear_pulse()
 
     if proc.returncode != 0:
+        if looks_like_auth(proc.stdout, proc.stderr):
+            raise auth_broken()
         raise FactoryError(f"claude exit {proc.returncode}: {(proc.stderr or proc.stdout)[:1500]}")
 
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise FactoryError(f"claude вернул не JSON: {proc.stdout[:800]}") from e
+    payload = pulse.result
+    if payload is None:
+        # Поток кончился без итогового события. Так бывает, если claude оборвали
+        # снаружи: делать вид, что вердикта нет по существу, нельзя — это сбой.
+        if looks_like_auth(proc.stdout, proc.stderr):
+            raise auth_broken()
+        raise FactoryError("claude не отдал итог потоком: "
+                           + (proc.stderr or proc.stdout or "")[-800:])
 
     meta = {
         "cost_usd": payload.get("total_cost_usd"),
         "duration_ms": payload.get("duration_ms"),
         "num_turns": payload.get("num_turns"),
+        "steps": pulse.steps,
         "is_error": payload.get("is_error"),
         "subtype": payload.get("subtype"),
         "session_id": payload.get("session_id"),
         "raw": payload,
     }
 
+    # Агент дошёл до конца — значит с авторизацией всё в порядке, и кнопку входа
+    # в меню-баре пора убрать. Иначе она осталась бы висеть до перезапуска.
+    note_auth(True)
+
     verdict = extract_verdict(payload, verdict_key)
     if verdict is None:
         # структурированный ответ не доехал — не выдумываем вердикт, решим по коммитам
         verdict = {verdict_key: None, "summary": str(payload.get("result") or "")[:4000]}
+    # Режем в одной точке, а не в двадцати местах, где summary идёт в комментарий.
+    if isinstance(verdict.get("summary"), str):
+        verdict["summary_full"] = verdict["summary"]
+        verdict["summary"] = brief(verdict["summary"])
     return verdict, meta
+
+
+# Сколько «что сделано» влезает в комментарий к карточке. Промпты просят одно
+# предложение, но просьба — не гарантия: агент возвращал и абзац на полторы тысячи
+# знаков, и карточка превращалась в стену текста, которую никто не читает. Поэтому
+# режем ещё и здесь. Полный текст остаётся в summary_full и уходит в ревью на PR,
+# где подробности как раз уместны.
+BRIEF_LIMIT = 220
+
+
+def brief(text: str, limit: int = BRIEF_LIMIT) -> str:
+    """Первое предложение, не длиннее лимита. Пустое остаётся пустым."""
+    text = " ".join(str(text or "").split())
+    if not text:
+        return ""
+    # Обрываем по концу предложения, но только там, где дальше начинается новое:
+    # точка в «~13 мин.» или в «src/foo.ts» предложение не заканчивает.
+    for end in range(len(text)):
+        if text[end] in ".!?" and text[end - 1:end].isalnum():
+            tail = text[end + 1:end + 3]
+            if not tail or (tail[:1] == " " and tail[1:2].isupper()):
+                if end + 1 <= limit:
+                    return text[:end + 1]
+                break
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def full_summary(verdict: dict) -> str:
+    """Неурезанный отчёт агента — для ревью на PR, где подробности к месту."""
+    return str(verdict.get("summary_full") or verdict.get("summary") or "")
 
 
 def extract_verdict(payload: dict, key: str = "status"):
@@ -1225,14 +1673,73 @@ def out_of_budget(cfg: dict) -> bool:
 
 
 def format_meta(meta: dict) -> str:
+    """
+    Строка «сколько заняло и во что обошлось».
+
+    Про шаги и время: когда агента обрывают по потолку, claude отдаёт мусорные
+    метрики — девять миллисекунд и один шаг за девять минут настоящей работы.
+    Свой счётчик шагов из пульса в этот момент честнее, поэтому берём больший
+    из двух, а заведомо неправдоподобное время просто не показываем.
+    """
     bits = []
-    if meta.get("duration_ms"):
-        bits.append(f"{round(meta['duration_ms'] / 1000)}с")
+    duration = int(meta.get("duration_ms") or 0)
+    steps = max(int(meta.get("num_turns") or 0), int(meta.get("steps") or 0))
+    if duration >= 1000:
+        bits.append(f"{round(duration / 1000)}с")
     if meta.get("cost_usd"):
         bits.append(f"~${meta['cost_usd']:.2f}")
-    if meta.get("num_turns"):
-        bits.append(f"{meta['num_turns']} шагов")
+    if steps:
+        bits.append(f"{steps} шагов")
     return ", ".join(bits)
+
+
+# Причины, по которым claude обрывает сам себя. Это не вердикт агента: работа шла,
+# просто её прекратили снаружи. Ключи — subtype из итогового события потока.
+AGENT_STOP_REASONS = {
+    "error_max_budget_usd": "упёрся в потолок расхода",
+    "error_max_turns": "упёрся в потолок шагов",
+    "error_during_execution": "оборвался на ошибке рантайма",
+}
+
+# Метка в комментарии: работа прервана и будет продолжена. По ней же следующий прогон
+# понимает, что надо не начинать заново, а взять существующую ветку.
+PARTIAL_MARK = "Работа прервана, продолжу с того же места"
+
+
+def agent_was_cut(meta: dict) -> str:
+    """Оборвали ли агента снаружи. Возвращает причину по-русски или пустую строку."""
+    subtype = str((meta or {}).get("subtype") or "")
+    if not subtype.startswith("error_"):
+        return ""
+    return AGENT_STOP_REASONS.get(subtype, subtype)
+
+
+def count_partials(comments: list) -> int:
+    """
+    Сколько раз подряд агента обрывали с последней реплики человека.
+
+    Нужен, чтобы не жечь деньги вечно: если задача не влезает в потолок, второй
+    обрыв подряд значит, что её надо разбить или поднять лимит, а не пробовать снова.
+    """
+    count = 0
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if not text.startswith(AGENT_MARKS):
+            break
+        if PARTIAL_MARK in text:
+            count += 1
+    return count
+
+
+def format_assumptions(verdict: dict) -> str:
+    """
+    Блок «Додумал сам» — решения, которые агент принял за человека.
+
+    Ради него фабрике и разрешили не ждать ответа: она не встаёт на сутки из-за
+    вопроса, но и не делает вид, что вопроса не было. Место ему в карточке, а не
+    в PR: карточку человек читает, PR открывает не всегда.
+    """
+    return format_list("⚠️ Додумал сам — проверь", verdict.get("assumptions"))
 
 
 def format_list(title: str, items) -> str:
@@ -1255,7 +1762,7 @@ def comment_success(verdict: dict, meta: dict, pr_url: str, branch: str) -> str:
         text += f"\n\n**Риски:** {verdict['risks']}"
     if format_meta(meta):
         text += f"\n\n_Агент: {format_meta(meta)}._"
-    text += format_joke(verdict)
+    text += format_assumptions(verdict) + format_joke(verdict)
     return text
 
 
@@ -1720,7 +2227,7 @@ def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
                    needs_changes: bool) -> str:
     head = ("нужны правки" if needs_changes else "замечаний нет")
     text = f"{REVIEWER_MARK} **Ревью, круг {round_number}/{max_rounds}: {head}.**\n\n"
-    text += review.get("summary", "")
+    text += full_summary(review)
     text += format_findings(review.get("findings"))
     if needs_changes:
         text += "\n\nОтправляю в «Правки», исполнитель поправит и вернёт на ревью."
@@ -1731,7 +2238,24 @@ def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
 
 
 def count_review_rounds(comments: list) -> int:
-    return sum(1 for c in comments
+    """
+    Сколько кругов ревью прошло **с последней реплики человека**.
+
+    Считать за всю историю нельзя. Потолок `reviewer.max_rounds` тогда упирается
+    навсегда: эпик после третьего ревью уходит в «ждёт человека» и не выходит оттуда,
+    сколько ему ни отвечай — счётчик-то не убывает. Поймали вживую на эпике ETA:
+    блокеры сняты, человек ответил на оба вопроса, а фабрика два прогона подряд
+    писала «ждёт твоего ответа».
+
+    Ответ человека — новая вводная: стена, в которую упиралось ревью, пробита,
+    и круги начинаются заново.
+    """
+    start = 0
+    for index, comment in enumerate(comments):
+        text = strip_html(comment.get("text", ""))
+        if text and not text.startswith(AGENT_MARKS):
+            start = index + 1
+    return sum(1 for c in comments[start:]
                if strip_html(c.get("text", "")).startswith(REVIEWER_MARK)
                and "продолжение" not in strip_html(c.get("text", ""))[:40])
 
@@ -1897,17 +2421,23 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
 
         asks = [a for a in (review.get("needs_human") or []) if str(a).strip()]
         if asks:
-            # то же, что у спеки: круг правок в эту стену не пробьётся
-            text = (f"{REVIEWER_MARK} **Дальше без тебя не выйдет.**\n\n"
+            # Код написан, PR открыт — значит человек и так следующий в очереди, и
+            # вопрос ревьювера это часть ревью, а не отдельная блокировка. Раньше
+            # карточка уезжала в «Вопрос от агента» с блокером «не хватило данных»
+            # и вставала в колонке «В работе», как будто её ещё пишут: на доске
+            # сабтасок эти две роли делят одну колонку. А вопрос был вида «кто
+            # посмотрит экран на стенде до мержа» — это ровно то, чем ревью и
+            # занимается. Поэтому едем в колонку ревью, вопросы несём с собой.
+            text = (f"{REVIEWER_MARK} **Ревью пройдено, но нужен твой взгляд.**\n\n"
                     f"{review.get('summary', '')}")
             for ask in asks[:4]:
                 text += f"\n\n❓ {ask}"
             if pr_url.startswith("http"):
                 text += f"\n\nОстальные замечания — в PR: {pr_url}"
             kaiten.comment(card_id, text + "\n\nОтветь комментарием в карточке.")
-            hand_over(kaiten, profile, card_id, "question", asks[0][:90])
-            finish_status(card_id, title, "нужен человек", meta, pr_url)
-            log(f"  -> нужен человек: {len(asks)} вопросов")
+            hand_over(kaiten, profile, card_id, "review")
+            finish_status(card_id, title, "на ревью, есть вопросы", meta, pr_url)
+            log(f"  -> На ревью (человеку), вопросов: {len(asks)}")
             return
 
         if needs_changes:
@@ -1992,14 +2522,33 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     slug = slugify(title)
     branch = f"{cfg['pr']['branch_prefix']}{card_id}" + (f"-{slug}" if slug else "")
     continue_from = None
-    if fixing:
+    # Прошлый заход оборвали на полушаге — берём его ветку, а не начинаем с нуля.
+    # Иначе агент второй раз проходит тот же путь и второй раз упирается в потолок.
+    resuming = count_partials(comments) > 0
+    if fixing or resuming:
         # правки идут в ту же ветку и тот же PR, иначе ревью пойдёт по кругу с нуля
         continue_from = remote_branch_for_card(repo, repo_cfg["remote"],
                                                cfg["pr"]["branch_prefix"], card_id)
         if continue_from:
             branch = continue_from
 
-    reason = " (правки после ревью)" if fixing else (" (ответ на вопрос)" if returning else "")
+    # Сабтаска эпика продолжает ветку спеки: спека и реализация должны приехать
+    # человеку **одним** PR. Раньше выходило два — отдельно спека, отдельно код, —
+    # и ревьюить их приходилось врозь, а мержить в правильном порядке. Ветка спеки
+    # уже содержит описание того, что делается, так что код ложится ровно поверх,
+    # а open_pr видит открытый PR этой ветки и второго не создаёт.
+    if not continue_from:
+        epic_id = epic_of_card(card)
+        if epic_id:
+            spec_branch = remote_branch_for_card(repo, repo_cfg["remote"],
+                                                 cfg["pr"]["branch_prefix"], epic_id)
+            if spec_branch and spec_branch.endswith("-spec"):
+                branch = continue_from = spec_branch
+                log(f"  пишу в ветку спеки эпика #{epic_id}: {branch}")
+
+    reason = (" (правки после ревью)" if fixing else
+              " (продолжаю прерванное)" if resuming else
+              " (ответ на вопрос)" if returning else "")
     log(f"#{card_id} «{title[:60]}» -> {repo_key} / {branch}{reason}")
 
     if not args.prompt_only:
@@ -2039,6 +2588,55 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         commits = git(worktree, "log", f"{base_ref}..HEAD", "--oneline")
         dirty = git(worktree, "status", "--porcelain")
         status = verdict.get("status")
+
+        # Структурированного отчёта нет — после долгих сессий агент иногда просто
+        # не зовёт StructuredOutput. Тогда в summary оказывалась его последняя реплика:
+        # в карточке висело «фоновая установка зависимостей завершилась с кодом 0»,
+        # хотя сделан был весь экран. Сообщение коммита говорит по делу.
+        if status is None and commits:
+            first = commits.splitlines()[0].split(" ", 1)
+            if len(first) > 1:
+                verdict["summary"] = first[1]
+
+        # Агента оборвали снаружи — он не «ничего не сделал», он не доработал.
+        # Раньше это выглядело как «агент не внёс изменений и не объяснил почему»:
+        # карточка уезжала к человеку, а worktree с девятью минутами работы удалялся
+        # в finally. Один такой обрыв стоил $5 и не оставил ни строчки.
+        cut = agent_was_cut(meta)
+        if cut:
+            partials = count_partials(comments)
+            if not args.dry_run and dirty:
+                # Коммитим что есть: агента прервали на полушаге, и сам он уже не успеет
+                git(worktree, "add", "-A")
+                git(worktree, "commit", "-m",
+                    f"#{card_id} промежуточный результат: {cut}", check=False)
+                commits = git(worktree, "log", f"{base_ref}..HEAD", "--oneline")
+            if commits and not args.dry_run and branch.startswith(cfg["pr"]["branch_prefix"]):
+                git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
+
+            # Второй обрыв подряд — дальше пробовать бессмысленно: задача не влезает
+            # в потолок, и каждый заход стоит денег ради того же результата.
+            if partials >= 1 or not commits:
+                text = (f"{AGENT_MARK} **Не укладываюсь в отведённый бюджет.** {cut} "
+                        f"({format_meta(meta)}).\n\n"
+                        + ("Успел закоммитить часть — она в ветке `" + branch + "`.\n\n"
+                           if commits else "Закоммитить ничего не успел.\n\n")
+                        + "Дальше сам не вытяну: либо разбей задачу на части поменьше, "
+                        + "либо подними `agent.max_budget_usd` в конфиге фабрики.")
+                kaiten.comment(card_id, text)
+                hand_over(kaiten, profile, card_id, "question")
+                finish_status(card_id, title, "не влез в бюджет", meta)
+                log(f"  -> {cut}, второй раз подряд — отдаю человеку")
+                return
+
+            kaiten.comment(card_id,
+                           f"{AGENT_MARK} **{PARTIAL_MARK}.** {cut} "
+                           f"({format_meta(meta)}).\n\nСделанное закоммичено в ветку "
+                           f"`{branch}` — следующим прогоном продолжу оттуда, "
+                           f"начинать заново не буду.")
+            finish_status(card_id, title, "прервался, продолжу", meta)
+            log(f"  -> {cut}, работа сохранена в {branch}, продолжу следующим прогоном")
+            return
 
         # Нет коммитов — обсуждать нечего, что бы агент ни написал.
         if not commits:
@@ -2102,6 +2700,11 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         finish_status(card_id, title, "на ревью агента", meta, pr_url)
         log(f"  -> Ревью агента: {pr_url}")
 
+    except AgentAuthError:
+        # Единственная поломка, за которую карточку наказывать нельзя: агент не
+        # начинался. Уроним прогон целиком — со следующей карточкой будет то же
+        # самое, а «Упало» на ровном месте потом разбирать руками.
+        raise
     except Exception as e:  # noqa: BLE001 — карточка не должна застревать в «В работе»
         log(f"  !! {e}")
         if args.prompt_only:
@@ -2144,17 +2747,25 @@ def save_triage_state(state: dict) -> None:
     tmp.replace(TRIAGE_STATE_FILE)
 
 
-def note_triage_fail(state: dict, card_id: int, error: str) -> None:
+def note_triage_fail(state: dict, card_id: int, error: str, max_fails: int) -> bool:
     """
     Копим неудачи по карточке. Разведка ходит по расписанию каждые несколько минут,
     и карточка, на которой агент стабильно падает, иначе жгла бы деньги на каждом тике.
+
+    Возвращает True ровно один раз — на том прогоне, где счётчик дошёл до предела.
+    Это последняя возможность сказать человеку хоть что-то: дальше pick_inbox_cards
+    молча выкидывает карточку из выборки, и она навсегда зависает в «Инбоксе».
     """
     cards = state.setdefault("cards", {})
     entry = cards.setdefault(str(card_id), {"fails": 0})
     entry["fails"] = entry.get("fails", 0) + 1
     entry["error"] = error[:300]
     entry["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    give_up = entry["fails"] >= max_fails and not entry.get("told")
+    if give_up:
+        entry["told"] = True
     save_triage_state(state)
+    return give_up
 
 
 def forget_triage_fail(state: dict, card_id: int) -> None:
@@ -2418,6 +3029,18 @@ def comment_triage_budget(meta: dict) -> str:
             f"это видно, как называется кнопка или строка, ссылка на код или на PR.")
 
 
+def comment_triage_stuck(fails: int, error: str) -> str:
+    """
+    Разведка сорвалась столько раз подряд, что карточка выпала из выборки. Молчать
+    нельзя ровно по той же причине, что и с бюджетом: человек ждёт разбора, а фабрика
+    эту карточку уже вычеркнула — и без комментария он об этом никогда не узнает.
+    """
+    return (f"{TRIAGE_MARK} **Разведка сорвалась и больше не берётся.**\n\n"
+            f"Попыток: {fails}, все впустую. Последняя ошибка: {error}\n\n"
+            f"Дальше нужен человек. Карточка из автоматической разведки выпала и сама "
+            f"туда не вернётся: если причина ушла, скажи — я зайду ещё раз.")
+
+
 def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
                 scouts: dict[str, Path], round_number: int) -> None:
     card_id = card_stub["id"]
@@ -2511,6 +3134,7 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
         return 0
 
     state = load_triage_state()
+    max_fails = inbox.get("max_fails", 2)
     if only_card:
         rounds = count_triage_rounds(kaiten.comments(only_card)) + 1
         targets, pending = [({"id": only_card}, rounds)], 1
@@ -2537,15 +3161,26 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
             forget_triage_fail(state, card["id"])
             done += 1
         except ScoutSetupError as e:
-            # с остальными карточками будет то же самое, и карточки в этом не виноваты
+            # с остальными карточками будет то же самое, и карточки в этом не виноваты:
+            # ни в счётчик неудач, ни в комментарий это идти не должно
             log(f"  !! разведка невозможна: {e}")
             break
+        except AgentAuthError as e:
+            # То же самое, но чинить это человеку — и остальным фазам прогона тоже
+            # ничего не светит: везде упрёмся в тот же отказ. Роняем прогон целиком.
+            log(f"  !! разведка невозможна: {e}")
+            raise
         except Exception as e:  # noqa: BLE001 — одна карточка не должна валить прогон
             log(f"  !! #{card['id']} разведка не удалась: {e}")
-            note_triage_fail(state, card["id"], str(e))
+            if note_triage_fail(state, card["id"], str(e), max_fails):
+                log("  предел неудач — больше эту карточку не беру, говорю об этом в ней")
+                try:
+                    kaiten.comment(card["id"], comment_triage_stuck(max_fails, str(e)))
+                except Exception as mute:  # noqa: BLE001 — сказать не вышло, прогон живёт
+                    log(f"  !! и в карточку это не записалось: {mute}")
 
     if not args.prompt_only:
-        write_status(card=None, phase=None, inbox_pending=max(0, pending - done))
+        write_status(card=None, phase=None, agent=None, inbox_pending=max(0, pending - done))
     return 0
 
 
@@ -2578,7 +3213,36 @@ EPIC_ORIGIN_RE = re.compile(r"Из эпика:\s*#(\d+)")
 
 # Фазы. Порядок важен: фаза выводится первым совпавшим условием
 EPIC_PHASES = ("acceptance", "waiting_answer", "spec", "spec_review", "spec_fix",
-               "decompose", "working", "closing")
+               "spec_settle", "decompose", "working", "closing")
+
+# Где эпик стоит прямо сейчас — положение, а не действие. Раньше в меню-баре под
+# заголовком «следующий шаг» показывались метки из EPIC_PHASE_LABELS, но это работа,
+# которую фабрика собирается сделать, а не состояние: «сабтаски в работе» как
+# «следующий шаг» читается бессмыслицей.
+EPIC_PHASE_STATE = {
+    "acceptance": "приёмочных критериев ещё нет",
+    "waiting_answer": "ждёт твоего ответа",
+    "spec": "критерии готовы, спеки нет",
+    "spec_review": "спека написана, не отревьюена",
+    "spec_fix": "у спеки есть замечания",
+    "spec_settle": "круги ревью исчерпаны",
+    "decompose": "спека принята, сабтасок нет",
+    "working": "сабтаски в работе",
+    "closing": "все сабтаски отревьюены",
+}
+
+# Что фабрика сделает следующим шагом. Это и есть «дальше», в отличие от положения выше.
+EPIC_PHASE_NEXT = {
+    "acceptance": "напишет приёмочные критерии",
+    "waiting_answer": "ждёт тебя — ничего не сделает",
+    "spec": "напишет спеку",
+    "spec_review": "отревьюит спеку",
+    "spec_fix": "поправит спеку по замечаниям",
+    "spec_settle": "примет спеку как есть и разложит на сабтаски",
+    "decompose": "разложит на сабтаски",
+    "working": "ждёт, пока сабтаски пройдут ревью",
+    "closing": "закроет эпик",
+}
 
 # Формулировки нарочно безличные: фаза висит в трее и когда прогон не идёт, а
 # «правлю спеку» в этот момент врёт — человек видит работу, которой нет.
@@ -2588,6 +3252,7 @@ EPIC_PHASE_LABELS = {
     "spec": "написать спеку",
     "spec_review": "отревьюить спеку",
     "spec_fix": "поправить спеку по замечаниям",
+    "spec_settle": "принять спеку как есть",
     "decompose": "разложить на сабтаски",
     "working": "сабтаски в работе",
     "closing": "закрыть эпик",
@@ -2602,21 +3267,16 @@ def epic_flow(cfg: dict) -> dict | None:
     return flow
 
 
-def next_column_after(kaiten: Kaiten, board_id: int, column_id: int) -> int | None:
+def column_order(kaiten: Kaiten, board_id: int) -> list[int]:
     """
-    Колонка справа от указанной.
+    Колонки доски слева направо, одним списком id.
 
-    Эпик после ревью уезжает «в следующую после разработки», а не в жёстко заданную:
-    так это описано в процессе. Подколонки считаются внутри своего родителя, и только
-    когда сосед справа кончился — переходим к следующей верхней колонке.
+    По этому порядку эпик и двигается: целевая колонка описана в процессе как
+    «следующая после разработки», а не задана жёстко. Подколонки идут внутри своего
+    родителя, и только когда сосед справа кончился — начинается следующая верхняя
+    колонка; так их раскладывает flat_columns.
     """
-    board = kaiten.board(board_id)
-    columns = flat_columns(board)
-    ids = [int(c["id"]) for c in columns]
-    if column_id not in ids:
-        return None
-    position = ids.index(column_id)
-    return ids[position + 1] if position + 1 < len(ids) else None
+    return [int(c["id"]) for c in flat_columns(kaiten.board(board_id))]
 
 
 def acceptance_items(card: dict) -> list[dict]:
@@ -2655,7 +3315,17 @@ def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> list:
     own = []
     for child in children:
         description = strip_html(child.get("description")) or ""
-        match = EPIC_ORIGIN_RE.search(description)
+        if not description and child.get("description_filled"):
+            # `GET /cards/{id}/children` описание не отдаёт вовсе — только флаг
+            # description_filled. Без дозапроса эпик не узнаёт собственных сабтасок,
+            # навсегда остаётся в фазе «разложить на сабтаски» и каждый прогон
+            # раскладывается заново, плодя дубли по $0.9 за комплект.
+            try:
+                description = strip_html((kaiten.card(child["id"]) or {}).get("description"))
+            except Exception as e:  # noqa: BLE001 — одна недоступная карточка не повод падать
+                log(f"  не смог прочитать сабтаску #{child.get('id')}: {e}")
+                description = ""
+        match = EPIC_ORIGIN_RE.search(description or "")
         if match and int(match.group(1)) == epic_id:
             own.append(child)
     return own
@@ -2682,11 +3352,16 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
     от того, что фабрика помнит о прошлом разе.
     """
     card_id = card["id"]
-    # Любой наш действующий блокер значит одно: ход человека, агентов не запускаем.
-    # Раньше проверялся только блокер апрува АЦ, и эпик, заблокированный на вопросе,
-    # каждый прогон заново входил в ту же фазу — ревьювер часами пересматривал одну
-    # и ту же неизменённую спеку по $1.3 за круг.
-    if any(ours(b) for b in kaiten.blockers(card_id)):
+    # Наш действующий блокер значит ход человека, агентов не запускаем. Раньше
+    # проверялся только блокер апрува АЦ, и эпик, заблокированный на вопросе, каждый
+    # прогон заново входил в ту же фазу — ревьювер часами пересматривал одну и ту же
+    # неизменённую спеку по $1.3 за круг.
+    #
+    # Но ждать вечно тоже нельзя: вопрос вроде «какой текст у подписи» останавливал
+    # эпик на сутки. Отвисевший своё блокер перестаёт держать — фабрика идёт дальше,
+    # принимая решения сама и честно перечисляя их в «Додумал сам».
+    held, stale = stale_holds(kaiten, flow, card_id)
+    if held and not stale:
         return "waiting_answer"
     if not acceptance_items(card):
         return "acceptance"
@@ -2698,7 +3373,13 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
         # а он ничего поправить не мог — спека лежит в репозитории.
         rounds = count_review_rounds(comments)
         if rounds >= (cfg.get("reviewer") or {}).get("max_rounds", 3):
-            return "waiting_answer"
+            # Круги кончились. Раньше здесь эпик вставал и ждал человека — и это была
+            # худшая из возможных развязок: к третьему кругу замечания мельчают
+            # («1 из 4», «1 из 3»), спека давно исполнима, а задача стоит сутки из-за
+            # несогласованной формулировки в одном пункте. Спека — не диссертация,
+            # а руководство к работе: принимаем как есть, нерешённое несём дальше
+            # открытым текстом.
+            return "spec_settle"
         return "spec_fix" if last_word_is_review(comments) else "spec_review"
 
     children = kaiten.children(card_id)
@@ -2791,6 +3472,7 @@ def comment_acceptance(verdict: dict, meta: dict) -> str:
         text += "\n\nПохоже, понадобится и бек — учту при декомпозиции."
     tail = format_meta(meta)
     text += f"\n\n_приёмочные критерии{': ' + tail if tail else ''}. Код не менял._"
+    text += format_assumptions(verdict)
     return text + format_joke(verdict)
 
 
@@ -2901,7 +3583,8 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
             f"{verdict.get('summary', '')}")
     if any(i.get("mocks_backend") for _, i in created):
         text += f"\n\n{MOCK_BACKEND_NOTE}"
-    text += f"\n\n_декомпозиция, {format_meta(meta)}._" + format_joke(verdict)
+    text += (f"\n\n_декомпозиция, {format_meta(meta)}._"
+             + format_assumptions(verdict) + format_joke(verdict))
     kaiten.comment(epic["id"], text)
 
 
@@ -2939,21 +3622,83 @@ def epic_worktree(kaiten: Kaiten, cfg: dict, repo_cfg: dict, repo_key: str,
     return worktree
 
 
+# Врезка в промпт, когда на вопросы никто не ответил. Главное здесь — не «реши как
+# хочешь», а «реши консервативно и покажи, что решил»: человек увидит список и поправит
+# то, что его не устроит, а задача к этому моменту уже будет двигаться.
+UNANSWERED_NOTE = """
+## На эти вопросы никто не ответил
+
+Их задал прошлый прогон, и человек не откликнулся за отведённое время:
+
+{questions}
+
+Ждать больше не нужно — **прими решения сам и работай дальше**. По каждому:
+
+- выбирай самый осторожный вариант: тот, что ближе к тому, как уже сделано в коде
+  или нарисовано в макете, и тот, который проще всего потом откатить;
+- если вопрос организационный (кто, когда, в каком PR) — считай, что это делает
+  кто-то другой отдельной задачей, и просто не закладывайся на это;
+- ничего не выдумывай про данные, которых нет: если без факта нельзя, опиши развилку
+  прямо в тексте и возьми вариант по умолчанию.
+
+**Каждое такое решение верни отдельной строкой в `assumptions`** — коротко, в форме
+«принял X, потому что Y». Это единственное место, по которому человек поймёт, где ты
+додумывал за него. Молча принятое решение хуже неотвеченного вопроса.
+"""
+
+
+def release_stale_holds(kaiten: Kaiten, flow: dict, card: dict, comments: list,
+                        args) -> list[str]:
+    """
+    Снимает отвисевшие своё блокеры и возвращает вопросы, на которые не ответили.
+
+    Пустой список — либо блокеров не было, либо они ещё свежие: ждём дальше.
+    """
+    card_id = card["id"]
+    held, stale = stale_holds(kaiten, flow, card_id)
+    if not stale:
+        return []
+    questions = open_questions(comments) or [
+        str(b.get("reason") or "").removeprefix(BLOCK_MARK).strip() for b in stale
+    ]
+    questions = [q for q in questions if q]
+    hours = flow.get("answer_wait_hours", DEFAULT_ANSWER_WAIT_HOURS)
+    log(f"  ответа нет {hours} ч — снимаю блокер и иду дальше сам")
+    if args.prompt_only or args.dry_run:
+        return questions
+    for blocker in stale:
+        try:
+            kaiten.unblock(card_id, blocker["id"])
+        except Exception as e:  # noqa: BLE001 — не смогли снять, но работу не бросаем
+            log(f"  !! блокер {blocker.get('id')} не снялся: {e}")
+    text = (f"{EPIC_MARK} **Ответа не дождался за {hours} ч — двигаюсь дальше сам.**\n\n"
+            "Решения по открытым вопросам приму на своё усмотрение, самые осторожные "
+            "из возможных, и перечислю их в следующем комментарии под заголовком "
+            "«Додумал сам». Если что-то не так — поправь, это дешевле, чем стоять.")
+    kaiten.comment(card_id, text)
+    return questions
+
+
 def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list,
-                 phase: str, args) -> None:
+                 phase: str, args, unanswered: list[str] | None = None) -> None:
     """Продвигает эпик на одну фазу. Каждая фаза заканчивается либо шагом, либо блокером."""
     card_id = card["id"]
     card_url = kaiten.card_url(card)
     title = (card.get("title") or "").strip()
     repo_key, repo_cfg = resolve_repo(card, cfg, (flow.get("subtasks") or {}).get("repo"))
     agent_cfg = {**cfg["triager"], **(flow.get("agent") or {})}
+    unanswered_note = (UNANSWERED_NOTE.format(
+        questions="\n".join(f"- {q}" for q in unanswered)) if unanswered else "")
 
     if phase == "acceptance":
+        note_phase(args, "эпик: готовлю копию репозитория")
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
         prompt = epic_prompt(ACCEPTANCE_TEMPLATE_PATH, card, card_url, repo_cfg,
-                             {"{{COMMENTS}}": format_comments(comments)})
+                             {"{{COMMENTS}}": format_comments(comments),
+                              "{{UNANSWERED}}": unanswered_note})
         if show_prompt(prompt, args, "приёмочных критериев"):
             return
+        note_phase(args, "эпик: пишу приёмочные критерии")
         verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=ACCEPTANCE_SCHEMA)
         note_spend(meta)
         log_phase(card_id, "acceptance", verdict, meta)
@@ -2971,6 +3716,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         return
 
     if phase in ("spec", "spec_fix"):
+        note_phase(args, "эпик: готовлю копию репозитория")
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=True)
         criteria = acceptance_items(card)
         fixing = phase == "spec_fix"
@@ -2982,9 +3728,11 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             "{{SPEC_NOTE}}": SPEC_FIX_NOTE if fixing else "",
             "{{REVIEW_NOTES}}": (fetch_pr_notes(worktree, spec_pr_url(comments))
                                  if fixing else ""),
+            "{{UNANSWERED}}": unanswered_note,
         })
         if show_prompt(prompt, args, "правки спеки" if fixing else "спеки"):
             return
+        note_phase(args, "эпик: правлю спеку" if fixing else "эпик: пишу спеку")
         verdict, meta = run_agent(prompt, worktree, cfg["agent"], schema=SPEC_SCHEMA)
         note_spend(meta)
         log_phase(card_id, "spec", verdict, meta)
@@ -3008,21 +3756,52 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
                        f"{verdict.get('summary', '')}\n\n"
                        f"_{'правка спеки' if fixing else 'спека'}, {format_meta(meta)}. "
                        f"Дальше её посмотрит ревьювер._"
-                       + format_joke(verdict))
+                       + format_assumptions(verdict) + format_joke(verdict))
         log(f"  -> спека: {pr_url}")
         if not (args.keep_worktree or cfg.get("keep_worktree")):
             drop_worktree(Path(repo_cfg["path"]).expanduser(), worktree)
         return
 
+    if phase == "spec_settle":
+        # Ревью и правки не сошлись за отведённые круги. Агента не запускаем: он уже
+        # трижды правил, и каждый следующий круг стоит денег ради всё более мелких
+        # придирок. Закрываем ревью своей властью и оставляем нерешённое в карточке —
+        # исполнитель прочитает его вместе со спекой, а человек увидит, где недоспорили.
+        # Только замечания ревьювера: у них значок важности. Без фильтра сюда лезут
+        # и строки из «Додумал сам» — они уже показаны выше и нерешёнными не являются.
+        marks = tuple(SEVERITY_ICON.values()) + ("❓",)
+        leftovers = [q for q in open_questions(comments, limit=8) if q.startswith(marks)][:5]
+        text = (f"{EPIC_MARK} **{SPEC_OK_LINE}** Ревью и автор не сошлись за "
+                f"{count_review_rounds(comments)} круга — принимаю спеку как есть "
+                f"и иду дальше: она исполнима, а спорить об остатке дороже, чем "
+                f"поправить его при работе.")
+        if leftovers:
+            text += format_list("⚠️ Осталось нерешённым — посмотри при ревью кода",
+                                leftovers)
+        text += ("\n\nНе согласен — напиши комментарием, спека вернётся в правку "
+                 "с твоей репликой.")
+        if not args.prompt_only:
+            kaiten.comment(card_id, text)
+        log(f"  -> спека принята как есть, нерешённых замечаний: {len(leftovers)}")
+        # Эта фаза мгновенная и агента не зовёт — тратить на неё целый тик расписания
+        # незачем: сразу раскладываем эпик на сабтаски, ради чего спека и писалась.
+        if args.prompt_only or out_of_budget(cfg):
+            return
+        return advance_epic(kaiten, cfg, flow, card, comments, "decompose", args,
+                            unanswered)
+
     if phase == "spec_review":
+        note_phase(args, "эпик: готовлю копию репозитория")
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
         prompt = epic_prompt(SPEC_REVIEW_TEMPLATE_PATH, card, card_url, repo_cfg, {
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
                                         for i in acceptance_items(card)),
             "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{UNANSWERED}}": unanswered_note,
         })
         if show_prompt(prompt, args, "ревью спеки"):
             return
+        note_phase(args, "эпик: ревьювер смотрит спеку")
         review, meta = run_agent(prompt, worktree, cfg["reviewer"],
                                  schema=SPEC_REVIEW_SCHEMA, verdict_key="verdict")
         note_spend(meta)
@@ -3037,7 +3816,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             # Стена, которую автор спеки не пробьёт: нужен макет, продуктовое решение
             # или доступ. Гонять круги правок в неё бессмысленно — каждый стоит денег
             # и заканчивается тем же замечанием.
-            full = (f"{REVIEWER_MARK} **Нужен человек.**\n\n{review.get('summary', '')}"
+            full = (f"{REVIEWER_MARK} **Нужен человек.**\n\n{full_summary(review)}"
                     + format_findings(findings))
             if spec_pr and not args.dry_run:
                 post_pr_review(worktree, spec_pr, full)
@@ -3059,7 +3838,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             # Полное ревью — комментарием в PR спеки: там его читает и человек,
             # и следующий круг правок (фабрика забирает его обратно через gh)
             full = (f"{REVIEWER_MARK} **Спеку надо поправить.**\n\n"
-                    f"{review.get('summary', '')}" + format_findings(findings))
+                    f"{full_summary(review)}" + format_findings(findings))
             if spec_pr and not args.dry_run:
                 post_pr_review(worktree, spec_pr, full)
 
@@ -3086,15 +3865,18 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         return
 
     if phase == "decompose":
+        note_phase(args, "эпик: готовлю копию репозитория")
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
         prompt = epic_prompt(DECOMPOSE_TEMPLATE_PATH, card, card_url, repo_cfg, {
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
                                         for i in acceptance_items(card)),
             "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
             "{{MAX_SUBTASKS}}": str(flow.get("max_subtasks", 5)),
+            "{{UNANSWERED}}": unanswered_note,
         })
         if show_prompt(prompt, args, "декомпозиции"):
             return
+        note_phase(args, "эпик: раскладываю на сабтаски")
         verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=DECOMPOSE_SCHEMA)
         note_spend(meta)
         log_phase(card_id, "decompose", verdict, meta)
@@ -3179,17 +3961,26 @@ def close_epic(kaiten: Kaiten, flow: dict, card: dict) -> str:
     разработки». Если её выставили в конфиге — уважаем конфиг.
     """
     card_id = card["id"]
+    order = column_order(kaiten, card["board_id"])
     target = flow.get("review_column_id")
     if not target:
-        target = next_column_after(kaiten, card["board_id"],
-                                   int(flow["development_column_id"]))
-        if not target:
+        development = int(flow["development_column_id"])
+        if development not in order:
+            return "не понял, куда двигать эпик: колонки разработки нет на этой доске"
+        position = order.index(development) + 1
+        if position >= len(order):
             return "не понял, куда двигать эпик: справа от колонки разработки пусто"
-    # человек мог утащить эпик дальше сам — тогда не возвращаем его назад
-    if card.get("column_id") == target:
+        target = order[position]
+    target = int(target)
+
+    # Человек мог утащить эпик дальше сам — тогда не возвращаем его назад. Сравниваем
+    # позиции, а не id: пока здесь стояло `==`, эпик, уехавший в «Rollout», на первом же
+    # прогоне откатывался обратно на ревью, которое человек уже прошёл руками.
+    here = card.get("column_id")
+    if here in order and target in order and order.index(here) >= order.index(target):
         return ""
     log(f"  все сабтаски отревьюены, двигаю эпик в колонку {target}")
-    kaiten.move(card_id, int(target))
+    kaiten.move(card_id, target)
     return f"{EPIC_MARK} **Все сабтаски отревьюены.** Эпик уехал на ревью."
 
 
@@ -3253,6 +4044,11 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
                                "url": kaiten.card_url(card)},
                          phase=f"эпик: {EPIC_PHASE_LABELS.get(phase, phase)}")
 
+        # Ответа не дождались — снимаем свой блокер и идём дальше сами. Вопросы
+        # не выбрасываем: они уедут агенту, он примет по ним решения и вернёт их
+        # списком «Додумал сам».
+        unanswered = release_stale_holds(kaiten, flow, card, comments, args)
+
         if phase == "closing":
             note = close_epic(kaiten, flow, card)
             if note:
@@ -3269,12 +4065,14 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
 
         take_epic(kaiten, flow, card)
         try:
-            advance_epic(kaiten, cfg, flow, card, comments, phase, args)
+            advance_epic(kaiten, cfg, flow, card, comments, phase, args, unanswered)
+        except AgentAuthError:
+            raise
         except FactoryError as e:
             log(f"  !! фаза «{phase}» не удалась: {e}")
 
     if not args.prompt_only:
-        write_status(card=None, phase=None, epics_waiting=waiting,
+        write_status(card=None, phase=None, agent=None, epics_waiting=waiting,
                      waiting=AWAITING["cards"])
     return 0
 
@@ -3285,11 +4083,12 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
 
 # Что показывать в меню-баре про каждую колонку. Порядок важен: роли на чужой доске
 # делят колонки, и карточку относим к первому подходящему состоянию.
+# Роль колонки -> (где карточка стоит, что фабрика сделает дальше).
 FLOW_STATES = [
-    ("in_progress", "в работе"),
-    ("agent_review", "ждёт ревьювера"),
-    ("fixes", "правки после ревью"),
-    ("review", "на ревью у человека"),
+    ("in_progress", "в работе", "агент напишет код и откроет PR"),
+    ("agent_review", "ждёт ревьювера", "ревьювер посмотрит PR"),
+    ("fixes", "правки после ревью", "агент поправит по замечаниям"),
+    ("review", "на ревью у человека", "твоя очередь — посмотреть PR"),
 ]
 
 
@@ -3307,7 +4106,7 @@ def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
     flow, seen = [], set()
 
     for profile in profiles:
-        for role, state in FLOW_STATES:
+        for role, state, upcoming in FLOW_STATES:
             column = role_column(profile, role)
             if not column:
                 continue
@@ -3323,6 +4122,7 @@ def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
                     "title": (card.get("title") or "").strip(),
                     "kind": "card",
                     "state": state,
+                    "next": upcoming,
                     "url": kaiten.card_url(card),
                 })
 
@@ -3342,7 +4142,8 @@ def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
                 "id": card_id,
                 "title": (card.get("title") or "").strip(),
                 "kind": "epic",
-                "state": EPIC_PHASE_LABELS.get(phase, phase),
+                "state": EPIC_PHASE_STATE.get(phase, phase),
+                "next": EPIC_PHASE_NEXT.get(phase, EPIC_PHASE_LABELS.get(phase, phase)),
                 "url": kaiten.card_url(card),
             })
 
@@ -3399,6 +4200,12 @@ def main() -> int:
 
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     env = load_env()
+    # Долгоживущий токен агента, если человек его завёл (`claude setup-token`) и положил
+    # в .env рядом с KAITEN_TOKEN. Без него claude ходит с обычной сессией, а она живёт
+    # сутки: протухла ночью — и до утра фабрика молча падает на 401 в каждой карточке.
+    # Значение не логируем и в статус не кладём.
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = env["CLAUDE_CODE_OAUTH_TOKEN"]
     domain = env.get("KAITEN_DOMAIN") or cfg["kaiten"]["domain"]
     kaiten = Kaiten(domain, env["KAITEN_TOKEN"], cfg["kaiten"]["space_id"], dry_run=args.dry_run)
 
@@ -3407,9 +4214,21 @@ def main() -> int:
     if not args.prompt_only:
         # pid нужен менюбар-приложению, чтобы при выходе прибить и питон, и агента.
         # run_started — чтобы оно могло сказать, сколько прогон уже идёт: без этого
-        # зависший git выглядел в трее как обычная работа
-        write_status(pid=os.getpid(), card=None, phase="смотрю доску",
+        # зависший git выглядел в трее как обычная работа.
+        #
+        # Карточку, на которую показали пальцем, объявляем сразу. Раньше тут стояло
+        # card=None, и после кнопки «сделать следующий шаг» по конкретной задаче в
+        # меню-баре висело безличное «смотрю доску»: подтверждения, что взяли именно
+        # её, человек не получал до первого настоящего шага — а это полминуты.
+        # Названия мы ещё не знаем, его подставит первый же write_status с карточкой;
+        # меню-бар до тех пор берёт название из своего списка «В потоке» по номеру.
+        target = args.card or args.epic_card or args.triage_card
+        write_status(pid=os.getpid(),
+                     card={"id": target} if target else None,
+                     phase=f"беру #{target}" if target else "смотрю доску",
+                     agent=None,
                      run_started=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        forget_auth_note()
     if args.dry_run:
         log("DRY-RUN: Kaiten и GitHub не трогаем, агент отработает по-настоящему")
 
@@ -3454,6 +4273,8 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     if not (args.card or args.only_review or args.only_work or args.no_triage):
         try:
             triage_inbox(kaiten, cfg, args)
+        except AgentAuthError:
+            raise
         except Exception as e:  # noqa: BLE001 — чужая доска не должна ронять основной поток
             log(f"разведка инбокса не задалась: {e}")
 
@@ -3487,6 +4308,8 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
                     break
                 try:
                     review_card(card, kaiten, cfg, args, profile)
+                except AgentAuthError:
+                    raise
                 except FactoryError as e:
                     log(f"#{card['id']} ревью не удалось начать: {e}")
 
@@ -3525,10 +4348,12 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
                 break
             try:
                 process(card, kaiten, cfg, args, profile)
+            except AgentAuthError:
+                raise
             except FactoryError as e:
                 log(f"#{card['id']} не удалось даже начать: {e}")
     if not args.prompt_only:
-        write_status(card=None, phase=None, run_started=None,
+        write_status(card=None, phase=None, agent=None, run_started=None,
                      night_waiting=NIGHT_WAITING["count"])
     return 0
 
@@ -3542,7 +4367,7 @@ def clear_phase() -> None:
     """
     try:
         if STATUS_FILE.is_file():
-            write_status(card=None, phase=None, run_started=None)
+            write_status(card=None, phase=None, agent=None, run_started=None)
     except Exception:  # noqa: BLE001 — на выходе падать уже незачем
         pass
 

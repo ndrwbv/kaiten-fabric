@@ -20,13 +20,33 @@ let intervalChoices: [(title: String, minutes: Int)] = [
     ("Выключено", 0),
 ]
 
-// Разведка инбокса дешёвая и короткая, поэтому ходит чаще полного прогона: карточку
-// закинули — через несколько минут в ней уже лежит комментарий.
+// Разведка инбокса дешёвая и короткая, поэтому может ходить часто: карточку закинули —
+// через несколько минут в ней уже лежит комментарий. Но она же и единственная фаза,
+// которая тратит деньги на карточки, о которых её никто не просил, так что в другом
+// конце списка — раз в день: инбокс пополняется рывками, и разбирать его по расписанию
+// кофеварки нужно не всегда.
 let inboxIntervalChoices: [(title: String, minutes: Int)] = [
     ("Каждые 5 минут", 5),
     ("Каждые 10 минут", 10),
     ("Каждые 15 минут", 15),
     ("Каждые 30 минут", 30),
+    ("Раз в день", 1440),
+    ("Выключено", 0),
+]
+
+// Проверка эпика и шаг эпика — разные вещи, и путать их дорого стоило. Сам чек дешёвый:
+// фабрика смотрит блокеры, чек-лист и комментарии и почти всегда уходит ни с чем — эпик
+// ждёт человека. Агент запускается, только когда фаза действительно сменилась, а сменить
+// её может лишь человек (ответил, снял блокер) или предыдущий шаг. Поэтому частый чек не
+// значит частых трат — он значит, что снятый блокер подхватится через десять минут,
+// а не через два часа.
+let epicsIntervalChoices: [(title: String, minutes: Int)] = [
+    ("Каждые 10 минут", 10),
+    ("Каждые 15 минут", 15),
+    ("Каждый час", 60),
+    ("Каждые 2 часа", 120),
+    ("Каждые 4 часа", 240),
+    ("Раз в день", 1440),
     ("Выключено", 0),
 ]
 
@@ -53,11 +73,28 @@ struct InFlow {
     var id: Int
     var title: String
     var kind: String
+    /// Где карточка стоит сейчас — положение, а не работа.
     var state: String
+    /// Что фабрика сделает следующим шагом. Раньше в меню под видом «следующего
+    /// шага» показывалось положение, и выходило «следующий шаг: сабтаски в работе».
+    var next: String
     var url: String?
 
     var isEpic: Bool { kind == "epic" }
     var icon: String { isEpic ? "🧩" : "•" }
+}
+
+/// Пускает ли claude агента. Фабрика записывает это в статус, когда упирается
+/// в 401 на живом запросе, и снимает отметку после удачного прогона агента.
+/// Сам меню-бар в связку ключей не лезет: ему хватает флага.
+struct Auth {
+    var ok: Bool
+    var expires: Date?
+
+    /// Срок вышел по часам. Сам по себе это ещё не приговор — claude обычно
+    /// продлевает сессию молча, — поэтому кнопку рисуем по `ok`, а это только
+    /// для подсказки.
+    var stale: Bool { expires.map { $0 < Date() } ?? false }
 }
 
 struct Status {
@@ -78,11 +115,18 @@ struct Status {
     var lastPR: String?
     var lastURL: String?
     var lastCost: Double?
+    /// Что агент делает прямо сейчас, сколько шагов сделал и когда подал голос.
+    /// Пока этого не было, «Работает: пишу спеку» висело неподвижно по двадцать
+    /// минут, и понять, работа это или зависшая сеть, было нечем.
+    var agentAction: String?
+    var agentSteps = 0
+    var agentBeat: Date?
     var inboxPending = 0
     var epicsWaiting = 0
     var nightWaiting = 0
     var waiting: [Waiting] = []
     var flow: [InFlow] = []
+    var auth: Auth?
 }
 
 final class Fabrica: NSObject, NSApplicationDelegate {
@@ -92,15 +136,22 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private let root: URL
     private let defaults = UserDefaults.standard
 
+    /// Ответ `security` про свежесть сессии и когда мы его получили. Спрашивать на
+    /// каждую отрисовку меню незачем: это подпроцесс, а меню перерисовывается часто.
+    private var sessionFresh: Bool?
+    private var sessionCheckedAt: Date?
+
     private var scheduleTimer: Timer?
     private var inboxTimer: Timer?
+    private var epicsTimer: Timer?
     private var pollTimer: Timer?
     private var runner: Process?
     private var nextRun: Date?
     private var nextInboxRun: Date?
-    // расписание попало в занятое время — прогон не теряем, а делаем сразу после текущего
-    private var pendingRun = false
-    private var pendingInboxRun = false
+    private var nextEpicsRun: Date?
+    // Расписание попало в занятое время — прогон не теряем, а делаем сразу после
+    // текущего. Очередь, а не три флага: режимов стало три, и флаги начали путаться.
+    private var pendingModes: [RunMode] = []
     private var status = Status()
     private var lastError: String?
     private var mood: Mood?
@@ -115,6 +166,11 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private var inboxIntervalMinutes: Int {
         get { defaults.object(forKey: "inboxIntervalMinutes") as? Int ?? 10 }
         set { defaults.set(newValue, forKey: "inboxIntervalMinutes") }
+    }
+
+    private var epicsIntervalMinutes: Int {
+        get { defaults.object(forKey: "epicsIntervalMinutes") as? Int ?? 15 }
+        set { defaults.set(newValue, forKey: "epicsIntervalMinutes") }
     }
 
     override init() {
@@ -144,6 +200,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         menu.delegate = self
         rescheduleTimer()
         rescheduleInboxTimer()
+        rescheduleEpicsTimer()
         readStatusFile()
         redraw()
     }
@@ -165,7 +222,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         let timer = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.nextRun = Date().addingTimeInterval(seconds)
-            self.startRun(manual: false)
+            self.startRun(manual: false, mode: .board)
         }
         RunLoop.main.add(timer, forMode: .common)
         scheduleTimer = timer
@@ -188,17 +245,41 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         inboxTimer = timer
     }
 
+    private func rescheduleEpicsTimer() {
+        epicsTimer?.invalidate()
+        epicsTimer = nil
+        nextEpicsRun = nil
+        let minutes = epicsIntervalMinutes
+        guard minutes > 0 else { return }
+        let seconds = TimeInterval(minutes * 60)
+        nextEpicsRun = Date().addingTimeInterval(seconds)
+        let timer = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.nextEpicsRun = Date().addingTimeInterval(seconds)
+            self.startRun(manual: false, mode: .epics)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        epicsTimer = timer
+    }
+
     // MARK: - запуск прогона
 
     /// Что запускаем. Раньше это были булевы флаги, но их стало три и они путались.
     enum RunMode: Equatable {
-        case full, inbox, epics
+        /// Всё подряд: инбокс, эпики, ревью, работа. Остался для ночного LaunchAgent —
+        /// он зовёт run.sh без флагов.
+        case full
+        /// Только доска: ревью и работа. Инбокс и эпики ходят по своим расписаниям,
+        /// и полный прогон делал бы их работу второй раз — за отдельные деньги.
+        case board
+        case inbox, epics
         /// Одна карточка: у эпика своя фаза, у обычной — обычный поток
         case one(id: Int, epic: Bool)
 
         var flag: String {
             switch self {
             case .full: return ""
+            case .board: return " --no-triage --no-epics"
             case .inbox: return " --only-triage"
             case .epics: return " --only-epics"
             case .one(let id, let epic):
@@ -207,16 +288,16 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startRun(manual: Bool, mode: RunMode = .full) {
+    private func startRun(manual: Bool, mode: RunMode = .board) {
         guard runner == nil else {
             if manual { NSSound.beep() }
             // по расписанию — не теряем: запустим сразу после текущего прогона
-            else if mode == .inbox { pendingInboxRun = true } else { pendingRun = true }
+            else if !pendingModes.contains(mode) { pendingModes.append(mode) }
             return
         }
         lastError = nil
-        // полный прогон сам заходит в инбокс, отдельная разведка после него не нужна
-        if mode != .inbox { pendingInboxRun = false }
+        // то, что сейчас и так делаем, из очереди убираем
+        pendingModes.removeAll { $0 == mode || (mode == .full && $0 != .board) }
 
         let script = "cd \(shellQuote(root.path)) && ./run.sh" + mode.flag
         let process = Process()
@@ -243,12 +324,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 }
                 self.readStatusFile()
                 self.redraw()
-                if self.pendingRun || self.pendingInboxRun {
-                    let mode: RunMode = self.pendingRun ? .full : .inbox
-                    self.pendingRun = false
-                    self.pendingInboxRun = false
+                if !self.pendingModes.isEmpty {
+                    let next = self.pendingModes.removeFirst()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                        self.startRun(manual: false, mode: mode)
+                        self.startRun(manual: false, mode: next)
                     }
                 }
             }
@@ -320,13 +399,25 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                               title: item["title"] as? String ?? "",
                               kind: item["kind"] as? String ?? "card",
                               state: item["state"] as? String ?? "",
+                              next: item["next"] as? String ?? "",
                               url: item["url"] as? String)
             }
+        }
+        if let agent = json["agent"] as? [String: Any] {
+            s.agentAction = agent["action"] as? String
+            s.agentSteps = (agent["steps"] as? NSNumber)?.intValue ?? 0
         }
         s.pid = (json["pid"] as? NSNumber)?.int32Value
         let stamps = ISO8601DateFormatter()
         s.runStarted = (json["run_started"] as? String).flatMap { stamps.date(from: $0) }
         s.phaseSince = (json["phase_since"] as? String).flatMap { stamps.date(from: $0) }
+        s.agentBeat = ((json["agent"] as? [String: Any])?["beat"] as? String)
+            .flatMap { stamps.date(from: $0) }
+        if let auth = json["auth"] as? [String: Any] {
+            s.auth = Auth(ok: auth["ok"] as? Bool ?? true,
+                          expires: (auth["expires"] as? String)
+                              .flatMap { stamps.date(from: $0) })
+        }
         if let card = json["card"] as? [String: Any] {
             s.cardID = (card["id"] as? NSNumber)?.intValue
             s.cardTitle = card["title"] as? String
@@ -346,6 +437,42 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     // MARK: - отрисовка меню
 
     /// Настроение человечка. Работа важнее всего, дальше — авария, потом висящие вопросы.
+    /// Свежая ли сейчас авторизация claude. nil — узнать не удалось.
+    ///
+    /// Спрашиваем сам claude-овский секрет, а не фабрику: отметку в статусе ставит и
+    /// снимает только прогон, а человек, который минуту назад вошёл, ждёт, что кнопка
+    /// пропадёт сразу, а не через десять минут до ближайшего тика. Читаем один срок
+    /// годности, сам токен нам не нужен и в приложение не попадает.
+    private func sessionIsFresh() -> Bool? {
+        if let at = sessionCheckedAt, Date().timeIntervalSince(at) < 5 { return sessionFresh }
+        sessionCheckedAt = Date()
+        sessionFresh = nil
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let expires = (oauth["expiresAt"] as? NSNumber)?.doubleValue
+        else { return nil }
+        sessionFresh = Date(timeIntervalSince1970: expires / 1000) > Date()
+        return sessionFresh
+    }
+
+    /// Показывать ли кнопку входа. Отметку фабрики уважаем, но не слепо: если сессия
+    /// уже свежая — человек вошёл сам, и висящая кнопка только раздражает. Обратного
+    /// не делаем: сами тревогу не поднимаем, приговор всегда за фабрикой.
+    private var needsLogin: Bool {
+        status.auth?.ok == false && sessionIsFresh() != true
+    }
+
     /// Идёт ли прогон на самом деле. Свой процесс видно напрямую, чужой (запущенный
     /// из терминала или ночным агентом) — только по pid из статуса.
     private var runIsAlive: Bool {
@@ -362,11 +489,25 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         return "\(minutes) мин"
     }
 
-    /// Прогон идёт подозрительно долго. Ни один шаг столько не занимает: значит
-    /// что-то зависло — чаще всего сеть в git push.
+    /// Давно ли агент подавал голос. nil — если он сейчас не работает.
+    private func silence() -> TimeInterval? {
+        guard let beat = status.agentBeat else { return nil }
+        return Date().timeIntervalSince(beat)
+    }
+
+    /// Прогон завис.
+    ///
+    /// Раньше это был час от начала прогона — и он молчал ровно там, где нужен:
+    /// агент работает от шести до двадцати шести минут, и всё это время зависшая
+    /// сеть выглядела как обычная работа. Теперь решает пульс: живой агент шлёт
+    /// событие каждые несколько секунд, и пять минут тишины значит, что он не
+    /// работает, а во что-то уткнулся. Пульса нет вовсе — остаётся прежний
+    /// сторож по времени: фабрика может стоять и в git push, где событий не бывает.
     private var runLooksStuck: Bool {
-        guard runIsAlive, let since = status.runStarted else { return false }
-        return Date().timeIntervalSince(since) > 50 * 60
+        guard runIsAlive else { return false }
+        if let quiet = silence() { return quiet > 5 * 60 }
+        guard let since = status.phaseSince ?? status.runStarted else { return false }
+        return Date().timeIntervalSince(since) > 15 * 60
     }
 
     private func currentMood() -> Mood {
@@ -391,19 +532,45 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private func redraw() {
         let running = runner != nil
         paintIcon()
-        statusItem.button?.toolTip = running
+        statusItem.button?.toolTip = runIsAlive
             ? "Фабрика работает: \(status.phase ?? "")"
             : (status.waiting.first.map { "#\($0.id): \($0.reason)" }
                ?? "Фабрика")
 
         menu.removeAllItems()
         menu.addItem(disabled(headline()))
-        if running, let title = status.cardTitle, let id = status.cardID {
+        // Карточку показываем по факту работы, а не только своего процесса, и имя
+        // добираем из потока: в первые секунды прогона фабрика знает лишь номер,
+        // а человек, ткнувший «сделать следующий шаг», хочет видеть, что взяли его
+        // задачу, а не безличное «смотрю доску».
+        if runIsAlive, let id = status.cardID {
+            let name = status.cardTitle?.isEmpty == false
+                ? status.cardTitle!
+                : (status.flow.first { $0.id == id }?.title ?? "")
             let mark = status.returning ? "↩︎ " : ""
-            menu.addItem(disabled("   \(mark)#\(id) \(truncate(title, 46))"))
+            menu.addItem(disabled("   \(mark)#\(id) \(truncate(name, 46))"))
+        }
+        // Что агент делает прямо сейчас. Ради этой строки всё и затевалось: без неё
+        // между «пошёл работать» и «вернулся» проходило до получаса полной тишины.
+        if runIsAlive, let action = status.agentAction {
+            var line = "   ⚙ \(truncate(action, 40))"
+            if status.agentSteps > 0 { line += " · шаг \(status.agentSteps)" }
+            let item = disabled(line)
+            item.toolTip = silence().map { "последнее движение \(Int($0)) с назад" }
+            menu.addItem(item)
         }
         if let error = lastError {
             menu.addItem(disabled("   ⚠️ \(truncate(error, 50))"))
+        }
+        // Протухшая авторизация — единственная поломка, которая валит фабрику целиком:
+        // ни одна карточка не поедет, пока человек не войдёт заново. Раньше это было
+        // невидимо — карточки просто уезжали в «Упало» с «агент не уложился», и неделю
+        // никто не понимал почему. Теперь причина написана и чинится отсюда же.
+        if needsLogin {
+            let item = action("⚠️ claude не авторизован — войти", #selector(loginClicked))
+            item.toolTip = "Откроется терминал с `claude auth login`. "
+                + "Пока не войдёшь, ни одна карточка не поедет."
+            menu.addItem(item)
         }
         if runLooksStuck {
             let item = action("⚠️ Прогон висит \(elapsed() ?? "долго") — остановить",
@@ -421,8 +588,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 let item = NSMenuItem(
                     title: "   \(card.icon) #\(card.id) \(truncate(card.title, 38))",
                     action: nil, keyEquivalent: "")
-                item.submenu = cardMenu(id: card.id, url: card.url,
-                                        epic: card.isEpic, running: running)
+                item.submenu = cardMenu(id: card.id, url: card.url, epic: card.isEpic)
                 item.toolTip = card.reason
                 menu.addItem(item)
                 if !card.reason.isEmpty {
@@ -444,15 +610,20 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 let item = NSMenuItem(
                     title: "   \(card.icon) #\(card.id) \(truncate(card.title, 36))",
                     action: nil, keyEquivalent: "")
+                // Две разные вещи, и путать их нельзя: где карточка стоит и что
+                // фабрика с ней сделает. Пока это была одна строка, в меню висело
+                // «следующий шаг: сабтаски в работе» — положение, выданное за работу.
                 let active = runIsAlive && status.cardID == card.id
-                let note = active
-                    ? "сейчас: \(card.state)" + (elapsed().map { ", \($0)" } ?? "")
-                    : "следующий шаг: \(card.state)"
-                item.toolTip = note
-                item.submenu = cardMenu(id: card.id, url: card.url,
-                                        epic: card.isEpic, running: running)
+                let now = active
+                    ? "\(card.state)" + (elapsed().map { ", \($0)" } ?? "")
+                    : card.state
+                item.toolTip = card.next.isEmpty ? now : "\(now) → дальше: \(card.next)"
+                item.submenu = cardMenu(id: card.id, url: card.url, epic: card.isEpic)
                 menu.addItem(item)
-                menu.addItem(disabled("        \(note)"))
+                menu.addItem(disabled("        сейчас: \(truncate(now, 46))"))
+                if !card.next.isEmpty {
+                    menu.addItem(disabled("        дальше: \(truncate(card.next, 46))"))
+                }
             }
         }
 
@@ -482,23 +653,32 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             let check = action("Проверить доску сейчас", #selector(runClicked))
             let inbox = action("Разобрать инбокс сейчас", #selector(inboxClicked))
             let epics = action("Продвинуть эпики сейчас", #selector(epicsClicked))
-            epics.toolTip = "Только фаза эпиков: критерии, спека, декомпозиция. "
-                + "Полный прогон делает это тоже, но сначала проходит инбокс и ревью"
+            check.toolTip = "Ревью и работа по карточкам доски"
+            epics.toolTip = "Только фаза эпиков: критерии, спека, декомпозиция"
             for item in [check, inbox, epics] {
-                item.isEnabled = !running
-                if running { item.toolTip = "Идёт прогон — дождись или останови его" }
+                item.isEnabled = !runIsAlive
+                if runIsAlive { item.toolTip = "Идёт прогон — дождись или останови его" }
                 menu.addItem(item)
             }
         }
 
-        menu.addItem(intervalMenu(title: "Расписание", choices: intervalChoices,
+        // Три расписания, и каждое ходит только за своим. Раньше «Расписание» тянуло
+        // за собой ещё и инбокс с эпиками, так что реже сделать эпики, не трогая
+        // доску, было нельзя — а шаг эпика стоит несколько долларов.
+        menu.addItem(intervalMenu(title: "Доска: расписание", choices: intervalChoices,
                                   current: intervalMinutes, next: nextRun,
                                   selector: #selector(intervalClicked(_:)),
-                                  hint: "Полный прогон: ревью, работа и разведка инбокса"))
-        menu.addItem(intervalMenu(title: "Разведка инбокса", choices: inboxIntervalChoices,
+                                  hint: "Только доска: ревью и работа по карточкам"))
+        menu.addItem(intervalMenu(title: "Инбокс: расписание", choices: inboxIntervalChoices,
                                   current: inboxIntervalMinutes, next: nextInboxRun,
                                   selector: #selector(inboxIntervalClicked(_:)),
                                   hint: "Только инбокс: посмотреть новые карточки и отписаться"))
+        menu.addItem(intervalMenu(title: "Эпики: расписание", choices: epicsIntervalChoices,
+                                  current: epicsIntervalMinutes, next: nextEpicsRun,
+                                  selector: #selector(epicsIntervalClicked(_:)),
+                                  hint: "Только эпики: критерии, спека, ревью спеки, "
+                                      + "декомпозиция. Чаще всего это дешёвая проверка: "
+                                      + "агент идёт работать, лишь когда фаза сменилась"))
 
         menu.addItem(.separator())
         if let outcome = status.lastOutcome, let id = status.lastCardID {
@@ -510,9 +690,45 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
         menu.addItem(action("Открыть доску", #selector(openBoard)))
         menu.addItem(action("Показать лог", #selector(openLog)))
+        menu.addItem(authMenu())
 
         menu.addItem(.separator())
         menu.addItem(action("Выйти", #selector(quitClicked)))
+    }
+
+    /// Подменю авторизации claude. Лежит внизу рядом с логом и доступно всегда:
+    /// протухшая сессия — не редкость, а раз в сутки, и лазить за этим в терминал
+    /// руками человек не должен.
+    private func authMenu() -> NSMenuItem {
+        let head = NSMenuItem(title: "Авторизация клода", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+
+        let login = NSMenuItem(title: "Войти заново",
+                               action: #selector(loginClicked), keyEquivalent: "")
+        login.target = self
+        login.toolTip = "claude auth login в терминале: откроется браузер"
+        submenu.addItem(login)
+
+        // Долгоживущий токен — единственный способ не возвращаться сюда каждые сутки.
+        let token = NSMenuItem(title: "Завести долгоживущий токен…",
+                               action: #selector(tokenClicked), keyEquivalent: "")
+        token.target = self
+        token.toolTip = "claude setup-token в терминале. Выданный токен положи в "
+            + "~/.claude/.env строкой CLAUDE_CODE_OAUTH_TOKEN=… — фабрика подхватит его "
+            + "сама, и сессия перестанет протухать"
+        submenu.addItem(token)
+
+        head.submenu = submenu
+        if needsLogin {
+            head.toolTip = "Сейчас не авторизован — фабрика стоит"
+        } else if let expires = status.auth?.expires {
+            head.toolTip = status.auth!.stale
+                ? "Сессия истекла в \(clock(expires)) — claude мог продлить её сам"
+                : "Сессия до \(clock(expires))"
+        } else {
+            head.toolTip = "Про авторизацию пока ничего не известно"
+        }
+        return head
     }
 
     /// Подменю с интервалами: галочка на текущем, время следующего запуска — в подсказке.
@@ -549,6 +765,11 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 ? "Похоже, завис: \(phase)\(age)"
                 : "Работает: \(phase)\(age)"
         }
+        // Прогон кончился, а карточка в статусе осталась — значит его оборвали
+        // на полушаге. Молчать нельзя: человек нажал кнопку и ждёт результата.
+        if status.cardID != nil, status.phase != nil {
+            return "Прогон оборвался на #\(status.cardID ?? 0)"
+        }
         // Прогон не идёт. Если по эпику ждут ответа — говорим об этом, а не про
         // расписание: иначе выходит, что фабрика «чем-то занята», хотя она стоит.
         if let first = status.waiting.first {
@@ -567,7 +788,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     // MARK: - действия
 
-    @objc private func runClicked() { startRun(manual: true) }
+    @objc private func runClicked() { startRun(manual: true, mode: .board) }
     @objc private func inboxClicked() { startRun(manual: true, mode: .inbox) }
     @objc private func epicsClicked() { startRun(manual: true, mode: .epics) }
     @objc private func stopClicked() { stopRun(); redraw() }
@@ -582,6 +803,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     @objc private func inboxIntervalClicked(_ sender: NSMenuItem) {
         inboxIntervalMinutes = sender.tag
         rescheduleInboxTimer()
+        redraw()
+    }
+
+    @objc private func epicsIntervalClicked(_ sender: NSMenuItem) {
+        epicsIntervalMinutes = sender.tag
+        rescheduleEpicsTimer()
         redraw()
     }
 
@@ -600,7 +827,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     /// Меню действий для одной карточки: открыть или продвинуть.
-    private func cardMenu(id: Int, url: String?, epic: Bool, running: Bool) -> NSMenu {
+    private func cardMenu(id: Int, url: String?, epic: Bool) -> NSMenu {
         let submenu = NSMenu()
         let openItem = action("Открыть карточку", #selector(openCardClicked))
         openItem.representedObject = url
@@ -609,8 +836,8 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         let push = action(epic ? "Сделать следующий шаг по эпику"
                                : "Сделать следующий шаг", #selector(pushCardClicked))
         push.representedObject = ["id": id, "epic": epic] as [String: Any]
-        push.isEnabled = !running
-        push.toolTip = running
+        push.isEnabled = !runIsAlive
+        push.toolTip = runIsAlive
             ? "Идёт прогон — дождись или останови его"
             : "Запустить фабрику только по этой карточке"
         submenu.addItem(push)
@@ -630,6 +857,41 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     @objc private func openLog() {
         NSWorkspace.shared.open(root.appendingPathComponent("logs/run.log"))
+    }
+
+    @objc private func loginClicked() { inTerminal("login", "claude auth login") }
+    @objc private func tokenClicked() { inTerminal("setup-token", "claude setup-token") }
+
+    /// Выполнить команду в настоящем терминале.
+    ///
+    /// Именно в терминале, а не через Process: вход в claude интерактивный — он
+    /// открывает браузер и ждёт, что человек вернётся. Делаем это .command-файлом,
+    /// который открывает Finder: так не нужны Apple Events и разрешение «управлять
+    /// Терминалом», которое иначе спросят при первом же клике.
+    ///
+    /// Шебанг с `-l` не для красоты: без логин-оболочки в PATH нет ни homebrew,
+    /// ни того, куда человек поставил claude.
+    private func inTerminal(_ name: String, _ command: String) {
+        let file = root.appendingPathComponent("state/\(name).command")
+        let script = """
+        #!/bin/zsh -l
+        # Файл сделан «Фабрикой» — можно удалять.
+        \(command)
+        echo
+        echo "Готово. Окно можно закрыть."
+        """
+        do {
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent("state"),
+                withIntermediateDirectories: true)
+            try script.write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                                  ofItemAtPath: file.path)
+            NSWorkspace.shared.open(file)
+        } catch {
+            lastError = "не смог открыть терминал: \(error.localizedDescription)"
+            redraw()
+        }
     }
 
     // MARK: - мелочи
