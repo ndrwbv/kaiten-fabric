@@ -107,7 +107,6 @@ ACCEPTANCE_SCHEMA = {
         "questions": {"type": "array", "items": {"type": "string"}},
         "backend_needed": {"type": "boolean"},
         "assumptions": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
     "additionalProperties": False,
@@ -122,7 +121,6 @@ SPEC_SCHEMA = {
         "questions": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "string"},
         "assumptions": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
     "additionalProperties": False,
@@ -151,7 +149,6 @@ SPEC_REVIEW_SCHEMA = {
         # Без этого поля круг правок упирался в одну и ту же стену, пока не кончались
         # круги, — по $4 за стену.
         "needs_human": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["verdict", "summary"],
     "additionalProperties": False,
@@ -180,7 +177,6 @@ DECOMPOSE_SCHEMA = {
         },
         "questions": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
     "additionalProperties": False,
@@ -198,7 +194,6 @@ VERDICT_SCHEMA = {
         # о проверках, чаще их и запускает. Оседает в logs/card-*.json
         "checks": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["status", "summary"],
     "additionalProperties": False,
@@ -226,7 +221,6 @@ REVIEW_SCHEMA = {
         },
         # см. SPEC_REVIEW_SCHEMA: то, что автор закрыть не может без человека
         "needs_human": {"type": "array", "items": {"type": "string"}},
-        "joke": {"type": "string"},
     },
     "required": ["verdict", "summary"],
     "additionalProperties": False,
@@ -242,7 +236,6 @@ TRIAGE_SCHEMA = {
         "plan": {"type": "array", "items": {"type": "string"}},
         "effort": {"type": "string", "enum": ["s", "m", "l"]},
         "risk": {"type": "string"},
-        "joke": {"type": "string"},
     },
     "required": ["status", "problem"],
     "additionalProperties": False,
@@ -1750,11 +1743,6 @@ def format_list(title: str, items) -> str:
     return f"\n\n**{title}**\n{body}"
 
 
-def format_joke(verdict: dict) -> str:
-    joke = (verdict.get("joke") or "").strip()
-    return f"\n\n> {joke}" if joke else ""
-
-
 def comment_success(verdict: dict, meta: dict, pr_url: str, branch: str) -> str:
     text = f"🤖 **Готово, нужен ревью.**\n\nPR: {pr_url}\nВетка: `{branch}`"
     text += f"\n\n{verdict.get('summary', '')}"
@@ -1762,7 +1750,7 @@ def comment_success(verdict: dict, meta: dict, pr_url: str, branch: str) -> str:
         text += f"\n\n**Риски:** {verdict['risks']}"
     if format_meta(meta):
         text += f"\n\n_Агент: {format_meta(meta)}._"
-    text += format_assumptions(verdict) + format_joke(verdict)
+    text += format_assumptions(verdict)
     return text
 
 
@@ -1773,7 +1761,6 @@ def comment_question(verdict: dict, meta: dict) -> str:
     text += "\n\nПоправь описание карточки и верни её в «Очередь»."
     if format_meta(meta):
         text += f"\n\n_Агент: {format_meta(meta)}._"
-    text += format_joke(verdict)
     return text
 
 
@@ -2233,7 +2220,6 @@ def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
         text += "\n\nОтправляю в «Правки», исполнитель поправит и вернёт на ревью."
     if format_meta(meta):
         text += f"\n\n_Ревьювер: {format_meta(meta)}._"
-    text += format_joke(review)
     return text
 
 
@@ -2321,7 +2307,7 @@ def comment_review_short(review: dict, meta: dict, round_number: int, max_rounds
     tail = format_meta(meta)
     line = f"ревью, круг {round_number} из {max_rounds}"
     text += f"\n\n_{line}{': ' + tail if tail else ''}._"
-    return text + format_joke(review)
+    return text
 
 
 def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> None:
@@ -3012,7 +2998,6 @@ def comment_triage(verdict: dict, meta: dict, round_number: int, handoff: str = 
     if tail:
         line += ": " + ", ".join(tail)
     text += f"\n\n_{line}. Код не менял._"
-    text += format_joke(verdict)
     return text
 
 
@@ -3473,7 +3458,7 @@ def comment_acceptance(verdict: dict, meta: dict) -> str:
     tail = format_meta(meta)
     text += f"\n\n_приёмочные критерии{': ' + tail if tail else ''}. Код не менял._"
     text += format_assumptions(verdict)
-    return text + format_joke(verdict)
+    return text
 
 
 def comment_epic_unclear(verdict: dict, meta: dict, phase: str) -> str:
@@ -3484,7 +3469,7 @@ def comment_epic_unclear(verdict: dict, meta: dict, phase: str) -> str:
              "с того же места.")
     tail = format_meta(meta)
     text += f"\n\n_{phase}{': ' + tail if tail else ''}. Код не менял._"
-    return text + format_joke(verdict)
+    return text
 
 
 def subtask_description(epic: dict, epic_url: str, item: dict, spec_note: str) -> str:
@@ -3584,7 +3569,7 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
     if any(i.get("mocks_backend") for _, i in created):
         text += f"\n\n{MOCK_BACKEND_NOTE}"
     text += (f"\n\n_декомпозиция, {format_meta(meta)}._"
-             + format_assumptions(verdict) + format_joke(verdict))
+             + format_assumptions(verdict))
     kaiten.comment(epic["id"], text)
 
 
@@ -3756,7 +3741,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
                        f"{verdict.get('summary', '')}\n\n"
                        f"_{'правка спеки' if fixing else 'спека'}, {format_meta(meta)}. "
                        f"Дальше её посмотрит ревьювер._"
-                       + format_assumptions(verdict) + format_joke(verdict))
+                       + format_assumptions(verdict))
         log(f"  -> спека: {pr_url}")
         if not (args.keep_worktree or cfg.get("keep_worktree")):
             drop_worktree(Path(repo_cfg["path"]).expanduser(), worktree)
@@ -3828,7 +3813,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
                 text += f"\n\nОстальные замечания — в PR: {spec_pr}"
             text += ("\n\nОтветь комментарием и **сними блокер** — я вернусь и продолжу "
                      "с того же места.")
-            text += f"\n\n_ревью спеки, {format_meta(meta)}._" + format_joke(review)
+            text += f"\n\n_ревью спеки, {format_meta(meta)}._"
             kaiten.comment(card_id, text)
             hold(kaiten, card_id, BLOCK_QUESTION, asks[0][:90])
             log(f"  -> нужен человек: {len(asks)} вопросов")
@@ -3860,7 +3845,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
 
         kaiten.comment(card_id,
                        f"{EPIC_MARK} **{SPEC_OK_LINE}** {review.get('summary', '')}\n\n"
-                       f"_ревью спеки, {format_meta(meta)}._" + format_joke(review))
+                       f"_ревью спеки, {format_meta(meta)}._")
         log("  -> спека принята")
         return
 
