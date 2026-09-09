@@ -714,7 +714,27 @@ def has_tag(card: dict, name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 # Какие события уезжают в канал, если в конфиге не сказано иное.
-TIME_EVENTS = ("pr_opened", "pr_updated", "fix_taken")
+TIME_EVENTS = ("pr_opened", "pr_updated", "fix_taken", "status", "asked")
+
+# Последняя строка сообщения — не название колонки, а фраза человеку в канал: там
+# сидят коллеги, а не фабрика, и им важно одно — смотреть уже можно или ещё нет.
+# Пока возимся — «не смотрите». Нужен человек — «позырьте». Закончили — строка просто
+# исчезает, и сообщение снова становится ссылкой на готовый PR.
+# Роли могут делить колонку, поэтому побеждает первая подходящая.
+TIME_STATUSES = {
+    "queue": "пацаны, пока не смотрите, сыровато",
+    "in_progress": "пацаны, пока не смотрите, сыровато",
+    "agent_review": "пацаны, пока не смотрите, сыровато",
+    "fixes": "пацаны, пока не смотрите, сыровато",
+    "review": "пацанчики, позырьте плз",
+    "question": "пацанчики, позырьте плз, есть вопросики",
+    "failed": "сломалось, нужен человек",
+    "done": "",
+}
+
+# Когда у агента есть вопросы, статус говорит и об этом: сами вопросы уезжают в тред,
+# а строка в канале объясняет, зачем туда идти.
+TIME_STATUS_ASKED = "пацанчики, позырьте плз, есть вопросики"
 
 
 class Time:
@@ -786,12 +806,27 @@ class Time:
             body["root_id"] = root_id
         return self._request("POST", f"{self.api}/posts", body, config=self._auth())
 
+    def edit(self, post_id: str, text: str) -> None:
+        """
+        Переписать своё сообщение. У Mattermost это `PUT /posts/{id}/patch`, а не PATCH:
+        на PATCH он отвечает 404 «нет такой ручки».
+        """
+        if self.dry_run:
+            log(f"  [dry-run] Time -> правка {post_id}: {text[:120]}")
+            return
+        self._request("PUT", f"{self.api}/posts/{post_id}/patch", {"message": text},
+                      config=self._auth())
+
     def thread(self, root_id: str) -> list:
         """Сообщения треда по времени. Ответ Mattermost — словарь постов плюс порядок."""
         data = self._request("GET", f"{self.api}/posts/{root_id}/thread",
                              config=self._auth()) or {}
         posts = list((data.get("posts") or {}).values())
         return sorted(posts, key=lambda post: post.get("create_at") or 0)
+
+    def post_by_id(self, post_id: str) -> dict:
+        return self._request("GET", f"{self.api}/posts/{post_id}",
+                             config=self._auth()) or {}
 
     def me(self) -> dict:
         return self._request("GET", f"{self.api}/users/me", config=self._auth()) or {}
@@ -1053,19 +1088,56 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         if not channel and not client.webhook_url:
             log("Time: не задан канал (notify.time.channels) — не пишу")
             return
-        post = client.post(channel, time_pr_message(
-            card_url, pr_url, brief(verdict.get("summary") or "")))
+        base = time_pr_message(card_url, pr_url, brief(verdict.get("summary") or ""))
+        post = client.post(channel, base)
         if post and post.get("id"):
             state.setdefault("threads", {})[str(card["id"])] = {
                 "channel_id": post.get("channel_id") or channel,
                 "root_id": post["id"],
                 "last_post_id": post["id"],
+                "base": base,
+                "status": "",
                 "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             save_time_state(state)
         log("  написал про PR в Time")
     except Exception as e:  # noqa: BLE001 — PR уже открыт, отправка не важнее
         log(f"  !! в Time не написал: {e}")
+
+
+def time_status(profile: dict | None, card: dict, asks: list) -> tuple[str, str]:
+    """
+    Роль колонки и фраза для канала. Роль нужна логике (конец потока, «Вопрос»),
+    фраза — человеку. Обе пустые, если колонка не из потока фабрики.
+    """
+    if not profile:
+        return "", ""
+    for role, label in TIME_STATUSES.items():
+        if card.get("column_id") == role_column(profile, role):
+            if asks and role in ("review", "question"):
+                label = TIME_STATUS_ASKED
+            return role, label
+    return "", ""
+
+
+def with_status(base: str, status: str) -> str:
+    return f"{base}\n_{status}_" if status else base
+
+
+def thread_base(client: Time, info: dict) -> str:
+    """
+    Текст сообщения без строки статуса.
+
+    Обычно он запомнен при отправке. Для тредов, созданных до появления статуса, читаем
+    сообщение из Time и отрезаем последнюю строку, если она курсивом — это и есть статус.
+    """
+    if info.get("base"):
+        return info["base"]
+    post = client.post_by_id(info.get("root_id", ""))
+    lines = (post.get("message") or "").splitlines()
+    if len(lines) > 1 and lines[-1].startswith("_") and lines[-1].endswith("_"):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 def from_thread_comment(author: str, text: str) -> str:
@@ -1098,7 +1170,7 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
     останется — он же и восстановление после простоя.
     """
     conf = time_config(cfg)
-    if not conf or not conf.get("follow_threads", True):
+    if not conf:
         return 0
     env = load_env()
     client = time_client(cfg, env, args.dry_run)
@@ -1127,6 +1199,58 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         root_id = info.get("root_id")
         if not root_id:
             continue
+
+        try:
+            card = kaiten.card(int(card_key))
+        except FactoryError:
+            log(f"  #{card_key} больше нет — убираю тред из состояния")
+            threads.pop(card_key, None)
+            save_time_state(state)
+            continue
+
+        # Статус берём из колонки, а не из событий фабрики: карточку двигают в десятке
+        # мест, и хук в каждом однажды забыли бы поставить. А так источник правды один,
+        # и статус верен даже после прогона, который убили на середине.
+        profile = profile_for_board(profiles, card.get("board_id"))
+        comments = kaiten.comments(card["id"])
+        asks = open_questions(comments)
+        role, status = time_status(profile, card, asks)
+
+        # Вопросы агента — в тред: человеку сказали «позырьте», и он должен увидеть,
+        # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
+        if asks and time_wants(conf, "asked") and role in ("review", "question"):
+            asked = "\n".join(asks)
+            if info.get("asked") != asked:
+                try:
+                    client.post(info.get("channel_id", ""),
+                                "\n".join(f"❓ {ask}" for ask in asks), root_id=root_id)
+                    info["asked"] = asked
+                    save_time_state(state)
+                    log(f"  #{card_key}: вопросы в тред ({len(asks)})")
+                except FactoryError as e:
+                    log(f"  !! не смог написать вопросы в тред по #{card_key}: {e}")
+
+        if time_wants(conf, "status") and role and status != info.get("status"):
+            try:
+                info["base"] = thread_base(client, info)
+                client.edit(root_id, with_status(info["base"], status))
+                info["status"] = status
+                save_time_state(state)
+                log(f"  #{card_key}: статус в канале -> {status or 'снят'}")
+            except FactoryError as e:
+                log(f"  !! не смог поправить статус по #{card_key}: {e}")
+
+        # «Готово» — конец: строку статуса сняли, дальше по этой карточке ничего
+        # не случится, и держать её в состоянии значит спрашивать Kaiten про неё
+        # каждый прогон до конца времён
+        if role == "done":
+            threads.pop(card_key, None)
+            save_time_state(state)
+            continue
+
+        if not conf.get("follow_threads", True):
+            continue
+
         try:
             posts = client.thread(root_id)
         except FactoryError as e:
@@ -1172,14 +1296,6 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 save_time_state(state)
                 continue
 
-        try:
-            card = kaiten.card(int(card_key))
-        except FactoryError:
-            log(f"  #{card_key} больше нет — убираю тред из состояния")
-            threads.pop(card_key, None)
-            save_time_state(state)
-            continue
-
         for post in human:
             user = names.get(post.get("user_id"), {})
             author = (user.get("nickname") or user.get("username")
@@ -1190,10 +1306,12 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             f"{'сообщение' if len(human) == 1 else 'сообщений'}")
 
         moved += 1
-        profile = profile_for_board(profiles, card.get("board_id"))
         stuck = blocked_by(kaiten, card["id"])
         target = role_column(profile, "fixes") if profile else None
-        active = [role_column(profile, role) for role in ACTIVE_ROLES] if profile else []
+        # карточку в «Вопросе» двигать не надо: она и так ждёт ответа человека, и
+        # перенесённый комментарий делает её пригодной к работе следующим же прогоном
+        stay = ([role_column(profile, role) for role in ACTIVE_ROLES]
+                + [role_column(profile, "question")]) if profile else []
 
         if stuck:
             # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
@@ -1201,8 +1319,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 f"карточку не двигаю")
             reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
                      "его снимает человек.")
-        elif not target or card.get("column_id") in active:
-            reply = "Записал в карточку, задача и так в работе."
+        elif not target or card.get("column_id") in stay:
+            reply = "Записал в карточку, дальше по обычному кругу."
         else:
             kaiten.move(card["id"], target)
             reply = "Записал в карточку и взял в правки."

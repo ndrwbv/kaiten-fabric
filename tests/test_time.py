@@ -32,6 +32,8 @@ class Fake(BaseHTTPRequestHandler):
         GOT.append(("GET", self.path, None, self.headers.get("Authorization")))
         if self.path.endswith("/users/me"):
             return self._reply({"id": BOT_ID, "username": "fabrica"})
+        if "/posts/" in self.path and "/thread" not in self.path:
+            return self._reply({"id": "root", "message": "[PR](u) Убрал lowercase.\n[Карточка](k)"})
         if "/thread" in self.path:
             root = self.path.split("/posts/")[1].split("/thread")[0]
             return self._reply({"order": [root, "reply"], "posts": {
@@ -43,6 +45,12 @@ class Fake(BaseHTTPRequestHandler):
                           "message": "регистр поехал и в шапке тоже, поправь и там"},
             }})
         return self._reply({})
+
+    def do_PUT(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        GOT.append(("PUT", self.path, raw, self.headers.get("Authorization")))
+        return self._reply({"id": "root", "message": json.loads(raw).get("message"),
+                            "edit_at": 1})
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
@@ -60,6 +68,8 @@ BASE = f"http://127.0.0.1:{srv.server_address[1]}"
 
 
 class FakeKaiten:
+    column = 107      # «На ревью»
+    asks: list = []   # вопросы агента в карточке
     """
     Заглушка Kaiten: карточка в «На ревью», без блокеров.
 
@@ -68,8 +78,13 @@ class FakeKaiten:
     """
     def __init__(self): self.comments_written, self.moves = [], []
     def card(self, card_id): return {"id": card_id, "title": "Поправить текст",
-                                     "board_id": 1000, "column_id": 107}
+                                     "board_id": 1000, "column_id": self.column}
     def comment(self, card_id, text): self.comments_written.append((card_id, text))
+    def comments(self, card_id):
+        if not self.asks:
+            return []
+        body = "🤖 **Не хватило данных.**\n\n" + "\n".join(f"- {a}" for a in self.asks)
+        return [{"text": body, "created": "2026-09-09T00:00:00Z"}]
     def move(self, card_id, column): self.moves.append((card_id, column))
     def blockers(self, card_id): return []
 
@@ -188,6 +203,59 @@ GOT.clear()
 f.follow_time_threads(kaiten4, hook, Args(), profiles)
 check("треды не читаются", kaiten4.comments_written == [])
 check("и в сеть за ними не ходили", GOT == [], str(GOT))
+
+print("=== 9. статус в корневом сообщении ===")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+kaiten5 = FakeKaiten()
+f.follow_time_threads(kaiten5, cfg, Args(), profiles)
+edits = [g for g in GOT if g[0] == "PUT"]
+check("сообщение переписано", len(edits) == 1, str(GOT))
+check("правкой, а не PATCH", edits[0][1].endswith("/posts/root/patch"), edits[0][1])
+edited = json.loads(edits[0][2])["message"]
+check("статус последней строкой по-человечески",
+      edited.splitlines()[-1] == "_пацанчики, позырьте плз_", edited)
+check("текст сообщения не потерян", edited.startswith("[PR](u) Убрал lowercase."))
+check("статус запомнен", json.loads(f.TIME_STATE_FILE.read_text())
+      ["threads"]["555"]["status"] == "пацанчики, позырьте плз")
+
+print("=== 10. тот же статус второй раз не переписывается ===")
+GOT.clear()
+f.follow_time_threads(FakeKaiten(), cfg, Args(), profiles)
+check("правок нет", [g for g in GOT if g[0] == "PUT"] == [])
+
+print("=== 11. «Готово» — карточка уходит из состояния ===")
+GOT.clear()
+done = FakeKaiten(); done.column = 108
+f.follow_time_threads(done, cfg, Args(), profiles)
+edited = json.loads([g for g in GOT if g[0] == "PUT"][-1][2])["message"]
+check("на «Готово» строка статуса снята", edited == "[PR](u) Убрал lowercase.\n[Карточка](k)",
+      repr(edited))
+check("тред больше не отслеживаем",
+      "555" not in json.loads(f.TIME_STATE_FILE.read_text())["threads"])
+
+print("=== 12. вопросы агента уезжают в тред ===")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+asking = FakeKaiten()
+asking.asks = ["Какой текст у подписи?", "Включать для Польши?"]
+f.follow_time_threads(asking, cfg, Args(), profiles)
+posted = [json.loads(g[2])["message"] for g in GOT
+          if g[0] == "POST" and g[1].endswith("/posts")]
+in_thread = [m for m in posted if m.startswith("❓")]
+check("вопросы написаны в тред", len(in_thread) == 1, str(posted))
+check("оба вопроса", in_thread[0].count("❓") == 2, in_thread[0])
+edited = json.loads([g for g in GOT if g[0] == "PUT"][-1][2])["message"]
+check("статус говорит про вопросы",
+      edited.splitlines()[-1] == "_пацанчики, позырьте плз, есть вопросики_", edited)
+GOT.clear()
+f.follow_time_threads(asking, cfg, Args(), profiles)
+check("те же вопросы второй раз не пишутся",
+      [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
 
 srv.shutdown()
 print("\nвсё сошлось")
