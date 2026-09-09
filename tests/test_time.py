@@ -250,9 +250,14 @@ asking.asks = ["Какой текст у подписи?", "Включать д�
 f.follow_time_threads(asking, cfg, Args(), profiles)
 posted = [json.loads(g[2])["message"] for g in GOT
           if g[0] == "POST" and g[1].endswith("/posts")]
-in_thread = [m for m in posted if m.startswith("❓")]
+in_thread = [m for m in posted if m.startswith("Есть следующие вопросы:")]
 check("вопросы написаны в тред", len(in_thread) == 1, str(posted))
-check("оба вопроса", in_thread[0].count("❓") == 2, in_thread[0])
+check("оба вопроса, списком", in_thread[0].count("\n- ") == 2, in_thread[0])
+check("в треде без эмодзи", not any(m in in_thread[0] for m in ("❓", "⚠️", "🛑", "💬")),
+      in_thread[0])
+check("один вопрос — одной строкой",
+      f.thread_asks(["❓ Включать для Польши?"]) == "Есть вопрос: Включать для Польши?",
+      f.thread_asks(["❓ Включать для Польши?"]))
 edited = json.loads([g for g in GOT if g[0] == "PUT"][-1][2])["message"]
 check("статус говорит про вопросы",
       edited.splitlines()[-1] == "_пацанчики, позырьте плз, есть вопросики_", edited)
@@ -314,6 +319,33 @@ check("в тред не отвечает",
       [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
 check("но сообщение считает прочитанным", json.loads(f.TIME_STATE_FILE.read_text())
       ["threads"]["555"]["last_post_id"] == "reply")
+
+print("=== 17. вопросы ревьювера начинаются с «❓» — их тоже видно ===")
+
+
+class Reviewer(FakeKaiten):
+    """Ревью с замечанием и вопросом: у ревьювера свои маркеры, не «- »."""
+    def comments(self, card_id):
+        return [{"text": "🔍 **Нужны правки: 1 из 3.**\n\n"
+                         "⚠️ Быстрый заказ обходит обязательный телефон",
+                 "created": "2026-09-09T00:00:00Z"},
+                {"text": "🔍 **Ревью пройдено, но нужен твой взгляд.**\n\n"
+                         "❓ Какой unitId у пиццерии Алматы-9?",
+                 "created": "2026-09-09T00:00:01Z"}]
+
+
+QUESTION[0] = "коллеги, а кто посмотрит?"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+f.follow_time_threads(Reviewer(), cfg, Args(), profiles)
+asked = [json.loads(g[2])["message"] for g in GOT
+         if g[0] == "POST" and g[1].endswith("/posts")]
+check("сообщение одно", len(asked) == 1, str(asked))
+check("вопрос ревьювера на месте", "Какой unitId у пиццерии Алматы-9?" in asked[0], asked[0])
+check("замечание тоже", "Быстрый заказ обходит обязательный телефон" in asked[0], asked[0])
+check("и ни одного значка", not any(m in asked[0] for m in ("❓", "⚠️", "🔍")), asked[0])
 
 srv.shutdown()
 print("\nвсё сошлось")

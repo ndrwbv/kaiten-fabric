@@ -1192,6 +1192,23 @@ def with_status(base: str, status: str) -> str:
     return f"{base}\n_{status}_" if status else base
 
 
+def thread_asks(asks: list[str]) -> str:
+    """
+    Вопросы для треда — так, как их написал бы человек.
+
+    В карточке у каждой строки свой значок важности, и там он к месту. В треде это
+    короткое сообщение живому человеку, и «❓ ⚠️» в начале строки только сбивает:
+    непонятно, вопрос это или предупреждение. Один вопрос — одна строка, несколько —
+    список: перечисление из одной строки в мессенджере не читается.
+    """
+    clean = [ask for ask in (ASK_MARK_RE.sub("", a).strip() for a in asks) if ask]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return f"Есть вопрос: {clean[0]}"
+    return "Есть следующие вопросы:\n" + "\n".join(f"- {ask}" for ask in clean)
+
+
 def thread_base(client: Time, info: dict) -> str:
     """
     Текст сообщения без строки статуса.
@@ -1292,10 +1309,10 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
         if asks and time_wants(conf, "asked") and role in ("review", "question"):
             asked = "\n".join(asks)
-            if info.get("asked") != asked:
+            text = thread_asks(asks)
+            if text and info.get("asked") != asked:
                 try:
-                    client.post(info.get("channel_id", ""),
-                                "\n".join(f"❓ {ask}" for ask in asks), root_id=root_id)
+                    client.post(info.get("channel_id", ""), text, root_id=root_id)
                     info["asked"] = asked
                     save_time_state(state)
                     log(f"  #{card_key}: вопросы в тред ({len(asks)})")
@@ -4697,7 +4714,14 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
 # Строки, по которым узнаём вопрос или замечание в комментарии агента. Ищем именно
 # их, а не весь текст: человеку в меню нужен вопрос, а не пересказ исследования.
 ASK_HEADS = ("Что нужно уточнить", "Замечания", "Что уточнить")
-ASK_BULLETS = ("- ", "• ", "🛑 ", "⚠️ ", "💬 ")
+ASK_BULLETS = ("- ", "• ", "🛑 ", "⚠️ ", "💬 ", "❓ ")
+
+# Значок в начале строки: в карточке он к месту — строк много и они разной
+# срочности, — а в мессенджере лишний. Собираем из ASK_BULLETS, чтобы новый
+# значок не пришлось дописывать в двух местах.
+ASK_MARK_RE = re.compile("^(?:"
+                         + "|".join(re.escape(b.strip()) for b in ASK_BULLETS)
+                         + r")\s*")
 
 
 def open_questions(comments: list, limit: int = 4) -> list[str]:
