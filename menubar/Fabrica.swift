@@ -962,6 +962,43 @@ enum Main {
 // Настройки Time
 // --------------------------------------------------------------------------- #
 
+/// Обработка ⌘V, ⌘C, ⌘X, ⌘A в полях ввода.
+///
+/// В обычном приложении это делает меню «Правка»: именно оно превращает нажатие
+/// в действие. У приложения в меню-баре главного меню нет вовсе, поэтому ⌘V просто
+/// не доезжает до поля — секрет нельзя было вставить, только набрать руками.
+///
+/// Зовём редактор поля напрямую, а не `NSApp.sendAction`: тот отдаёт действие первому
+/// респонденту, и если его в цепочке нет, вставка молча не происходит — так и было
+/// в первой попытке. Заодно `currentEditor()` отвечает на главный вопрос: нажатие
+/// адресовано именно этому полю, ведь `performKeyEquivalent` спрашивают у всех подряд.
+private func editingShortcut(_ field: NSTextField, _ event: NSEvent) -> Bool {
+    guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+          let key = event.charactersIgnoringModifiers?.lowercased(),
+          let editor = field.currentEditor()
+    else { return false }
+    switch key {
+    case "v": editor.paste(nil)
+    case "c": editor.copy(nil)
+    case "x": editor.cut(nil)
+    case "a": editor.selectAll(nil)
+    default: return false
+    }
+    return true
+}
+
+final class PasteableTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        editingShortcut(self, event) || super.performKeyEquivalent(with: event)
+    }
+}
+
+final class PasteableSecureField: NSSecureTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        editingShortcut(self, event) || super.performKeyEquivalent(with: event)
+    }
+}
+
 /// Окно «Настройки Time»: транспорт, адрес, секрет, канал.
 ///
 /// Само оно не пишет ни конфиг, ни файл с секретом: сохранение — это
@@ -972,14 +1009,20 @@ enum Main {
 ///
 /// Секрет уходит в питон через stdin, а не аргументом: аргументы видны в `ps` любому
 /// процессу пользователя.
-final class TimeSettings: NSObject {
+final class TimeSettings: NSObject, NSMenuDelegate {
     private let root: URL
     private var window: NSWindow?
 
     private let transport = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let address = NSTextField()
-    private let secret = NSSecureTextField()
-    private let channel = NSTextField()
+    private let address = PasteableTextField()
+    private let secret = PasteableSecureField()
+    /// Каналы бота списком: id канала в Time не показывают, а бота в нужные каналы
+    /// обычно добавляют сразу — значит спрашивать id у человека незачем, он и так
+    /// есть в списке. Выбранное лежит в representedObject пункта.
+    private let channel = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// Канал из конфига. Держим отдельно: если список не удалось получить, сохранение
+    /// не должно затереть то, что уже настроено.
+    private var savedChannel = ""
     private let note = NSTextField(wrappingLabelWithString: "")
     private var rows: NSStackView?
 
@@ -1002,9 +1045,11 @@ final class TimeSettings: NSObject {
         transport.addItems(withTitles: ["Бот", "Вебхук"])
         transport.target = self
         transport.action = #selector(transportChanged)
+        // Наполняем список в момент раскрытия, а не при открытии окна: за каналами
+        // надо идти в Time, и на медленной сети окно замирало бы на открытии.
+        channel.menu?.delegate = self
         address.placeholderString = "https://company.time-messenger.ru"
         secret.placeholderString = "токен бота"
-        channel.placeholderString = "id канала, 26 символов"
         note.textColor = .secondaryLabelColor
 
         let save = NSButton(title: "Сохранить", target: self, action: #selector(saveClicked))
@@ -1067,6 +1112,62 @@ final class TimeSettings: NSObject {
         return stack
     }
 
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard isBot, menu == channel.menu else { return }
+        fillChannels()
+    }
+
+    /// Пока список не раскрывали, показываем одним пунктом то, что уже настроено.
+    /// id канала в пункте живёт всегда — иначе сохранение затёрло бы настроенное.
+    private func showSavedChannel() {
+        channel.removeAllItems()
+        if isBot {
+            channel.addItem(withTitle: savedChannel.isEmpty
+                            ? "нажми, чтобы выбрать" : "канал выбран")
+            channel.lastItem?.representedObject = savedChannel.isEmpty ? nil : savedChannel
+            channel.isEnabled = true
+        } else {
+            channel.addItem(withTitle: "у вебхука канал в URL")
+            channel.isEnabled = false
+        }
+    }
+
+    /// Наполнить список каналов тем, что отдал бот. Не получилось — говорим об этом
+    /// пунктом в списке, а настроенный канал не теряем.
+    private func fillChannels() {
+        channel.removeAllItems()
+        guard isBot else {
+            channel.addItem(withTitle: "у вебхука канал в URL")
+            channel.isEnabled = false
+            return
+        }
+        let answer = run(["factory.py", "--time-channels"])
+        let data = answer.out.data(using: .utf8) ?? Data()
+        let parsed = try? JSONSerialization.jsonObject(with: data)
+        guard let list = parsed as? [[String: Any]], !list.isEmpty else {
+            let why = (parsed as? [String: Any])?["error"] as? String
+            channel.addItem(withTitle: why ?? "сначала сохрани токен")
+            channel.isEnabled = false
+            return
+        }
+        channel.isEnabled = true
+        for entry in list {
+            guard let id = entry["id"] as? String else { continue }
+            let name = (entry["name"] as? String) ?? id
+            let team = (entry["team"] as? String) ?? ""
+            let lock = (entry["private"] as? Bool) == true ? " 🔒" : ""
+            let title = team.isEmpty ? "\(name)\(lock)" : "\(team) / \(name)\(lock)"
+            channel.addItem(withTitle: title)
+            channel.lastItem?.representedObject = id
+            if id == savedChannel { channel.select(channel.lastItem) }
+        }
+    }
+
+    /// Что выбрано в списке. Пусто — список не наполнился, и трогать конфиг нельзя.
+    private var chosenChannel: String {
+        (channel.selectedItem?.representedObject as? String) ?? ""
+    }
+
     private var isBot: Bool { transport.indexOfSelectedItem == 0 }
 
     private var secretName: String { isBot ? "TIME_BOT_TOKEN" : "TIME_WEBHOOK_URL" }
@@ -1075,27 +1176,28 @@ final class TimeSettings: NSObject {
         secret.placeholderString = isBot ? "токен бота" : "URL вебхука"
         // у вебхука канал зашит в сам URL, спрашивать его второй раз незачем
         address.isEnabled = isBot
-        channel.isEnabled = isBot
         note.stringValue = isBot ? "" : "У вебхука канал зашит в URL, и тред он читать "
             + "не умеет: сообщения про PR пойдут, а правки из треда — нет."
+        showSavedChannel()
         fit(window)
     }
 
     // MARK: - чтение и запись
 
     private func load() {
-        let shown = run(["setup.py", "--get-notify"]).out
+        let answer = run(["setup.py", "--get-notify"])
+        let shown = answer.out
         guard let data = shown.data(using: .utf8),
               let conf = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
-            note.stringValue = "Не смог прочитать настройки: " + shown
+            note.stringValue = "Не смог прочитать настройки: " + said(answer)
             fit(window)
             return
         }
         defer { fit(window) }
         transport.selectItem(at: (conf["transport"] as? String) == "webhook" ? 1 : 0)
         address.stringValue = (conf["base_url"] as? String) ?? ""
-        channel.stringValue = ((conf["channels"] as? [String: Any])?["default"] as? String) ?? ""
+        savedChannel = ((conf["channels"] as? [String: Any])?["default"] as? String) ?? ""
         secret.stringValue = ""
         transportChanged()
         let key = "has_" + secretName.lowercased()
@@ -1110,21 +1212,28 @@ final class TimeSettings: NSObject {
         var conf: [String: Any] = ["transport": isBot ? "bot" : "webhook"]
         if isBot {
             conf["base_url"] = address.stringValue.trimmingCharacters(in: .whitespaces)
-            let id = channel.stringValue.trimmingCharacters(in: .whitespaces)
-            if !id.isEmpty { conf["channels"] = ["default": id] }
+            // канал пишем только когда он реально выбран: список мог не наполниться,
+            // и затирать уже настроенное нечем — незачем
+            let id = chosenChannel
+            if !id.isEmpty {
+                conf["channels"] = ["default": id]
+                savedChannel = id
+            }
         }
         guard let json = try? JSONSerialization.data(withJSONObject: conf),
               let text = String(data: json, encoding: .utf8)
         else { return "не собрал настройки" }
 
-        var said = run(["setup.py", "--set-notify"], input: text).out
+        var report = said(run(["setup.py", "--set-notify"], input: text))
         let value = secret.stringValue.trimmingCharacters(in: .whitespaces)
         if !value.isEmpty {
-            said += "\n" + run(["setup.py", "--set-secret", secretName], input: value).out
+            report += "\n" + said(run(["setup.py", "--set-secret", secretName], input: value))
             secret.stringValue = ""
             secret.placeholderString = "уже задан, можно не вводить"
+            // с новым токеном каналы наконец можно спросить
+            if isBot && chosenChannel.isEmpty { fillChannels() }
         }
-        return said
+        return report
     }
 
     @objc private func saveClicked() {
@@ -1135,13 +1244,16 @@ final class TimeSettings: NSObject {
     @objc private func testClicked() {
         // сначала сохраняем: проверять надо то, что человек видит в полях, а проверка
         // идёт тем же кодом, которым потом пишет фабрика, — он читает конфиг с диска
-        note.stringValue = save() + "\n\n" + run(["factory.py", "--time-test"]).out
+        note.stringValue = save() + "\n\n" + said(run(["factory.py", "--time-test"]))
         fit(window)
     }
 
     // MARK: - запуск питона
 
-    private func run(_ arguments: [String], input: String? = nil) -> (out: String, code: Int32) {
+    /// Потоки держим раздельно: у машинных команд stdout — чистый JSON, а лог фабрика
+    /// пишет в stderr. Слитые вместе, они ломали разбор списка каналов.
+    private func run(_ arguments: [String], input: String? = nil)
+        -> (out: String, err: String, code: Int32) {
         let task = Process()
         // /usr/bin/python3 есть на маке всегда; в логин-шелл лезть незачем — этим
         // командам не нужны ни nvm, ни токены из профиля
@@ -1150,22 +1262,30 @@ final class TimeSettings: NSObject {
         task.currentDirectoryURL = root
 
         let output = Pipe()
+        let errors = Pipe()
         task.standardOutput = output
-        task.standardError = output
+        task.standardError = errors
+        let stdin = Pipe()
+        if input != nil { task.standardInput = stdin }
+
+        guard (try? task.run()) != nil else {
+            return ("", "не смог запустить python3", -1)
+        }
         if let input {
-            let stdin = Pipe()
-            task.standardInput = stdin
-            guard (try? task.run()) != nil else { return ("не смог запустить python3", -1) }
             stdin.fileHandleForWriting.write(Data(input.utf8))
             stdin.fileHandleForWriting.closeFile()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-            return (clean(data), task.terminationStatus)
         }
-        guard (try? task.run()) != nil else { return ("не смог запустить python3", -1) }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
+        // читаем оба до конца прежде, чем ждать: иначе процесс упрётся в полный канал
+        let out = output.fileHandleForReading.readDataToEndOfFile()
+        let err = errors.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
-        return (clean(data), task.terminationStatus)
+        return (clean(out), clean(err), task.terminationStatus)
+    }
+
+    /// Что показать человеку: обычно питон говорит по делу в stdout, а если промолчал —
+    /// причина будет в stderr.
+    private func said(_ answer: (out: String, err: String, code: Int32)) -> String {
+        answer.out.isEmpty ? answer.err : answer.out
     }
 
     /// Питон красит вывод для терминала — в окне эти escape-последовательности лишние.

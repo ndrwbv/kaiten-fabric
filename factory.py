@@ -282,9 +282,16 @@ def slugify(text: str, limit: int = 48) -> str:
 # инфраструктура
 # --------------------------------------------------------------------------- #
 
+# Команды, которые печатают JSON для машины: у них stdout обязан быть чистым, иначе
+# «токен из ~/.claude/.env» первой строкой ломает разбор. Логи в этом режиме уходят
+# в stderr — человеку они по-прежнему видны, а `run.sh` подхватывает и их (2>&1).
+MACHINE_OUTPUT = False
+
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    print(f"[{ts}] {msg}", flush=True,
+          file=sys.stderr if MACHINE_OUTPUT else sys.stdout)
 
 
 class ScoutSetupError(RuntimeError):
@@ -789,6 +796,32 @@ class Time:
     def me(self) -> dict:
         return self._request("GET", f"{self.api}/users/me", config=self._auth()) or {}
 
+    def my_channels(self) -> list[dict]:
+        """
+        Каналы, в которых бот уже состоит.
+
+        Бота в нужные каналы обычно добавляют сразу при создании, так что спрашивать
+        у человека id канала незачем — он и так есть в этом списке. Личные переписки
+        отбрасываем: оповещения про PR им не место.
+        """
+        found = []
+        teams = self._request("GET", f"{self.api}/users/me/teams",
+                              config=self._auth()) or []
+        for team in teams:
+            channels = self._request(
+                "GET", f"{self.api}/users/me/teams/{team.get('id')}/channels",
+                config=self._auth()) or []
+            for channel in channels:
+                if channel.get("type") in ("D", "G"):
+                    continue
+                found.append({
+                    "id": channel.get("id"),
+                    "name": channel.get("display_name") or channel.get("name") or "?",
+                    "team": team.get("display_name") or team.get("name") or "",
+                    "private": channel.get("type") == "P",
+                })
+        return sorted(found, key=lambda c: (c["team"], c["name"].lower()))
+
     def users(self, ids: list[str]) -> dict:
         """id -> пользователь. Одним запросом на всех, а не по одному на автора."""
         if not ids:
@@ -852,6 +885,28 @@ def save_time_state(state: dict) -> None:
     tmp = TIME_STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(TIME_STATE_FILE)
+
+
+def time_channels(cfg: dict, args) -> int:
+    """
+    Список каналов бота машинным JSON. Этим пользуется окно настроек: человеку остаётся
+    выбрать канал из списка, а не искать его id в интерфейсе Time.
+    """
+    client = time_client(cfg, load_env(), args.dry_run)
+    if not client or not client.can_read:
+        # причина зависит от транспорта, и в окне настроек эта строка становится
+        # единственным пунктом списка — она должна объяснять, что делать
+        webhook = (time_config(cfg).get("transport") or "bot") == "webhook"
+        why = ("у вебхука канал зашит в URL — выбирать нечего" if webhook
+               else "сначала сохрани токен бота")
+        print(json.dumps({"error": why}, ensure_ascii=False))
+        return 1
+    try:
+        print(json.dumps(client.my_channels(), ensure_ascii=False, indent=2))
+    except FactoryError as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        return 1
+    return 0
 
 
 def time_test(cfg: dict, args) -> int:
@@ -4675,9 +4730,16 @@ def main() -> int:
                         help="полный прогон без чтения тредов в Time")
     parser.add_argument("--time-test", action="store_true",
                         help="послать в канал Time тестовое сообщение и выйти")
+    parser.add_argument("--time-channels", action="store_true",
+                        help="показать каналы бота списком (JSON) и выйти")
     parser.add_argument("--epic-card", type=int,
                         help="продвинуть конкретный эпик по id, игнорируя тег и выборку")
     args = parser.parse_args()
+
+    if args.time_channels:
+        # печатаем JSON — значит в stdout не должно быть ничего, кроме него
+        global MACHINE_OUTPUT
+        MACHINE_OUTPUT = True
 
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     env = load_env()
@@ -4722,7 +4784,7 @@ def main() -> int:
     # состояние часовой давности, и человек справедливо считал, что ничего не двигается.
     # Проверке связи снимок не нужен вовсе: она ничего не берёт из Kaiten, а обход досок
     # добавил бы к нажатию кнопки в окне настроек двадцать секунд ожидания.
-    snapshot = not (args.prompt_only or args.time_test)
+    snapshot = not (args.prompt_only or args.time_test or args.time_channels)
     if snapshot:
         refresh_flow(kaiten, cfg, profiles)
     try:
@@ -4753,6 +4815,8 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         return run_epics(kaiten, cfg, args)
     if args.time_test:
         return time_test(cfg, args)
+    if args.time_channels:
+        return time_channels(cfg, args)
     if args.only_time:
         return follow_time_threads(kaiten, cfg, args, profiles)
 
