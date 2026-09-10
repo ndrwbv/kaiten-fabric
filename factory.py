@@ -3020,7 +3020,7 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
 
 
 # --------------------------------------------------------------------------- #
-# мерж: смерженный PR закрывает карточку
+# мерж: работа, уехавшая в main, закрывает карточку
 # --------------------------------------------------------------------------- #
 
 # Колонки, из которых мерж уводит карточку в «Готово». Это те, где она стоит
@@ -3033,10 +3033,11 @@ MERGE_ROLES = ("agent_review", "review")
 # исполнителя и выжимка ревьювера, — и годится любой.
 PR_LINK_RE = re.compile(r"https://\S+?/pull/\d+")
 
-# По этой строке фабрика узнаёт свой же отчёт о мерже. Нужно на доске, где «Готово»
-# делит колонку с ревью: карточка остаётся на месте, и без проверки прогон
-# отчитывался бы об одном и том же мерже каждый час.
-MERGED_LINE = "PR смержен"
+# По этой строке фабрика узнаёт свой же отчёт о закрытии карточки и не пишет второй.
+# Строка одна на оба исхода — и «PR смержен», и «работа уехала в main», — потому что
+# проверка нужна одна. Нужна она на доске, где «Готово» делит колонку с ревью:
+# карточка остаётся на месте, и без проверки прогон отчитывался бы каждый час.
+DONE_LINE = "двигаю карточку в «Готово»"
 
 
 def pr_link(comments: list) -> str:
@@ -3090,6 +3091,31 @@ def pr_status(repo: Path, prefix: str, card_id: int, pr_url: str) -> dict:
     return {}
 
 
+def shipped_commit(repo: Path, repo_cfg: dict, card_id: int) -> dict:
+    """
+    Коммит карточки в базовой ветке: `sha` и `subject`. Пусто — не нашли.
+
+    Второй признак «сделано», и без него первого не хватает. PR карточки может быть
+    закрыт, а работа при этом уехать в `main` внутри чужого PR — так и вышло с правкой
+    дринкита: её сквошнули в PR по Алматы, а свой PR закрыли. GitHub про такой PR
+    честно отвечает «closed, не merged», и по нему одному карточка висела бы в ревью
+    вечно.
+
+    Ищем по номеру карточки, а не по коммитам ветки: при сквоше их sha в `main`
+    не попадают вовсе, зато первые строки уезжают в тело мерж-коммита целиком —
+    а исполнителю велено начинать первую строку с `#<id>`. Хвост `([^0-9]|$)` не даёт
+    номеру склеиться с более длинным. Обход всей истории стоит десятые доли секунды
+    даже на репозитории в двенадцать тысяч коммитов.
+    """
+    found = git(repo, "log", f"{repo_cfg['remote']}/{repo_cfg['base_branch']}",
+                "-E", f"--grep=#{card_id}([^0-9]|$)", "--format=%H%x09%s", "-1",
+                check=False)
+    if not found:
+        return {}
+    sha, _, subject = found.strip().partition("\t")
+    return {"sha": sha, "subject": subject}
+
+
 def merged_label(stamp) -> str:
     """«10 сентября в 09:11» по местному времени. Пусто — даты в ответе не было."""
     when = parse_stamp(stamp)
@@ -3101,7 +3127,7 @@ def merged_label(stamp) -> str:
 
 def comment_merged(pull: dict) -> str:
     """Отчёт о мерже в карточку: кто смержил, когда и куда идти смотреть."""
-    text = f"{AGENT_MARK} **{MERGED_LINE} — двигаю карточку в «Готово».**"
+    text = f"{AGENT_MARK} **PR смержен — {DONE_LINE}.**"
     if pull.get("url"):
         text += f"\n\nPR: {pull['url']}"
     # без «@» перед именем: в Kaiten это обращение, а звать человека сюда уже незачем
@@ -3116,9 +3142,35 @@ def comment_merged(pull: dict) -> str:
     return text
 
 
+def comment_shipped(commit: dict, pull: dict) -> str:
+    """
+    Отчёт о том, что работа в базовой ветке, а своего мержа у карточки не было.
+
+    Человеку важно не «карточка закрыта», а «куда девалась моя правка»: поэтому в тексте
+    и мёртвый PR, и коммит, внутри которого правка уехала. Заголовок чужого коммита
+    оставляем как есть — по нему и видно, в какой PR её забрали.
+    """
+    text = f"{AGENT_MARK} **Работа уехала в main — {DONE_LINE}.**"
+    if pull.get("url"):
+        text += f"\n\nСвой PR закрыт без мержа: {pull['url']}"
+    else:
+        text += "\n\nОткрытого PR у карточки нет."
+    text += f"\nНо правка в main: коммит `{commit['sha'][:10]}`"
+    if commit.get("subject"):
+        text += f" «{commit['subject'][:90]}»"
+    return text + ".\nПохоже, её забрали в другой PR."
+
+
 def close_if_merged(kaiten: Kaiten, cfg: dict, profile: dict, card: dict,
-                    done: int) -> bool:
-    """Одна карточка: её PR в main — уводим в «Готово». True, если увели."""
+                    done: int, fetched: set) -> bool:
+    """
+    Одна карточка: её работа уже в базовой ветке — уводим в «Готово». True, если увели.
+
+    Признака два, и порядок между ними важен. Смерженный PR — прямой и самый частый,
+    он же приносит «кто смержил и когда». PR ещё открыт — работа в полёте, ждём, что бы
+    ни лежало в `main`. А закрытый без мержа (или ненайденный) PR — не приговор: работу
+    могли забрать в чужой PR, и тогда решает сам `main`.
+    """
     card_id = card["id"]
     if theirs(profile, card):
         return False
@@ -3127,9 +3179,9 @@ def close_if_merged(kaiten: Kaiten, cfg: dict, profile: dict, card: dict,
     if stop:
         log(f"#{card_id} не трогаю: в карточке «{stop}»")
         return False
-    if any(MERGED_LINE in text and text.startswith(AGENT_MARK)
+    if any(DONE_LINE in text and text.startswith(AGENT_MARK)
            for text in (strip_html(c.get("text", "")) for c in comments)):
-        return False  # об этом мерже уже отчитались
+        return False  # об этой карточке уже отчитались
     # Свой блокер снимем сами, чужой — стоп: его повесил человек, и мерж этого
     # не отменяет. Пока он висит, карточка не наша.
     held = kaiten.blockers(card_id)
@@ -3137,15 +3189,32 @@ def close_if_merged(kaiten: Kaiten, cfg: dict, profile: dict, card: dict,
         log(f"#{card_id} под чужим блокером — в «Готово» не двигаю")
         return False
 
-    _, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
+    key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
+    repo = Path(repo_cfg["path"]).expanduser()
     prefix = (cfg.get("pr") or {}).get("branch_prefix", "ai/card-")
-    pull = pr_status(Path(repo_cfg["path"]).expanduser(), prefix, card_id,
-                     pr_link(comments))
-    if (pull.get("state") or "").upper() != "MERGED":
-        return False
+    pull = pr_status(repo, prefix, card_id, pr_link(comments))
+    state = (pull.get("state") or "").upper()
+    where = (card.get("title") or "").strip()[:60]
 
-    log(f"#{card_id} «{(card.get('title') or '').strip()[:60]}» — PR смержен")
-    kaiten.comment(card_id, comment_merged(pull))
+    if state == "MERGED":
+        report = comment_merged(pull)
+        log(f"#{card_id} «{where}» — PR смержен")
+    elif state == "OPEN":
+        return False
+    else:
+        # Базовую ветку подтягиваем один раз на репозиторий за прогон: в фазе мержа
+        # больше никто не ходит в сеть, и без этого `main` был бы вчерашним.
+        if key not in fetched:
+            git(repo, "fetch", repo_cfg["remote"], "--prune", check=False)
+            fetched.add(key)
+        commit = shipped_commit(repo, repo_cfg, card_id)
+        if not commit:
+            return False
+        report = comment_shipped(commit, pull)
+        log(f"#{card_id} «{where}» — своего мержа нет, но правка в main "
+            f"({commit['sha'][:10]})")
+
+    kaiten.comment(card_id, report)
     # Блокер «нужен человек» вешала фабрика — ей его и снимать: иначе карточка
     # встанет в «Готово» заблокированной и будет выглядеть сломанной. Чужих здесь
     # уже нет, их отсеяла проверка выше.
@@ -3167,7 +3236,9 @@ def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
 
     Про мерж фабрике никто не сообщает — вебхук ей слушать негде, — поэтому
     состояние PR она спрашивает сама, раз в прогон, и только по карточкам из колонок
-    ревью: один вызов `gh` на карточку, агента здесь нет вовсе.
+    ревью: один вызов `gh` на карточку, агента здесь нет вовсе. Смерженного PR
+    для решения хватает не всегда: работу могли забрать в чужой PR, а свой закрыть, —
+    тогда слово за базовой веткой, подробности в `shipped_commit`.
 
     Идёт первой в прогоне, до ревьювера: смерженный PR он иначе отревьюит заново
     за отдельные деньги.
@@ -3176,7 +3247,7 @@ def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     агента, а передвинуть карточку не дороже, чем её прочитать.
     """
     note_phase(args, "смотрю, что смержено")
-    moved = 0
+    moved, fetched = 0, set()
     for profile in profiles:
         done = role_column(profile, "done")
         if not done:
@@ -3188,7 +3259,7 @@ def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         for column in columns:
             for card in kaiten.cards_in_column(profile["board_id"], column):
                 try:
-                    if close_if_merged(kaiten, cfg, profile, card, done):
+                    if close_if_merged(kaiten, cfg, profile, card, done, fetched):
                         moved += 1
                 except Exception as e:  # noqa: BLE001 — одна карточка не роняет фазу
                     log(f"#{card['id']} мерж не проверился: {e}")

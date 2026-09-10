@@ -1,9 +1,9 @@
 """
 Проверка фазы мержа без GitHub и без Kaiten.
 
-Смерженный PR закрывает карточку, и проверить это руками дорого: нужен живой PR,
-живая доска и человек с правом мержа. Поэтому здесь `gh` подменён заглушкой,
-а Kaiten — фальшивкой, которая только записывает, о чём её попросили.
+Работа, уехавшая в main, закрывает карточку, и проверить это руками дорого: нужен
+живой PR, живая доска и человек с правом мержа. Поэтому здесь `gh` и `git` подменены
+заглушками, а Kaiten — фальшивкой, которая только записывает, о чём её попросили.
 Запуск: `python3 tests/test_merged.py`.
 """
 import importlib.util, json, subprocess, tempfile
@@ -22,13 +22,17 @@ CARD = 555
 PR = "https://github.com/o/r/pull/7"
 BRANCH = "ai/card-555-popravit-tekst"
 
-CFG = {"default_repo": "kiosk", "repos": {"kiosk": {"path": "/nope"}},
+CFG = {"default_repo": "kiosk",
+       "repos": {"kiosk": {"path": "/nope", "remote": "origin", "base_branch": "main"}},
        "pr": {"branch_prefix": "ai/card-"}}
 
 MERGED = {"url": PR, "state": "MERGED", "mergedAt": "2026-09-10T06:11:20Z",
           "mergedBy": {"login": "aboev"}, "headRefName": BRANCH}
 OPEN = {"url": PR, "state": "OPEN", "mergedAt": None,
         "mergedBy": None, "headRefName": BRANCH}
+# PR закрыли, не смержив: так бывает, когда правку забрали в чужой PR
+CLOSED = {"url": PR, "state": "CLOSED", "mergedAt": None,
+          "mergedBy": None, "headRefName": BRANCH}
 
 REPORT = "🤖 **Готово, нужен ревью.**\n\nPR: " + PR + "\nВетка: `" + BRANCH + "`"
 
@@ -88,6 +92,22 @@ def fake_gh(*replies):
     f.run_bounded = run
 
 
+GITTED = []         # с чем позвали `git`
+
+
+def fake_git(log_reply=""):
+    """
+    Подменяет git: `log` отдаёт заготовленную строку, `fetch` молчит.
+
+    Строка — то, что напечатал бы `git log --format=%H%x09%s -1`; пустая означает
+    «коммита карточки в базовой ветке нет».
+    """
+    def run(cwd, *args, check=True):
+        GITTED.append(list(args))
+        return log_reply if args and args[0] == "log" else ""
+    f.git = run
+
+
 def check(name, ok, detail=""):
     print(("  ✓ " if ok else "  ✗ ") + name + (f" — {detail}" if detail and not ok else ""))
     assert ok, name
@@ -97,6 +117,7 @@ profiles = [f.make_profile("работа", {"board_id": BOARD, "columns": COLUMN
 # статус пишем в свой каталог, а не в state настоящей фабрики
 f.STATE = Path(tempfile.mkdtemp())
 f.STATUS_FILE = f.STATE / "status.json"
+fake_git()   # по умолчанию коммита карточки в базовой ветке нет
 
 print("=== 1. смерженный PR закрывает карточку ===")
 ASKED.clear(); fake_gh(MERGED)
@@ -109,7 +130,7 @@ check("gh позвали один раз", len(ASKED) == 1, str(ASKED))
 check("отчёт написан", len(kaiten.written) == 1, str(kaiten.written))
 text = kaiten.written[0]
 check("это агентский комментарий", text.startswith(f.AGENT_MARK), text)
-check("сказано, что смержен", f.MERGED_LINE in text, text)
+check("сказано, что смержен", "PR смержен" in text, text)
 check("видно ссылку на PR", PR in text, text)
 check("видно, кто смержил", "aboev" in text, text)
 check("и когда — по-человечески", "10 сентября" in text, text)
@@ -124,8 +145,8 @@ check("и молчим", kaiten.written == [], str(kaiten.written))
 print("=== 3. о том же мерже второй раз не отчитываемся ===")
 ASKED.clear(); fake_gh(MERGED)
 kaiten = FakeKaiten(comments=[{"text": REPORT},
-                              {"text": f"🤖 **{f.MERGED_LINE} — двигаю карточку "
-                                       f"в «Готово».**\n\nPR: {PR}"}])
+                              {"text": f"🤖 **PR смержен — {f.DONE_LINE}.**"
+                                       f"\n\nPR: {PR}"}])
 f.close_merged(kaiten, CFG, Args(), profiles)
 check("повторного комментария нет", kaiten.written == [], str(kaiten.written))
 check("и повторного движения тоже", kaiten.moves == [], str(kaiten.moves))
@@ -229,5 +250,71 @@ f.close_merged(kaiten, CFG, Args(),
 check("карточку закрыли один раз", kaiten.moves == [(CARD, COLUMNS["done"])],
       str(kaiten.moves))
 check("и отчитались один раз", len(kaiten.written) == 1, str(kaiten.written))
+
+print("=== 13. PR закрыт без мержа, но правка уехала в main ===")
+# так вышло вживую: правку дринкита сквошнули в PR по Алматы, а свой PR закрыли
+ASKED.clear(); GITTED.clear(); fake_gh(CLOSED)
+fake_git("3b84ce18b51c47\t#69826636 Включить обязательную авторизацию (#4769)")
+kaiten = FakeKaiten()
+f.close_merged(kaiten, CFG, Args(), profiles)
+check("уехала в «Готово»", kaiten.moves == [(CARD, COLUMNS["done"])], str(kaiten.moves))
+check("базовую ветку подтянули", ["fetch", "origin", "--prune"] in GITTED, str(GITTED))
+asked_log = next((a for a in GITTED if a and a[0] == "log"), [])
+check("искали по номеру карточки в origin/main",
+      asked_log[:2] == ["log", "origin/main"]
+      and f"--grep=#{CARD}([^0-9]|$)" in asked_log, str(asked_log))
+text = kaiten.written[0]
+check("сказано, что работа в main", "Работа уехала в main" in text, text)
+check("и что свой PR закрыт", "закрыт без мержа" in text and PR in text, text)
+check("виден коммит", "3b84ce18b5" in text, text)
+check("и в какой PR её забрали", "#4769" in text, text)
+
+print("=== 14. PR закрыт и в main ничего — карточка ждёт человека ===")
+ASKED.clear(); GITTED.clear(); fake_gh(CLOSED); fake_git("")
+kaiten = FakeKaiten()
+f.close_merged(kaiten, CFG, Args(), profiles)
+check("не двигаем", kaiten.moves == [], str(kaiten.moves))
+check("и молчим", kaiten.written == [], str(kaiten.written))
+check("но в main всё же посмотрели",
+      any(a and a[0] == "log" for a in GITTED), str(GITTED))
+
+print("=== 15. открытый PR сильнее коммита в main ===")
+# работа в полёте: круг правок мог уже уехать в main частями, закрывать рано
+ASKED.clear(); GITTED.clear(); fake_gh(OPEN)
+fake_git("3b84ce18b51c47\t#69826636 что-то там")
+kaiten = FakeKaiten()
+f.close_merged(kaiten, CFG, Args(), profiles)
+check("не двигаем", kaiten.moves == [], str(kaiten.moves))
+check("в main даже не смотрим", GITTED == [], str(GITTED))
+
+print("=== 16. второй раз про main тоже не отчитываемся ===")
+ASKED.clear(); GITTED.clear(); fake_gh(CLOSED)
+fake_git("3b84ce18b51c47\t#69826636 что-то там")
+kaiten = FakeKaiten(comments=[{"text": REPORT},
+                              {"text": f"🤖 **Работа уехала в main — {f.DONE_LINE}.**"}])
+f.close_merged(kaiten, CFG, Args(), profiles)
+check("повторов нет", kaiten.written == [] and kaiten.moves == [], str(kaiten.written))
+check("и наружу не ходим", ASKED == [] and GITTED == [], str(ASKED + GITTED))
+
+print("=== 17. один fetch на репозиторий, сколько бы карточек ни было ===")
+ASKED.clear(); GITTED.clear(); fake_gh(CLOSED, CLOSED); fake_git("")
+
+
+class Two(FakeKaiten):
+    """Две карточки в одной колонке — обе с закрытым PR."""
+    def cards_in_column(self, board_id, column_id):
+        if column_id != self.column:
+            return []
+        return [{"id": CARD, "title": "Раз", "board_id": BOARD,
+                 "column_id": column_id, "description": ""},
+                {"id": CARD + 1, "title": "Два", "board_id": BOARD,
+                 "column_id": column_id, "description": ""}]
+
+
+f.close_merged(Two(), CFG, Args(), profiles)
+fetches = [a for a in GITTED if a and a[0] == "fetch"]
+check("fetch ровно один", len(fetches) == 1, str(GITTED))
+check("а в main смотрели по каждой",
+      len([a for a in GITTED if a and a[0] == "log"]) == 2, str(GITTED))
 
 print("\nвсё сошлось")
