@@ -3020,6 +3020,186 @@ def pick_cards(kaiten: Kaiten, cfg: dict, profile: dict) -> list:
 
 
 # --------------------------------------------------------------------------- #
+# мерж: смерженный PR закрывает карточку
+# --------------------------------------------------------------------------- #
+
+# Колонки, из которых мерж уводит карточку в «Готово». Это те, где она стоит
+# с открытым PR и ждёт человека. Рабочих колонок здесь нет намеренно: там карточку
+# либо пишут, либо правят по замечаниям, и смерженный PR прошлого круга — не повод
+# считать её законченной.
+MERGE_ROLES = ("agent_review", "review")
+
+# Ссылка на PR в комментарии фабрики. Своих комментариев про PR два — отчёт
+# исполнителя и выжимка ревьювера, — и годится любой.
+PR_LINK_RE = re.compile(r"https://\S+?/pull/\d+")
+
+# По этой строке фабрика узнаёт свой же отчёт о мерже. Нужно на доске, где «Готово»
+# делит колонку с ревью: карточка остаётся на месте, и без проверки прогон
+# отчитывался бы об одном и том же мерже каждый час.
+MERGED_LINE = "PR смержен"
+
+
+def pr_link(comments: list) -> str:
+    """
+    Ссылка на PR карточки из комментариев фабрики, самая свежая.
+
+    Человеческие комментарии не читаем: ссылку в них мог оставить кто угодно и на
+    что угодно, а по этой ссылке карточка закрывается.
+    """
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if not text.startswith(AGENT_MARKS):
+            continue
+        found = PR_LINK_RE.search(text)
+        if found:
+            return found.group(0)
+    return ""
+
+
+def pr_status(repo: Path, prefix: str, card_id: int, pr_url: str) -> dict:
+    """
+    Что стало с PR карточки: `url`, `state` (`OPEN`, `MERGED`, `CLOSED`), `mergedAt`,
+    `mergedBy`. Пустой словарь — PR не нашёлся, и это не поломка: карточку могли
+    положить в колонку ревью руками.
+
+    Путей два. Ссылка из комментария прямее: по ней `gh` находит PR сам, даже если
+    он в другом репозитории. Ссылки нет (карточку вёл ещё старый прогон, комментарий
+    стёрли) — ищем по имени ветки, и именно поиском по PR, а не через `ls-remote`:
+    после мержа GitHub ветку удаляет, в репозитории её больше нет, а в списке PR она
+    осталась.
+    """
+    fields = "url,state,mergedAt,mergedBy,headRefName"
+    if pr_url.startswith("http"):
+        proc = run_bounded(["gh", "pr", "view", pr_url, "--json", fields], repo, 120)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+        log(f"  !! {pr_url} не прочитался: {proc.stderr.strip()[:160]}")
+
+    head = f"{prefix}{card_id}"
+    proc = run_bounded(["gh", "pr", "list", "--search", f"head:{head}",
+                        "--state", "all", "--json", fields], repo, 120)
+    if proc.returncode != 0:
+        log(f"  !! PR по ветке {head} не искался: {proc.stderr.strip()[:160]}")
+        return {}
+    # `head:` в поиске GitHub совпадает по началу имени, поэтому `ai/card-123` поймал
+    # бы заодно и `ai/card-1234-…`: имя ветки проверяем сами
+    for pull in json.loads(proc.stdout or "[]"):
+        name = pull.get("headRefName") or ""
+        if name == head or name.startswith(f"{head}-"):
+            return pull
+    return {}
+
+
+def merged_label(stamp) -> str:
+    """«10 сентября в 09:11» по местному времени. Пусто — даты в ответе не было."""
+    when = parse_stamp(stamp)
+    if not when:
+        return ""
+    local = when.astimezone()
+    return f"{local.day} {MONTHS_GENITIVE[local.month - 1]} в {local:%H:%M}"
+
+
+def comment_merged(pull: dict) -> str:
+    """Отчёт о мерже в карточку: кто смержил, когда и куда идти смотреть."""
+    text = f"{AGENT_MARK} **{MERGED_LINE} — двигаю карточку в «Готово».**"
+    if pull.get("url"):
+        text += f"\n\nPR: {pull['url']}"
+    # без «@» перед именем: в Kaiten это обращение, а звать человека сюда уже незачем
+    who = ((pull.get("mergedBy") or {}).get("login") or "").strip()
+    when = merged_label(pull.get("mergedAt"))
+    if who and when:
+        text += f"\nСмержил {who}, {when}."
+    elif who:
+        text += f"\nСмержил {who}."
+    elif when:
+        text += f"\nСмержен {when}."
+    return text
+
+
+def close_if_merged(kaiten: Kaiten, cfg: dict, profile: dict, card: dict,
+                    done: int) -> bool:
+    """Одна карточка: её PR в main — уводим в «Готово». True, если увели."""
+    card_id = card["id"]
+    if theirs(profile, card):
+        return False
+    comments = kaiten.comments(card_id)
+    stop = hands_off(card, comments, cfg)
+    if stop:
+        log(f"#{card_id} не трогаю: в карточке «{stop}»")
+        return False
+    if any(MERGED_LINE in text and text.startswith(AGENT_MARK)
+           for text in (strip_html(c.get("text", "")) for c in comments)):
+        return False  # об этом мерже уже отчитались
+    # Свой блокер снимем сами, чужой — стоп: его повесил человек, и мерж этого
+    # не отменяет. Пока он висит, карточка не наша.
+    held = kaiten.blockers(card_id)
+    if any(not ours(blocker) for blocker in held):
+        log(f"#{card_id} под чужим блокером — в «Готово» не двигаю")
+        return False
+
+    _, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
+    prefix = (cfg.get("pr") or {}).get("branch_prefix", "ai/card-")
+    pull = pr_status(Path(repo_cfg["path"]).expanduser(), prefix, card_id,
+                     pr_link(comments))
+    if (pull.get("state") or "").upper() != "MERGED":
+        return False
+
+    log(f"#{card_id} «{(card.get('title') or '').strip()[:60]}» — PR смержен")
+    kaiten.comment(card_id, comment_merged(pull))
+    # Блокер «нужен человек» вешала фабрика — ей его и снимать: иначе карточка
+    # встанет в «Готово» заблокированной и будет выглядеть сломанной. Чужих здесь
+    # уже нет, их отсеяла проверка выше.
+    for blocker in held:
+        kaiten.unblock(card_id, blocker["id"])
+    kaiten.move(card_id, done)
+    log("  -> Готово")
+    return True
+
+
+def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
+    """
+    Фаза мержа: карточки, по которым PR уже в main, уезжают в «Готово».
+
+    Последний шаг потока раньше делал человек руками: смержил PR — иди в Kaiten
+    и перетащи карточку. Шаг мелкий, поэтому и забывался: в «На ревью» копились
+    карточки, по которым всё давно влито, и по доске нельзя было понять, что
+    действительно ждёт человека.
+
+    Про мерж фабрике никто не сообщает — вебхук ей слушать негде, — поэтому
+    состояние PR она спрашивает сама, раз в прогон, и только по карточкам из колонок
+    ревью: один вызов `gh` на карточку, агента здесь нет вовсе.
+
+    Идёт первой в прогоне, до ревьювера: смерженный PR он иначе отревьюит заново
+    за отдельные деньги.
+
+    Ночное окно этой фазе не указ: тег `claude:night` придуман для тяжёлых прогонов
+    агента, а передвинуть карточку не дороже, чем её прочитать.
+    """
+    note_phase(args, "смотрю, что смержено")
+    moved = 0
+    for profile in profiles:
+        done = role_column(profile, "done")
+        if not done:
+            log(f"в «{profile['key']}» нет колонки «Готово» — мерж не смотрю")
+            continue
+        # роли могут делить колонку: обходим каждую по одному разу
+        columns = [c for c in dict.fromkeys(role_column(profile, role)
+                                            for role in MERGE_ROLES) if c]
+        for column in columns:
+            for card in kaiten.cards_in_column(profile["board_id"], column):
+                try:
+                    if close_if_merged(kaiten, cfg, profile, card, done):
+                        moved += 1
+                except Exception as e:  # noqa: BLE001 — одна карточка не роняет фазу
+                    log(f"#{card['id']} мерж не проверился: {e}")
+    log(f"смержено и закрыто карточек: {moved}" if moved else "новых мержей нет")
+    # фазу за собой убираем: с --only-merged прогон на этом и кончается, а в трее
+    # иначе навсегда останется «смотрю, что смержено»
+    note_phase(args, None)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # ревьювер
 # --------------------------------------------------------------------------- #
 
@@ -5033,6 +5213,10 @@ def main() -> int:
                         help="показать промпт и выйти: агент не запускается, карточка не двигается")
     parser.add_argument("--link-review", action="store_true",
                         help="привязать все карточки из «На ревью» к долгу спринта и выйти")
+    parser.add_argument("--only-merged", action="store_true",
+                        help="только фаза мержа: закрыть карточки со смерженным PR и выйти")
+    parser.add_argument("--no-merged", action="store_true",
+                        help="не проверять, что смержено")
     parser.add_argument("--only-review", action="store_true",
                         help="только фаза ревью: пройти «Ревью агента» и выйти")
     parser.add_argument("--only-work", action="store_true",
@@ -5148,10 +5332,21 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         return time_channels(cfg, args)
     if args.time_announce:
         return time_announce(kaiten, cfg, args, args.time_announce)
+    if args.only_merged:
+        return close_merged(kaiten, cfg, args, profiles)
     if args.only_time:
         return follow_time_threads(kaiten, cfg, args, profiles)
 
-    # Треды в Time — раньше всего: это дешёвый запрос без агента, а карточка после него
+    # Мерж — первым: он дешёвый (один `gh` на карточку, агента нет) и убирает с доски
+    # то, что уже влито. Перед тредами в Time намеренно: карточка уезжает в «Готово»,
+    # и строка статуса в канале снимается тем же прогоном, а не следующим.
+    if not (args.card or args.only_review or args.only_work or args.no_merged):
+        try:
+            close_merged(kaiten, cfg, args, profiles)
+        except Exception as e:  # noqa: BLE001 — GitHub не должен ронять поток
+            log(f"проверка мержа не задалась: {e}")
+
+    # Треды в Time — до агентов: это дешёвый запрос без агента, а карточка после него
     # уезжает в «Правки», и работа в этом же прогоне её подхватит.
     if not (args.card or args.no_time):
         try:

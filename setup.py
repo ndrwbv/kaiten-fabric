@@ -64,7 +64,7 @@ COLUMN_ROLES = [
     ("agent_review", "Ревью агента",     2, "сюда уезжает готовый PR, отсюда его берёт ревьювер"),
     ("fixes",        "Правки",           2, "ревьювер вернул замечания"),
     ("review",       "На ревью",         2, "ревью пройдено, дальше смотрит человек"),
-    ("done",         "Готово",           3, "фабрика сюда ничего не двигает"),
+    ("done",         "Готово",           3, "сюда карточка уезжает, когда её PR смержен"),
 ]
 
 # Синонимы для угадывания роли по названию уже существующей колонки. Список короткий
@@ -685,6 +685,8 @@ def step_epic_flow(kaiten: Kaiten, space_id: int, repo_name: str) -> dict | None
         column_id = columns_map.get(role)
         if column_id:
             ok(f"{role:<13} → «{by_id.get(column_id, column_id)}»  \033[2m{purpose}\033[0m")
+        elif role == "done":
+            hint(f"    {role:<13} не задана — карточки со смерженным PR останутся в ревью")
         else:
             hint(f"    {role:<13} не задана — обойдёмся блокером")
 
@@ -896,6 +898,8 @@ def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
             if role in ("queue", "in_progress", "agent_review"):
                 bad(f"сабтаски: роль {role} ({name}) обязательна, но не указана")
                 problems += 1
+            elif role == "done":
+                hint("    done: не указана — карточки со смерженным PR останутся в ревью")
             else:
                 hint(f"    {role}: не указана — фабрика обойдётся блокером")
             continue
