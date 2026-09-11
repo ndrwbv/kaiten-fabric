@@ -220,10 +220,16 @@ check("сообщение переписано", len(edits) == 1, str(GOT))
 check("правкой, а не PATCH", edits[0][1].endswith("/posts/root/patch"), edits[0][1])
 edited = json.loads(edits[0][2])["message"]
 check("статус последней строкой по-человечески",
-      edited.splitlines()[-1] == "_пацанчики, позырьте плз_", edited)
+      edited.splitlines()[-1] == "пацанчики, позырьте плз", edited)
+check("и без курсива", "_" not in edited.splitlines()[-1], edited)
 check("текст сообщения не потерян", edited.startswith("[PR](u) Убрал lowercase."))
 check("статус запомнен", json.loads(f.TIME_STATE_FILE.read_text())
       ["threads"]["555"]["status"] == "пацанчики, позырьте плз")
+
+check("старый курсивный статус узнаётся как статус",
+      f.is_status_line("_пацанчики, позырьте плз_")
+      and f.is_status_line("пацанчики, позырьте плз")
+      and not f.is_status_line("[Карточка](k)"))
 
 print("=== 10. тот же статус второй раз не переписывается ===")
 GOT.clear()
@@ -260,7 +266,7 @@ check("один вопрос — одной строкой",
       f.thread_asks(["❓ Включать для Польши?"]))
 edited = json.loads([g for g in GOT if g[0] == "PUT"][-1][2])["message"]
 check("статус говорит про вопросы",
-      edited.splitlines()[-1] == "_пацанчики, позырьте плз, есть вопросики_", edited)
+      edited.splitlines()[-1] == "пацанчики, позырьте плз, есть вопросики", edited)
 GOT.clear()
 f.follow_time_threads(asking, cfg, Args(), profiles)
 check("те же вопросы второй раз не пишутся",
@@ -277,7 +283,10 @@ f.follow_time_threads(asker, cfg, Args(), profiles)
 replies = [json.loads(g[2])["message"] for g in GOT
            if g[0] == "POST" and g[1].endswith("/posts")]
 check("ответил в тред", any("Сейчас:" in r for r in replies), str(replies))
-check("сказал, где карточка", any("на ревью у человека" in r for r in replies), str(replies))
+check("сказал, где карточка", any("жду вашего ревью" in r for r in replies), str(replies))
+check("и от первого лица, без ревьюверов и агентов",
+      not any(word in r for r in replies for word in ("агент", "ревьювер", "фабрик")),
+      str(replies))
 check("в карточку вопрос не тащил", asker.comments_written == [],
       str(asker.comments_written))
 check("карточку не двигал", asker.moves == [], str(asker.moves))
@@ -379,6 +388,84 @@ finally:
     f.DRY_RUN = False
 f.note_triage_fail({"cards": {}}, 555, "агент упал", 2)
 check("а в настоящем прогоне пишется", f.TRIAGE_STATE_FILE.is_file())
+
+print("=== 19. вопрос по задаче — это не постановка ===")
+check("«как дела» — про статус", f.thread_intent("как дела?") == "status")
+check("«поправь» — постановка", f.thread_intent("поправь заголовок") == "task")
+check("«как дела и поправь» — постановка",
+      f.thread_intent("как дела? и поправь заголовок") == "task")
+check("вопрос по существу — вопрос",
+      f.thread_intent("а на каком экране ты это воспроизводил?") == "question")
+check("вопрос с «проверял» не путается с «проверь»",
+      f.thread_intent("а ты проверял на большом экране?") == "question")
+check("утверждение без вопроса — постановка",
+      f.thread_intent("на большом экране плашка всё ещё едет") == "task")
+
+f.load_env = lambda: env
+QUESTION[0] = "@fabrica а на каком экране ты это воспроизводил?"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+asked = FakeKaiten()
+f.follow_time_threads(asked, cfg, Args(), profiles)
+text = asked.comments_written[0][1]
+check("вопрос перенесён в карточку", len(asked.comments_written) == 1, str(asked.comments_written))
+check("и помечен вопросом, а не постановкой", "Вопрос из треда" in text, text)
+check("агенту сказано отвечать словами", "ответь на него своими словами" in text, text)
+check("карточку всё же взяли в работу", asked.moves == [(555, 106)], str(asked.moves))
+replies = [json.loads(g[2])["message"] for g in GOT
+           if g[0] == "POST" and g[1].endswith("/posts")]
+check("в треде обещали ответить, а не поправить",
+      any("схожу посмотрю и отвечу" in r for r in replies), str(replies))
+check("и не сказали «взял в правки»",
+      not any("взял в правки" in r for r in replies), str(replies))
+check("в состоянии помечено, что круг отвечает на вопрос",
+      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["answering"] is True)
+
+print("=== 20. итог такого круга — ответ, а не «поправил» ===")
+GOT.clear()
+f.notify_pr(cfg, "kiosk", card, "https://kaiten/card/555",
+            "https://github.com/o/r/pull/7",
+            {"summary": "Воспроизводится на iPad 1024×1366, на большом экране плашки нет."},
+            False, updated=True, env=env)
+answer = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")][-1][2])
+check("ушло в тот же тред", answer.get("root_id") == "root", str(answer))
+check("это ответ, без слова «поправил»",
+      answer["message"] == "Воспроизводится на iPad 1024×1366, на большом экране плашки нет.",
+      answer["message"])
+saved = json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]
+check("пометка снята", saved["answering"] is False, str(saved))
+check("а круг правки записан", saved["fixed"] is True, str(saved))
+
+print("=== 21. вторая пачка вопросов — это круг после правки ===")
+check("в первый раз — просто вопросы",
+      f.thread_asks(["❓ А где макет?"]) == "Есть вопрос: А где макет?")
+check("во второй — с оговоркой про правку",
+      f.thread_asks(["❓ А где макет?"], again=True).startswith("Перечитал ещё раз после правки"),
+      f.thread_asks(["❓ А где макет?"], again=True))
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply", "fixed": True,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+QUESTION[0] = "коллеги, а кто посмотрит?"
+GOT.clear()
+again = FakeKaiten()
+again.asks = ["Правка меняет отступ только на малом экране", "На каком киоске видели?"]
+f.follow_time_threads(again, cfg, Args(), profiles)
+posted = [json.loads(g[2])["message"] for g in GOT
+          if g[0] == "POST" and g[1].endswith("/posts")]
+check("вопросы объяснены кругом ревью",
+      any(m.startswith("Перечитал ещё раз после правки") for m in posted), str(posted))
+
+print("=== 22. «проверок не запускал» вопросом не считается ===")
+report = ("🤖 **Готово, нужен ревью.**\n\nPR: https://pr/1\n\n"
+          "Опустил контент экрана с ETA под плашку додокоинов.\n\n"
+          "**Проверок я не запускал** — ни тестов, ни линтера. "
+          "Смотреть этот PR стоит внимательнее обычного.\n\n"
+          "**Что нужно уточнить**\n- На каком киоске видели съехавшую плашку?")
+check("в тред уезжает только настоящий вопрос",
+      f.open_questions([{"text": report}]) == ["На каком киоске видели съехавшую плашку?"],
+      str(f.open_questions([{"text": report}])))
 
 srv.shutdown()
 print("\nвсё сошлось")

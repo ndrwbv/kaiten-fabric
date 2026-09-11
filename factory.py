@@ -733,7 +733,7 @@ TIME_STATUSES = {
     "fixes": "пацаны, пока не смотрите, сыровато",
     "review": "пацанчики, позырьте плз",
     "question": "пацанчики, позырьте плз, есть вопросики",
-    "failed": "сломалось, нужен человек",
+    "failed": "у меня тут упало, нужна помощь",
     "done": "",
 }
 
@@ -741,28 +741,68 @@ TIME_STATUSES = {
 # а строка в канале объясняет, зачем туда идти.
 TIME_STATUS_ASKED = "пацанчики, позырьте плз, есть вопросики"
 
+# Все статусы разом — чтобы узнать свою же строку в сообщении, прочитанном из Time.
+TIME_STATUS_LINES = frozenset(s for s in [*TIME_STATUSES.values(), TIME_STATUS_ASKED] if s)
+
 # То же самое, но обычными словами: статус-фраза хороша в конце сообщения и плохо
 # читается внутри предложения, а на вопрос «как дела» отвечать надо предложением.
+# Всё от первого лица: в треде с человеком говорит разработчик, а не пульт управления
+# фабрикой. Под капотом исполнитель и ревьювер — разные агенты, но в канале это
+# подробности устройства, и «ждёт ревьювера» из разговора выпадает.
 TIME_PLAIN_STATUSES = {
-    "queue": "в очереди",
+    "queue": "ещё не брался, задача в очереди",
     "in_progress": "в работе, пишу код",
-    "agent_review": "ждёт ревьювера",
-    "fixes": "правлю по замечаниям ревью",
-    "review": "на ревью у человека",
+    "agent_review": "дописал, перечитываю за собой",
+    "fixes": "правлю по замечаниям",
+    "review": "жду вашего ревью",
     "question": "жду ответа на вопросы",
-    "failed": "упало, нужен человек",
+    "failed": "сломался на этой задаче, нужна помощь",
     "done": "готово",
 }
 
-# По этим словам сообщение в треде считается вопросом «что там с задачей», а не
-# постановкой правки. Список короткий и намеренно грубый: ошибиться в другую сторону
-# дороже — правка, принятая за вопрос, потерялась бы молча.
-TIME_ASK_WORDS = ("как дела", "что там", "как продвигается", "как успехи", "статус",
-                  "на каком этапе", "что по задаче", "есть новости", "ну как")
+# По этим словам короткое сообщение в треде считается вопросом «что там с задачей»:
+# на такое отвечаем из карточки и агента не зовём. Список намеренно грубый — ошибка
+# здесь стоит дорого: спросят «как дела», а мы потратим на это настоящий прогон.
+TIME_STATUS_WORDS = ("как дела", "что там", "как продвигается", "как успехи", "статус",
+                     "на каком этапе", "что по задаче", "есть новости", "ну как",
+                     "как оно", "что нового", "долго ещё", "когда будет")
 
-# Сообщение длиннее этого вопросом не считается, даже если начинается с «как дела»:
-# в «как дела? и поправь ещё заголовок» главное — вторая половина.
-TIME_ASK_LIMIT = 80
+# Сообщение длиннее этого вопросом о статусе не считается, даже если начинается
+# с «как дела»: в «как дела? и поправь ещё заголовок» главное — вторая половина.
+TIME_STATUS_LIMIT = 80
+
+# Слова, по которым сообщение считается постановкой, а не вопросом. Не весь русский
+# императив, а то, чем в треде правда просят. Сравниваем по целым словам: в «а ты
+# проверял на большом экране?» есть «провер», но нет «проверь», и это разные вещи.
+TIME_TASK_WORDS = frozenset("""
+    поправь поправьте правь исправь почини сделай сделайте переделай перепиши
+    добавь допиши дополни убери удали верни замени перенеси подвинь опусти подними
+    уменьши увеличь поменяй смени обнови откати закрой разбери разберись выровняй
+    проверь попробуй посмотри посмотрите глянь гляньте уточни оставь
+    надо нужно давай
+""".split())
+
+
+def times(count: int) -> str:
+    """«один раз», «2 раза», «5 раз» — чтобы ответ в треде не косноязычил."""
+    if count == 1:
+        return "один раз"
+    tail = "раза" if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14) else "раз"
+    return f"{count} {tail}"
+
+
+def is_status_line(line: str) -> bool:
+    """
+    Последняя строка сообщения — это статус, который мы сами же и дописали?
+
+    Нужно там, где сообщение читается из Time, а не из своего состояния: снять старый
+    статус, чтобы не приписать к нему новый. Курсив учитываем ради сообщений, висящих
+    в канале с тех пор, когда статус писался курсивом.
+    """
+    line = line.strip()
+    if len(line) > 2 and line.startswith("_") and line.endswith("_"):
+        line = line[1:-1].strip()
+    return line in TIME_STATUS_LINES
 
 
 def strip_mention(text: str, handle: str) -> str:
@@ -772,11 +812,27 @@ def strip_mention(text: str, handle: str) -> str:
     return re.sub(rf"(?i){re.escape(handle)}[:,]?\s*", "", text).strip()
 
 
-def looks_like_question(text: str) -> bool:
-    if len(text.strip()) > TIME_ASK_LIMIT:
-        return False
-    low = normalize_phrase(text)
-    return any(word in low for word in TIME_ASK_WORDS)
+def thread_intent(text: str) -> str:
+    """
+    Чего от нас хотят сообщением в треде: `status`, `question` или `task`.
+
+    `status` — «как дела»: отвечаем из карточки и агента не зовём. Спросить в треде
+    «что там» стоит человеку одну строку, а прогон агента — минуты и деньги.
+
+    `question` — вопрос по самой задаче: «а на каком экране смотрел?». Ответить
+    на такое можно только заглянув в код, поэтому круг мы всё-таки заводим, но
+    просим ответить словами, а не искать, что бы поправить.
+
+    `task` — всё остальное, и сюда же уходит спорное: правка, принятая за вопрос,
+    потерялась бы молча, а лишний вопрос агент просто разберёт вместе с задачей.
+    """
+    body = text.strip()
+    low = normalize_phrase(body)
+    if set(low.split()) & TIME_TASK_WORDS:
+        return "task"
+    if len(body) <= TIME_STATUS_LIMIT and any(w in low for w in TIME_STATUS_WORDS):
+        return "status"
+    return "question" if "?" in body else "task"
 
 
 def time_status_answer(profile: dict | None, card: dict, comments: list,
@@ -785,8 +841,8 @@ def time_status_answer(profile: dict | None, card: dict, comments: list,
     Ответ на «как дела» — из карточки, без запуска агента.
 
     Спросить в треде «что там» стоит человеку одну строку, а прогон агента — минуты
-    и деньги. Всё, что нужно для ответа, и так лежит в Kaiten: колонка, число кругов
-    ревью и заголовок последнего отчёта.
+    и деньги. Всё, что нужно для ответа, и так лежит в Kaiten: колонка, сколько раз
+    переделывали и заголовок последнего отчёта.
     """
     role, _ = time_status(profile, card, asks)
     where = TIME_PLAIN_STATUSES.get(role, "не пойму, где карточка")
@@ -795,7 +851,7 @@ def time_status_answer(profile: dict | None, card: dict, comments: list,
     rounds = sum(1 for comment in comments
                  if strip_html(comment.get("text", "")).startswith(REVIEWER_MARK))
     if rounds:
-        lines.append(f"Кругов ревью: {rounds}.")
+        lines.append(f"Переделывал по замечаниям {times(rounds)}.")
 
     # заголовок последнего отчёта — первая строка агентского комментария без разметки
     headline = ""
@@ -1163,9 +1219,20 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         if updated:
             if not known.get("root_id"):
                 return  # корня нет — отвечать некуда, а новым сообщением шуметь незачем
-            summary = brief(verdict.get("summary") or "") or "без описания"
-            client.post(known.get("channel_id", ""), f"Поправил: {summary}",
-                        root_id=known["root_id"])
+            summary = brief(verdict.get("summary") or "")
+            if known.get("answering"):
+                # Круг завели вопросом из треда — там ждут ответа, а не отчёта
+                # о правке. «Поправил: смотрел на iPad» было бы ответом не на то.
+                text = summary or "Посмотрел, ответ — в карточке."
+            else:
+                text = f"Поправил: {summary or 'без описания'}"
+            client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
+            # Круг закончился — вопрос отвечен, а следующая пачка вопросов по этому
+            # треду будет уже «после правки», и сказать об этом придётся вслух.
+            known["answering"] = False
+            known["fixed"] = True
+            state.setdefault("threads", {})[str(card["id"])] = known
+            save_time_state(state)
             log("  написал в тред Time про правку")
             return
         channel = time_channel(conf, repo_key)
@@ -1205,10 +1272,16 @@ def time_status(profile: dict | None, card: dict, asks: list) -> tuple[str, str]
 
 
 def with_status(base: str, status: str) -> str:
-    return f"{base}\n_{status}_" if status else base
+    """
+    Статус — последняя строка сообщения, обычным текстом.
+
+    Курсивом он был раньше и читался как сноска от машины, а это такая же реплика
+    человека в канал, как и всё остальное в сообщении.
+    """
+    return f"{base}\n{status}" if status else base
 
 
-def thread_asks(asks: list[str]) -> str:
+def thread_asks(asks: list[str], again: bool = False) -> str:
     """
     Вопросы для треда — так, как их написал бы человек.
 
@@ -1216,13 +1289,19 @@ def thread_asks(asks: list[str]) -> str:
     короткое сообщение живому человеку, и «❓ ⚠️» в начале строки только сбивает:
     непонятно, вопрос это или предупреждение. Один вопрос — одна строка, несколько —
     список: перечисление из одной строки в мессенджере не читается.
+
+    `again` — вопросы уже второй раз за тот же тред, то есть это круг после правки.
+    Без этой оговорки вторая пачка выглядит дико: час назад отчитались «поправил»,
+    а теперь снова «есть вопросы», и человек не понимает, откуда они взялись.
     """
     clean = [ask for ask in (ASK_MARK_RE.sub("", a).strip() for a in asks) if ask]
     if not clean:
         return ""
+    after_fix = "Перечитал ещё раз после правки, и вот что вылезло" if again else ""
     if len(clean) == 1:
-        return f"Есть вопрос: {clean[0]}"
-    return "Есть следующие вопросы:\n" + "\n".join(f"- {ask}" for ask in clean)
+        return f"{after_fix or 'Есть вопрос'}: {clean[0]}"
+    return (f"{after_fix or 'Есть следующие вопросы'}:\n"
+            + "\n".join(f"- {ask}" for ask in clean))
 
 
 def thread_base(client: Time, info: dict) -> str:
@@ -1230,26 +1309,36 @@ def thread_base(client: Time, info: dict) -> str:
     Текст сообщения без строки статуса.
 
     Обычно он запомнен при отправке. Для тредов, созданных до появления статуса, читаем
-    сообщение из Time и отрезаем последнюю строку, если она курсивом — это и есть статус.
+    сообщение из Time и отрезаем последнюю строку, если она и есть статус. Курсив тут
+    же и проверяется: статус писался им до того, как перестал, и такие сообщения в
+    канале ещё висят.
     """
     if info.get("base"):
         return info["base"]
     post = client.post_by_id(info.get("root_id", ""))
     lines = (post.get("message") or "").splitlines()
-    if len(lines) > 1 and lines[-1].startswith("_") and lines[-1].endswith("_"):
+    if len(lines) > 1 and is_status_line(lines[-1]):
         lines = lines[:-1]
     return "\n".join(lines)
 
 
-def from_thread_comment(author: str, text: str) -> str:
+def from_thread_comment(author: str, text: str, question: bool = False) -> str:
     """
     Комментарий в карточку из треда.
 
     Метка FROM_TIME_MARK, а не AGENT_MARK: это слова человека, и вся машина — «ответили
     ли на вопрос», «чей ход», стоп-фраза — должна считать их человеческими. Иначе ответ
     в треде выглядел бы для фабрики её собственной репликой и ничего не двигал.
+
+    `question` — в треде спросили, а не поставили задачу. Без этой пометки агент идёт
+    искать, что бы поправить, и правит на всякий случай то, о чём его просто спросили.
     """
-    return f"{FROM_TIME_MARK} **Из треда в Time** ({author}):\n\n{text}"
+    head = "Вопрос из треда в Time" if question else "Из треда в Time"
+    text = f"{FROM_TIME_MARK} **{head}** ({author}):\n\n{text}"
+    if question:
+        text += ("\n\nЭто вопрос, а не постановка: ответь на него своими словами "
+                 "в отчёте. Код меняй, только если из ответа прямо следует правка.")
+    return text
 
 
 def profile_for_board(profiles: list[dict], board_id: int) -> dict | None:
@@ -1325,7 +1414,9 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
         if asks and time_wants(conf, "asked") and role in ("review", "question"):
             asked = "\n".join(asks)
-            text = thread_asks(asks)
+            # Вторая пачка вопросов по тому же треду — это круг после правки, и без
+            # оговорки она выглядит дико: час назад тут отчитались «поправил».
+            text = thread_asks(asks, again=bool(info.get("fixed") or info.get("asked")))
             if text and info.get("asked") != asked:
                 try:
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
@@ -1413,11 +1504,11 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             save_time_state(state)
             continue
 
-        # «Как дела» — это вопрос, а не задача: отвечаем из карточки и ничего не двигаем.
-        # Иначе такой вопрос уезжал бы правкой, и следующий прогон тратил бы на него
-        # настоящего агента.
-        questions = [pair for pair in addressed if looks_like_question(pair[1])]
-        if questions:
+        # «Как дела» — это вопрос, а не задача: отвечаем из карточки и ничего
+        # не двигаем. Иначе такой вопрос уезжал бы правкой, и следующий прогон тратил
+        # бы на него настоящего агента.
+        kinds = [(post, text, thread_intent(text)) for post, text in addressed]
+        if any(kind == "status" for _, _, kind in kinds):
             try:
                 client.post(info.get("channel_id", ""),
                             time_status_answer(profile, card, comments, asks),
@@ -1425,18 +1516,25 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 log(f"  #{card_key}: ответил в тред, что с задачей")
             except FactoryError as e:
                 log(f"  !! не смог ответить в тред по #{card_key}: {e}")
-        tasks = [pair for pair in addressed if pair not in questions and pair[1]]
-        if not tasks:
+
+        # Вопрос по самой задаче круг всё-таки заводит: ответить на «а на каком экране
+        # смотрел» можно только заглянув в код. Но в карточке он помечается вопросом,
+        # иначе агент пойдёт искать, что бы поправить, и поправит на всякий случай.
+        work = [triple for triple in kinds if triple[2] != "status" and triple[1]]
+        if not work:
             save_time_state(state)
             continue
+        only_asked = all(kind == "question" for _, _, kind in work)
 
-        for post, text in tasks:
+        for post, text, kind in work:
             user = names.get(post.get("user_id"), {})
             author = (user.get("nickname") or user.get("username")
                       or user.get("first_name") or "кто-то в Time")
-            kaiten.comment(card["id"], from_thread_comment(author, text))
-        log(f"  #{card_key}: перенёс из треда {len(tasks)} "
-            f"{'сообщение' if len(tasks) == 1 else 'сообщений'}")
+            kaiten.comment(card["id"], from_thread_comment(author, text,
+                                                           question=kind == "question"))
+        log(f"  #{card_key}: перенёс из треда {len(work)} "
+            f"{'сообщение' if len(work) == 1 else 'сообщений'}"
+            + (" (это вопрос)" if only_asked else ""))
 
         moved += 1
         stuck = blocked_by(kaiten, card["id"])
@@ -1446,6 +1544,11 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         stay = ([role_column(profile, role) for role in ACTIVE_ROLES]
                 + [role_column(profile, "question")]) if profile else []
 
+        # По итогам круга отчитаться надо ответом, а не словом «поправил». Ставим
+        # до развилки: круг случится и у заблокированной карточки — когда человек
+        # снимет блокер, — и у той, что уже стоит в рабочей колонке.
+        info["answering"] = only_asked
+
         if stuck:
             # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
             log(f"  #{card_key} заблокирована ({stuck}) — комментарий записал, "
@@ -1453,10 +1556,12 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
                      "его снимает человек.")
         elif not target or card.get("column_id") in stay:
-            reply = "Записал в карточку, дальше по обычному кругу."
+            reply = ("Вопрос записал, отвечу на следующем круге." if only_asked
+                     else "Записал в карточку, дальше по обычному кругу.")
         else:
             kaiten.move(card["id"], target)
-            reply = "Записал в карточку и взял в правки."
+            reply = ("Понял вопрос, схожу посмотрю и отвечу." if only_asked
+                     else "Записал в карточку и взял в правки.")
 
         if time_wants(conf, "fix_taken"):
             try:
@@ -3314,7 +3419,7 @@ def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
     text += full_summary(review)
     text += format_findings(review.get("findings"))
     if needs_changes:
-        text += "\n\nОтправляю в «Правки», исполнитель поправит и вернёт на ревью."
+        text += "\n\nЗабираю в «Правки»: поправлю и вернусь с обновлённым PR."
     if format_meta(meta):
         text += f"\n\n_Ревьювер: {format_meta(meta)}._"
     return text
@@ -3731,7 +3836,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
                 verdict["status"] = "unclear"
                 verdict.setdefault("questions", [])
                 verdict["summary"] = (
-                    "Агент не внёс изменений и не объяснил почему.\n\n"
+                    "Ничего не поменял и сам не объяснил почему.\n\n"
                     + verdict.get("summary", "")
                 )
             kaiten.comment(card_id, comment_question(verdict, meta))
@@ -3775,11 +3880,15 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             post_pr_review(worktree, pr_url, MOCK_BACKEND_NOTE)
 
         text = comment_success(verdict, meta, pr_url, branch)
+        # Обе приписки — без значка в начале строки. Со значком они выглядели для
+        # open_questions пунктом списка, и «не отчитался о проверках» уезжало человеку
+        # в тред наравне с вопросами, хотя вопросом никогда не было.
         if dirty:
-            text += "\n\n⚠️ В рабочей копии остались незакоммиченные изменения — они не в PR."
+            text += ("\n\n**В рабочей копии остались незакоммиченные изменения** — "
+                     "в PR они не поехали.")
         if not (verdict.get("checks") or []):
-            text += ("\n\n⚠️ Агент не отчитался ни об одной запущенной проверке — "
-                     "ревьюверу и человеку стоит смотреть внимательнее.")
+            text += ("\n\n**Проверок я не запускал** — ни тестов, ни линтера. "
+                     "Смотреть этот PR стоит внимательнее обычного.")
         text += epic_note
         kaiten.comment(card_id, text)
         report_to_inbox(kaiten, card, pr_url)
