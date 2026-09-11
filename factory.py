@@ -1555,6 +1555,13 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                 f"карточку не двигаю")
             reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
                      "его снимает человек.")
+        elif outside_flow(profile, card):
+            # карточку увели в «Тестинг» или «Ролаут» — тащить её оттуда назад
+            # в работу нельзя, даже если в треде попросили правку
+            log(f"  #{card_key} стоит вне колонок фабрики — комментарий записал, "
+                f"карточку не двигаю")
+            reply = ("Записал в карточку. Двигать не стал: она уже не в моих "
+                     "колонках — верни её в работу, если правку надо сделать.")
         elif not target or card.get("column_id") in stay:
             reply = ("Вопрос записал, отвечу на следующем круге." if only_asked
                      else "Записал в карточку, дальше по обычному кругу.")
@@ -1793,6 +1800,25 @@ def board_profiles(cfg: dict) -> list[dict]:
 
 def role_column(profile: dict, role: str) -> int | None:
     return profile["columns"].get(role)
+
+
+def outside_flow(profile: dict | None, card: dict) -> bool:
+    """
+    Карточка стоит в колонке, у которой нет ни одной роли фабрики?
+
+    Значит её увёл человек — в «Тестинг», в «Ролаут», в свою колонку, — и дальше
+    он ведёт её сам. Вытащить её оттуда назад в работу фабрика не имеет права
+    никогда: это откат чужого решения, а не её круг.
+
+    Внутри своих колонок она ходит как угодно, в том числе влево: «Правки» →
+    «В работе» и «Вопрос» → «В работе» — обычные переходы её потока, и запрещать
+    движение назад вообще нельзя, иначе круг правок встанет.
+
+    Эпикам это правило выражено по-другому, окном колонок: у них своя доска,
+    ролей на ней нет, и «своё» там — `ready_column_id` и `development_column_id`.
+    """
+    columns = {column for column in (profile or {}).get("columns", {}).values() if column}
+    return bool(columns) and card.get("column_id") not in columns
 
 
 def needs_blocker(profile: dict, role: str) -> bool:
@@ -2809,9 +2835,17 @@ def ensure_debt_card(kaiten: Kaiten, epic: dict, dry_run: bool) -> dict:
         if is_debt_card(candidate.get("title", ""), label, epic["title_prefix"]):
             log(f"  карточка долга: #{candidate['id']} «{candidate['title']}»")
             if epic.get("keep_in_development") and candidate.get("column_id") != dev_column:
-                # только колонка: state эпика не трогаем
-                log("  двигаю карточку долга в Development")
-                kaiten.move(candidate["id"], dev_column)
+                # только колонка: state эпика не трогаем. И только вперёд: карточку
+                # долга человек может увезти дальше сам, и возвращать её назад —
+                # ровно тот откат чужого решения, которого фабрика не делает
+                order = column_order(kaiten, epic["board_id"])
+                here = candidate.get("column_id")
+                if here in order and dev_column in order \
+                        and order.index(here) > order.index(dev_column):
+                    log("  карточка долга уже правее Development — назад не двигаю")
+                else:
+                    log("  двигаю карточку долга в Development")
+                    kaiten.move(candidate["id"], dev_column)
             if not dry_run:
                 fill_required_properties(kaiten, epic, candidate)
             return candidate
@@ -3692,6 +3726,14 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     wait = off_hours(card, cfg)
     if wait:
         log(f"#{card_id} откладываю: {wait}")
+        return
+    # Своим выборкам это правило не нужно — они и так читают только колонки потока.
+    # Нужно оно для `--card`: пальцем можно показать на любую карточку, в том числе
+    # на ту, что человек увёл в «Ролаут» или уже закрыл, а первым делом здесь идёт
+    # move в «В работе» — то есть откат чужого решения.
+    if outside_flow(profile, card) or card.get("column_id") == cols.get("done"):
+        log(f"#{card_id} стоит там, откуда фабрика карточки не забирает — "
+            f"верни её в «Очередь», если надо переделать")
         return
     repo_key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()

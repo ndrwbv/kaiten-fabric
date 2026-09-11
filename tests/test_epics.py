@@ -1,5 +1,6 @@
 """
-Проверка границ, в которых фабрика трогает эпик.
+Границы, за которые фабрика не выходит: окно колонок у эпика и правило
+«карточку, которую увёл человек, назад не тащим».
 
 Kaiten здесь заглушка: доска с колонками как у настоящей — Backlog, Ready for
 Development, Development, Design review, Rollout, — и эпик, который по ней ездит.
@@ -127,5 +128,27 @@ check("прочитанная сабтаска найдена", [c["id"] for c i
 check("нечитаемая посчитана отдельно", unreadable == 1, str(unreadable))
 own, unreadable = f.epic_subtasks(Children(broken=0), 1, kids)
 check("когда всё читается — нечитаемых ноль", unreadable == 0 and len(own) == 2)
+
+print("=== 6. карточка вне колонок фабрики — не наша ===")
+# доска «сабтаски» как в жизни: у «Тестинга» и «Ролаута» роли нет, туда карточку
+# уводит человек, и вытаскивать её оттуда назад в работу нельзя никогда
+work = f.make_profile("сабтаски", {"board_id": 9100, "columns": {
+    "queue": 1, "in_progress": 2, "question": 2, "failed": 2,
+    "agent_review": 3, "fixes": 2, "review": 3, "done": 6}})
+for column, name, expected in ((1, "«Очередь»", False), (2, "«В работе»", False),
+                               (3, "«Ревью»", False), (6, "«Готово»", False),
+                               (4, "«Тестинг»", True), (5, "«Ролаут»", True)):
+    check(f"{name} — {'вне потока' if expected else 'в потоке'}",
+          f.outside_flow(work, {"column_id": column}) is expected)
+check("без профиля правило молчит, а не запрещает всё",
+      f.outside_flow(None, {"column_id": 4}) is False)
+
+print("=== 7. движение внутри потока назад остаётся разрешённым ===")
+# «Правки» и «Вопрос» стоят левее «Ревью агента», и круг правок обязан работать:
+# запрет «никогда не влево» сломал бы фабрику, а не починил
+check("«Правки» → «В работе» — свои колонки",
+      not f.outside_flow(work, {"column_id": work["columns"]["fixes"]}))
+check("«Вопрос» → «В работе» — тоже свои",
+      not f.outside_flow(work, {"column_id": work["columns"]["question"]}))
 
 print("\nвсё сошлось")

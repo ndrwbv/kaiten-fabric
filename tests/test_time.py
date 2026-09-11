@@ -457,7 +457,24 @@ posted = [json.loads(g[2])["message"] for g in GOT
 check("вопросы объяснены кругом ревью",
       any(m.startswith("Перечитал ещё раз после правки") for m in posted), str(posted))
 
-print("=== 22. «проверок не запускал» вопросом не считается ===")
+print("=== 22. карточку, увезённую из потока, тред не тащит назад ===")
+# 777 нет ни в одной роли профиля — это «Тестинг» или «Ролаут», куда её увёл человек
+QUESTION[0] = "@fabrica поправь ещё заголовок, он тоже в нижнем регистре"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+gone = FakeKaiten(); gone.column = 777
+f.follow_time_threads(gone, cfg, Args(), profiles)
+check("комментарий всё равно записан", len(gone.comments_written) == 1,
+      str(gone.comments_written))
+check("но карточку не двигали", gone.moves == [], str(gone.moves))
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("и в треде сказали почему",
+      any("не в моих колонках" in m for m in said), str(said))
+
+print("=== 23. «проверок не запускал» вопросом не считается ===")
 report = ("🤖 **Готово, нужен ревью.**\n\nPR: https://pr/1\n\n"
           "Опустил контент экрана с ETA под плашку додокоинов.\n\n"
           "**Проверок я не запускал** — ни тестов, ни линтера. "
