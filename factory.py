@@ -643,6 +643,14 @@ class Kaiten:
         """Тег добавляется по имени; с tag_id Kaiten отвечает 400."""
         self._write("POST", f"/cards/{card_id}/tags", {"name": name})
 
+    def remove_tag(self, card_id: int, tag_id: int) -> None:
+        """
+        Отвязать тег от карточки. В отличие от блокера, тег снимается по-настоящему
+        и мусора в общем списке тегов компании не оставляет — проверено на живой
+        карточке: после удаления `GET /tags` его больше не показывает.
+        """
+        self._write("DELETE", f"/cards/{card_id}/tags/{tag_id}")
+
     def blockers(self, card_id: int) -> list:
         """
         Только действующие блокеры.
@@ -701,6 +709,22 @@ def flat_columns(board: dict) -> list[dict]:
 
 def column_label(column: dict) -> str:
     return f"{column.get('path') or column.get('title')}  (id {column['id']})"
+
+
+def tag_id(card: dict, name: str) -> int | None:
+    """
+    id тега на карточке — чтобы его снять. None, если тега нет.
+
+    Берём `tag_id`, а не `id`: у Kaiten это одно и то же число, но `tag_id` — это
+    именно то, чего ждёт `DELETE /cards/{id}/tags/{tag_id}`, и полагаться лучше
+    на него.
+    """
+    wanted = normalize_phrase(name)
+    for tag in (card.get("tags") or []):
+        if normalize_phrase(tag.get("name")) == wanted:
+            found = tag.get("tag_id") or tag.get("id")
+            return int(found) if found else None
+    return None
 
 
 def has_tag(card: dict, name: str) -> bool:
@@ -5309,7 +5333,36 @@ def close_epic(kaiten: Kaiten, flow: dict, card: dict) -> str:
         return ""
     log(f"  все сабтаски отревьюены, двигаю эпик в колонку {target}")
     kaiten.move(card_id, target)
-    return f"{EPIC_MARK} **Все сабтаски отревьюены.** Эпик уехал на ревью."
+    return (f"{EPIC_MARK} **Все сабтаски отревьюены.** Эпик уехал на ревью."
+            + drop_work_tag(kaiten, flow, card))
+
+
+def drop_work_tag(kaiten: Kaiten, flow: dict, card: dict) -> str:
+    """
+    Снимает рабочий тег с закрытого эпика и возвращает строку для комментария.
+
+    Второй выключатель к окну колонок, и главный из двух. Колонка говорит «сейчас
+    не твой ход», а тег — «это вообще твоё»; пока он висел вечно, эпик, однажды
+    оказавшийся в колонке разработки, снова становился фабричным — неважно, как он
+    туда попал. Так ETA и вернулся в работу через полгода после раскатки.
+
+    Теперь «эпик уехал на ревью» значит «фабрика с ним закончила». Надо переделать —
+    повесь тег заново, это осознанное действие, а не побочный эффект уборки на доске.
+
+    Ошибку не поднимаем: эпик уже уехал, и не снявшийся тег этого не отменяет.
+    """
+    name = flow.get("tag") or "claude:epic"
+    found = tag_id(card, name)
+    if not found:
+        return ""
+    try:
+        kaiten.remove_tag(card["id"], found)
+    except Exception as e:  # noqa: BLE001 — эпик уже закрыт, тег не важнее
+        log(f"  !! тег «{name}» не снялся: {e}")
+        return (f"\n\nТег `{name}` снять не смог — сними руками, иначе эпик снова "
+                f"попадёт ко мне, если окажется в колонке разработки.")
+    log(f"  снял тег «{name}» — эпик больше не мой")
+    return f"\n\nТег `{name}` снял: дальше эпик твой. Надо переделать — повесь заново."
 
 
 def epic_card_url(kaiten: Kaiten, card: dict) -> str:

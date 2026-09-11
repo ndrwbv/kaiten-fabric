@@ -26,7 +26,7 @@ FLOW = {"tag": "claude:epic", "boards": [BOARD], "development_column_id": DEV,
 class FakeKaiten:
     """Доска эпиков: подколонки внутри «Delivery», как в настоящем Kaiten."""
     def __init__(self, cards=None):
-        self.moves, self.boards_read = [], 0
+        self.moves, self.boards_read, self.tags_removed = [], 0, []
         self.cards_ = cards or []
 
     def board(self, board_id):
@@ -50,11 +50,18 @@ class FakeKaiten:
     def move(self, card_id, column):
         self.moves.append((card_id, column))
 
+    def remove_tag(self, card_id, tag):
+        self.tags_removed.append((card_id, tag))
+
+
+TAG_ID = 1142106
+
 
 def epic(column, card_id=1, tagged=True):
     return {"id": card_id, "title": "Прогноз приготовления заказа", "board_id": BOARD,
             "column_id": column, "description": "",
-            "tags": [{"name": "claude:epic"}] if tagged else []}
+            "tags": [{"id": TAG_ID, "tag_id": TAG_ID, "name": "claude:epic"}]
+                    if tagged else []}
 
 
 def check(name, ok, detail=""):
@@ -150,5 +157,33 @@ check("«Правки» → «В работе» — свои колонки",
       not f.outside_flow(work, {"column_id": work["columns"]["fixes"]}))
 check("«Вопрос» → «В работе» — тоже свои",
       not f.outside_flow(work, {"column_id": work["columns"]["question"]}))
+
+print("=== 8. закрытый эпик перестаёт быть фабричным ===")
+check("id тега находится по имени", f.tag_id(epic(DEV), "claude:epic") == TAG_ID)
+check("чужого тега нет", f.tag_id(epic(DEV), "claude:night") is None)
+check("у карточки без тегов — тоже None", f.tag_id(epic(DEV, tagged=False), "claude:epic") is None)
+
+closing = FakeKaiten()
+note = f.close_epic(closing, FLOW, epic(DEV))
+check("эпик уехал на колонку правее", closing.moves == [(1, REVIEW)], str(closing.moves))
+check("и тег снят", closing.tags_removed == [(1, TAG_ID)], str(closing.tags_removed))
+check("в комментарии сказано про тег", "Тег `claude:epic` снял" in note, note)
+
+stayed = FakeKaiten()
+note = f.close_epic(stayed, FLOW, epic(ROLLOUT))
+check("эпик уже правее — не двигаем", stayed.moves == [], str(stayed.moves))
+check("и тег не трогаем: движения не было", stayed.tags_removed == [], str(stayed.tags_removed))
+check("и комментария нет", note == "", repr(note))
+
+
+class TagFails(FakeKaiten):
+    def remove_tag(self, card_id, tag):
+        raise f.FactoryError("403")
+
+
+broken = TagFails()
+note = f.close_epic(broken, FLOW, epic(DEV))
+check("тег не снялся — эпик всё равно уехал", broken.moves == [(1, REVIEW)], str(broken.moves))
+check("и человеку сказано снять руками", "сними руками" in note, note)
 
 print("\nвсё сошлось")
