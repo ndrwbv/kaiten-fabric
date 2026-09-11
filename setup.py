@@ -865,6 +865,17 @@ def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
             position = ids.index(int(development))
             titles = {int(c["id"]): c.get("path") for c in columns}
             ok(f"колонка разработки → «{titles[int(development)]}»")
+            # окно работы: откуда берём эпик. Правее разработки фабрика к эпику
+            # не подходит, поэтому человеку важно видеть обе границы разом
+            start = flow.get("ready_column_id")
+            if start:
+                ok(f"колонка «готов к разработке» → «{titles.get(int(start), start)}»")
+            elif position > 0:
+                ok(f"колонка «готов к разработке» (вычислена) → «{titles[ids[position - 1]]}»")
+            else:
+                bad("слева от колонки разработки колонок нет — "
+                    "укажи epic_flow.ready_column_id явно")
+                problems += 1
             target = flow.get("review_column_id")
             if target:
                 ok(f"колонка ревью эпика → «{titles.get(int(target), target)}»")

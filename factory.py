@@ -4434,6 +4434,7 @@ EPIC_PHASE_STATE = {
     "decompose": "спека принята, сабтасок нет",
     "working": "сабтаски в работе",
     "closing": "все сабтаски отревьюены",
+    "unreadable": "часть сабтасок не прочиталась",
 }
 
 # Что фабрика сделает следующим шагом. Это и есть «дальше», в отличие от положения выше.
@@ -4447,6 +4448,7 @@ EPIC_PHASE_NEXT = {
     "decompose": "разложит на сабтаски",
     "working": "ждёт, пока сабтаски пройдут ревью",
     "closing": "закроет эпик",
+    "unreadable": "подождёт до следующего прогона — Kaiten не отдал сабтаски",
 }
 
 # Формулировки нарочно безличные: фаза висит в трее и когда прогон не идёт, а
@@ -4461,6 +4463,7 @@ EPIC_PHASE_LABELS = {
     "decompose": "разложить на сабтаски",
     "working": "сабтаски в работе",
     "closing": "закрыть эпик",
+    "unreadable": "сабтаски не прочитались",
 }
 
 
@@ -4482,6 +4485,40 @@ def column_order(kaiten: Kaiten, board_id: int) -> list[int]:
     колонка; так их раскладывает flat_columns.
     """
     return [int(c["id"]) for c in flat_columns(kaiten.board(board_id))]
+
+
+def epic_window(kaiten: Kaiten, flow: dict, board_id: int) -> tuple[int, int]:
+    """
+    Колонки, в которых фабрике позволено трогать эпик: «готов к разработке»
+    и «в разработке». Ноль на месте любой — окна нет, эпики на этой доске не наши.
+
+    Правее разработки эпик уже не её дело: там его смотрит человек, катится
+    эксперимент, считается результат. Окна не было вовсе — эпик выбирался по одному
+    тегу, и `take_epic` тащил его из «Rollout» обратно в разработку. Один такой
+    возврат стоил $6.79: декомпозиция по второму кругу плюс прогон дубля-сабтаски.
+
+    Колонку «готов к разработке» можно задать явно (`ready_column_id`), иначе это
+    соседняя слева от разработки — так же, как колонка ревью берётся соседней справа.
+    """
+    dev = int(flow.get("development_column_id") or 0)
+    if not dev:
+        return 0, 0
+    ready = int(flow.get("ready_column_id") or 0)
+    if ready:
+        return ready, dev
+    order = column_order(kaiten, board_id)
+    if dev not in order:
+        return 0, 0
+    position = order.index(dev) - 1
+    return (order[position] if position >= 0 else 0), dev
+
+
+def in_epic_window(kaiten: Kaiten, flow: dict, card: dict,
+                   window: tuple[int, int] | None = None) -> bool:
+    """Стоит ли эпик там, где фабрика имеет право его трогать."""
+    ready, dev = window if window is not None else epic_window(
+        kaiten, flow, card.get("board_id"))
+    return card.get("column_id") in {column for column in (ready, dev) if column}
 
 
 def acceptance_items(card: dict) -> list[dict]:
@@ -4510,14 +4547,19 @@ def own_blocker(kaiten: Kaiten, card_id: int, kind: str) -> dict | None:
     return None
 
 
-def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> list:
+def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> tuple[list, int]:
     """
-    Только свои сабтаски: те, где в описании стоит «Из эпика: #<id>».
+    Свои сабтаски и число тех, которых не удалось прочитать.
 
-    У эпика могут висеть и карточки, подвешенные человеком. Если считать всех детей,
-    эпик не закроется никогда — человек про свою карточку просто забудет.
+    Свои — те, где в описании стоит «Из эпика: #<id>». У эпика могут висеть и карточки,
+    подвешенные человеком. Если считать всех детей, эпик не закроется никогда —
+    человек про свою карточку просто забудет.
+
+    Нечитаемых считаем отдельно, и это важнее, чем кажется: пока их молча считали
+    чужими, один оборванный ответ Kaiten («invalid continuation byte» на середине
+    карточки) превращался в «сабтасок нет» — эпик раскладывался заново и заводил дубль.
     """
-    own = []
+    own, unreadable = [], 0
     for child in children:
         description = strip_html(child.get("description")) or ""
         if not description and child.get("description_filled"):
@@ -4529,11 +4571,12 @@ def epic_subtasks(kaiten: Kaiten, epic_id: int, children: list) -> list:
                 description = strip_html((kaiten.card(child["id"]) or {}).get("description"))
             except Exception as e:  # noqa: BLE001 — одна недоступная карточка не повод падать
                 log(f"  не смог прочитать сабтаску #{child.get('id')}: {e}")
-                description = ""
+                unreadable += 1
+                continue
         match = EPIC_ORIGIN_RE.search(description or "")
         if match and int(match.group(1)) == epic_id:
             own.append(child)
-    return own
+    return own, unreadable
 
 
 def last_word_is_review(comments: list) -> bool:
@@ -4588,7 +4631,11 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
         return "spec_fix" if last_word_is_review(comments) else "spec_review"
 
     children = kaiten.children(card_id)
-    own = epic_subtasks(kaiten, card_id, children)
+    own, unreadable = epic_subtasks(kaiten, card_id, children)
+    if unreadable:
+        # «Не смог прочитать» — это «не знаю», а не «сабтаски нет». Иначе оборванный
+        # ответ Kaiten читается как пустая декомпозиция, и эпик раскладывается заново.
+        return "unreadable"
     if not own:
         return "decompose"
 
@@ -4613,12 +4660,26 @@ def subtask_profile(cfg: dict, flow: dict) -> dict:
 
 
 def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
-    """Карточки с рабочим тегом на перечисленных досках, у которых нет чужого блокера."""
+    """
+    Эпики, которыми фабрика имеет право заниматься.
+
+    Одного тега мало: он висит на карточке всю её жизнь, а работа фабрики кончается
+    на колонке разработки. Поэтому кроме тега и чужого блокера смотрим на колонку —
+    эпик берётся, только пока он в окне «готов к разработке» — «в разработке».
+    Дальше его ведёт человек, и трогать там нечего.
+    """
     tag = flow.get("tag") or "claude:epic"
-    found = []
+    found, outside = [], 0
     for board_id in flow["boards"]:
+        window = epic_window(kaiten, flow, int(board_id))
+        if not window[1]:
+            log(f"доска {board_id}: не пойму, где колонка разработки — эпики не трогаю")
+            continue
         for card in kaiten.cards_on_board(int(board_id), with_description=True):
             if not has_tag(card, tag):
+                continue
+            if not in_epic_window(kaiten, flow, card, window):
+                outside += 1
                 continue
             comments = kaiten.comments(card["id"])
             stop = hands_off(card, comments, cfg)
@@ -4626,6 +4687,8 @@ def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
                 log(f"#{card['id']} не трогаю: в карточке «{stop}»")
                 continue
             found.append(card)
+    if outside:
+        log(f"эпиков с тегом вне колонок фабрики: {outside} — они уже у человека")
     return skip_off_hours(found, cfg)
 
 
@@ -5157,12 +5220,23 @@ def open_questions(comments: list, limit: int = 4) -> list[str]:
 
 
 def take_epic(kaiten: Kaiten, flow: dict, card: dict) -> None:
-    """Взяли эпик в работу — двигаем в колонку разработки, если он не там."""
-    target = flow.get("development_column_id")
-    if not target or card.get("column_id") == target:
+    """
+    Взяли эпик в работу — двигаем в колонку разработки, если он не там.
+
+    Только вперёд. Назад фабрика эпик не тащит никогда: он ушёл правее — значит
+    его ведёт человек. Пока проверки не было, `take_epic` возвращал эпик из
+    «Rollout» в разработку, и всё начиналось по второму кругу.
+    """
+    target = int(flow.get("development_column_id") or 0)
+    here = card.get("column_id")
+    if not target or here == target:
+        return
+    order = column_order(kaiten, card["board_id"])
+    if here in order and target in order and order.index(here) > order.index(target):
+        log("  эпик уже правее разработки — назад не двигаю")
         return
     log("  двигаю эпик в колонку разработки")
-    kaiten.move(card["id"], int(target))
+    kaiten.move(card["id"], target)
 
 
 def close_epic(kaiten: Kaiten, flow: dict, card: dict) -> str:
@@ -5213,7 +5287,15 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
         return 0
 
     if only_card:
+        # Окно колонок держим и здесь: --epic-card обходит тег и выборку, но не право
+        # трогать чужую работу. Хочешь переделать уехавший эпик — верни его в колонку
+        # разработки руками, это одно движение мышкой.
         epics = [kaiten.card(only_card)]
+        if not in_epic_window(kaiten, flow, epics[0]):
+            ready, dev = epic_window(kaiten, flow, epics[0].get("board_id"))
+            log(f"#{only_card} стоит вне колонок фабрики (её дело — {ready} и {dev}) "
+                f"— не трогаю")
+            return 0
     else:
         epics = pick_epics(kaiten, cfg, flow)
         if not epics:
@@ -5249,6 +5331,13 @@ def run_epics(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> 
             mine = next((b for b in kaiten.blockers(card_id) if ours(b)), {})
             note_waiting(kaiten, card, str(mine.get("reason") or EPIC_PHASE_LABELS[phase]),
                          kind="epic", asks=open_questions(comments))
+            continue
+
+        if phase == "unreadable":
+            # Kaiten не отдал часть сабтасок. Считать, что их нет, нельзя: так эпик
+            # раскладывается заново и заводит дубли. Ждём следующего прогона — раньше
+            # блокеров и раньше витрины: делать по «не знаю» вообще ничего не надо.
+            log("  часть сабтасок не прочиталась — жду следующего прогона")
             continue
 
         if not args.prompt_only:
