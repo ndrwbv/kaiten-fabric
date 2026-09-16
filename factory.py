@@ -55,6 +55,9 @@ WORKTREES = ROOT / "worktrees"
 LOGS = ROOT / "logs"
 STATE = ROOT / "state"
 STATUS_FILE = STATE / "status.json"
+# журнал исходов: строка на каждую законченную работу. status.json помнит только
+# последнюю, а витрине нужна история — что сделано, что упало и когда
+EVENTS_FILE = LOGS / "events.jsonl"
 # счётчик неудач разведки по карточкам: не долбить одну и ту же карточку каждые 10 минут
 TRIAGE_STATE_FILE = STATE / "triage.json"
 # треды в Time: по какой карточке в каком канале лежит корневое сообщение и до какого
@@ -3161,9 +3164,32 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
     return lines[-1]
 
 
+def note_event(event: dict) -> None:
+    """
+    Дописать строку в журнал исходов. Ошибки глотаем: витрина не важнее работы.
+
+    Формат — jsonl: дописать строку дешевле, чем перечитывать и переписывать файл,
+    а прогон может оборваться на любом шаге. Читает журнал `dashboard.py`.
+    """
+    if DRY_RUN:
+        return
+    try:
+        LOGS.mkdir(exist_ok=True)
+        with EVENTS_FILE.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log(f"  журнал исходов не пишется: {e}")
+
+
 def finish_status(card_id: int, title: str, outcome: str, meta, pr_url: str = "",
-                  card_url: str = "") -> None:
-    write_status(card=None, phase=None, last={
+                  card_url: str = "", kind: str = "card", detail: str = "") -> None:
+    """
+    Чем кончилась работа по карточке: строкой в меню-бар и строкой в журнал.
+
+    `detail` идёт только в журнал: в меню-баре исход стоит одной короткой строкой,
+    и текст поломки её разорвёт, а витрине без него нечего показать в «не смог».
+    """
+    last = {
         "card_id": card_id,
         "title": title,
         "outcome": outcome,
@@ -3172,7 +3198,11 @@ def finish_status(card_id: int, title: str, outcome: str, meta, pr_url: str = ""
         "url": card_url,
         "cost_usd": (meta or {}).get("cost_usd"),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
+    }
+    write_status(card=None, phase=None, last=last)
+    # «Упало» до журнала иначе не доходит вовсе: обёртка сломалась до агента, и файла
+    # в logs/ по такой карточке нет — по одним вердиктам агентов её не сосчитать
+    note_event({"kind": kind, **last, "detail": detail})
 
 
 def own_subtask(card: dict) -> bool:
@@ -3804,7 +3834,8 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
                 text += f"\n\nОстальные замечания — в PR: {pr_url}"
             kaiten.comment(card_id, text + "\n\nОтветь комментарием в карточке.")
             hand_over(kaiten, profile, card_id, "review")
-            finish_status(card_id, title, "на ревью, есть вопросы", meta, pr_url)
+            finish_status(card_id, title, "на ревью, есть вопросы", meta, pr_url,
+                          kind="review")
             log(f"  -> На ревью (человеку), вопросов: {len(asks)}")
             return
 
@@ -3812,11 +3843,11 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
             # правки идут в рабочую колонку: агент подхватит карточку следующим прогоном
             kaiten.move(card_id, role_column(profile, "fixes")
                         or role_column(profile, "in_progress"))
-            finish_status(card_id, title, "правки", meta)
+            finish_status(card_id, title, "правки", meta, kind="review")
             log("  -> Правки")
         else:
             hand_over(kaiten, profile, card_id, "review")
-            finish_status(card_id, title, "ревью пройдено", meta, pr_url)
+            finish_status(card_id, title, "ревью пройдено", meta, pr_url, kind="review")
             log("  -> На ревью (человеку)")
 
     except Exception as e:  # noqa: BLE001
@@ -3824,7 +3855,8 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
         if not args.prompt_only:
             kaiten.comment(card_id, comment_failed(str(e)))
             hand_over(kaiten, profile, card_id, "failed", str(e)[:120])
-            finish_status(card_id, title, "упало на ревью", None)
+            finish_status(card_id, title, "упало на ревью", None, kind="review",
+                          detail=str(e)[:200])
             log("  -> Упало")
     finally:
         if args.keep_worktree or cfg.get("keep_worktree"):
@@ -4095,7 +4127,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             return
         kaiten.comment(card_id, comment_failed(str(e)))
         hand_over(kaiten, profile, card_id, "failed", str(e)[:120])
-        finish_status(card_id, title, "упало", None)
+        finish_status(card_id, title, "упало", None, detail=str(e)[:200])
         log("  -> Упало")
     finally:
         if args.keep_worktree or cfg.get("keep_worktree"):
@@ -4493,7 +4525,7 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
             log(f"  разведка не уложилась в бюджет, {format_meta(meta)}")
             kaiten.comment(card_id, comment_triage_budget(meta))
             finish_status(card_id, title, "разведка: не уложилась в бюджет", meta,
-                          card_url=card_url)
+                          card_url=card_url, kind="triage")
             return
         # структурированный ответ не доехал. В инбоксе сидят живые коллеги — писать им
         # «агент упал» незачем, просто считаем неудачу и молчим
@@ -4513,7 +4545,8 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
     if args.dry_run:
         print("\n" + body + "\n")
     kaiten.comment(card_id, body)
-    finish_status(card_id, title, f"разведка: {TRIAGE_HEAD[status]}", meta, card_url=card_url)
+    finish_status(card_id, title, f"разведка: {TRIAGE_HEAD[status]}", meta,
+                  card_url=card_url, kind="triage")
 
 
 def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) -> int:

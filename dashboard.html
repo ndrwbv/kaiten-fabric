@@ -1,0 +1,559 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Фабрика — витрина</title>
+<!--
+  Страница витрины. Отдаёт её dashboard.py, данные берёт из /api/overview.
+  Никаких внешних библиотек: графики — это div-ы с высотой в процентах, и этого
+  для десятка столбиков достаточно. Править можно на живую — страница читается
+  с диска на каждый запрос.
+-->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --line: #e4e7ec; --ink: #16191d; --dim: #6b7280;
+  --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --idle: #9ca3af;
+  --work: #2563eb; --review: #7c3aed; --triage: #0891b2; --epic: #db2777;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #272b34; --ink: #e8eaed; --dim: #9aa1ad;
+    --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --idle: #6b7280;
+    --work: #60a5fa; --review: #a78bfa; --triage: #22d3ee; --epic: #f472b6;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
+
+/* шапка */
+header {
+  position: sticky; top: 0; z-index: 5; background: var(--bg);
+  border-bottom: 1px solid var(--line); padding: 12px 16px;
+}
+.head { max-width: 1180px; margin: 0 auto; display: flex; flex-wrap: wrap;
+        gap: 10px 16px; align-items: center; }
+.brand { font-weight: 650; font-size: 15px; margin-right: 4px; }
+.pulse { display: flex; align-items: center; gap: 8px; min-width: 260px; flex: 1;
+         white-space: nowrap; overflow: hidden; }
+.pulse > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: none; }
+.dot.on { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 22%, transparent); }
+.pulse .what { font-weight: 600; }
+.pulse .sub { color: var(--dim); }
+.buttons { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+button, .tab {
+  font: inherit; color: var(--ink); background: var(--panel); cursor: pointer;
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+input[type=text] {
+  font: inherit; color: var(--ink); background: var(--panel); width: 96px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
+}
+.toast { color: var(--dim); font-size: 13px; }
+.toast.bad { color: var(--bad); }
+
+/* блоки */
+section { margin-top: 22px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+     color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--line);
+         border-radius: var(--radius); padding: 14px; }
+.grid { display: grid; gap: 12px; }
+.kpi { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.kpi .panel { padding: 12px 14px; }
+.kpi .value { font-size: 26px; font-weight: 650; letter-spacing: -.02em; }
+.kpi .name { color: var(--dim); margin-top: 2px; }
+.kpi .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+.kpi .value.ok { color: var(--ok); } .kpi .value.bad { color: var(--bad); }
+.kpi .value.warn { color: var(--warn); }
+
+/* графики */
+.charts { grid-template-columns: 1fr 1fr; }
+@media (max-width: 800px) { .charts { grid-template-columns: 1fr; } }
+.chart h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+.chart .cap { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
+.bars { display: flex; align-items: flex-end; gap: 3px; height: 116px;
+        border-bottom: 1px solid var(--line); }
+.bars .col { flex: 1; min-width: 3px; display: flex; flex-direction: column-reverse;
+             border-radius: 3px 3px 0 0; overflow: hidden; min-height: 1px; }
+.bars .col.empty { background: var(--line); height: 1px !important; }
+.bars .seg { width: 100%; }
+.axis { display: flex; justify-content: space-between; color: var(--dim);
+        font-size: 11px; margin-top: 5px; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px;
+          color: var(--dim); font-size: 12px; }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+            margin-right: 4px; }
+
+/* доска */
+.board { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.col-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.col-title b { font-size: 14px; } .col-title .n { font-size: 18px; font-weight: 650; }
+.col-hint { color: var(--dim); font-size: 12px; margin: 2px 0 8px; }
+.col-card { padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.col-card .id { color: var(--dim); font-size: 12px; }
+.col-empty { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line);
+             padding-top: 8px; }
+
+/* списки и таблицы */
+.stuck-item { border-top: 1px solid var(--line); padding: 12px 0; }
+.stuck-item:first-child { border-top: 0; padding-top: 0; }
+.stuck-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.stuck-head .t { font-weight: 600; }
+.stuck-item ul { margin: 8px 0 0; padding-left: 18px; color: var(--dim); }
+.stuck-item li { margin: 3px 0; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table td:first-child { min-width: 220px; }
+th { text-align: left; color: var(--dim); font-weight: 600; font-size: 12px;
+     padding: 0 8px 8px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 8px 8px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+td.num, th.num { text-align: right; padding-right: 14px; white-space: nowrap;
+                 font-variant-numeric: tabular-nums; }
+td:last-child, th:last-child { padding-right: 0; }
+tr:last-child td { border-bottom: 0; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 12px;
+         white-space: nowrap; border: 1px solid var(--line); color: var(--dim); }
+.badge.merged { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.badge.waiting, .badge.working, .badge.fixes {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.badge.question, .badge.budget {
+  color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.badge.broken, .badge.closed, .badge.none {
+  color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.facts { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.fact b { display: block; font-size: 16px; font-weight: 600; }
+.fact span { color: var(--dim); font-size: 12px; }
+.dim { color: var(--dim); }
+.note { color: var(--dim); font-size: 12px; margin-top: 8px; }
+details summary { cursor: pointer; color: var(--dim); }
+pre.log { margin: 10px 0 0; max-height: 320px; overflow: auto; font-size: 12px;
+          line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.err { color: var(--bad); font-size: 12px; margin-top: 8px; }
+</style>
+
+<header>
+  <div class="head">
+    <div class="brand">🏭 Фабрика</div>
+    <div class="pulse"><span class="dot" id="dot"></span>
+      <span><span class="what" id="pulseWhat">…</span>
+      <span class="sub" id="pulseSub"></span></span></div>
+    <div class="buttons">
+      <button data-mode="board" class="primary">Проверить доску</button>
+      <button data-mode="inbox">Инбокс</button>
+      <button data-mode="epics">Эпики</button>
+      <button data-mode="merged">Мержи</button>
+      <button data-mode="full">Полный прогон</button>
+      <input type="text" id="cardId" placeholder="карточка">
+      <button id="runCard">По карточке</button>
+      <button id="stop" class="danger">Стоп</button>
+    </div>
+    <div class="toast" id="toast"></div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="buttons" style="justify-content: space-between">
+    <div class="buttons">
+      <button data-days="7">7 дней</button>
+      <button data-days="30" class="primary">30 дней</button>
+      <button data-days="0">всё время</button>
+    </div>
+    <div class="buttons">
+      <span class="toast" id="freshness"></span>
+      <button id="refresh">Обновить</button>
+    </div>
+  </div>
+
+  <section><div class="grid kpi" id="kpi"></div></section>
+
+  <section>
+    <h2>Тренды</h2>
+    <div class="grid charts">
+      <div class="panel chart" id="chartCost"></div>
+      <div class="panel chart" id="chartFlow"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Где карточки стоят сейчас</h2>
+    <div id="boards"></div>
+  </section>
+
+  <section>
+    <h2>Не смог — и чего не хватило</h2>
+    <div class="panel" id="stuck"></div>
+  </section>
+
+  <section>
+    <h2>Все задачи</h2>
+    <div class="panel" id="tasks"></div>
+  </section>
+
+  <section>
+    <h2>Здоровье</h2>
+    <div class="grid facts" id="health"></div>
+    <div class="err" id="errors"></div>
+  </section>
+
+  <section>
+    <h2>Лог прогона</h2>
+    <div class="panel">
+      <details id="logBox"><summary>последние строки logs/run.log</summary>
+        <pre class="log" id="log"></pre></details>
+    </div>
+  </section>
+</div>
+
+<script>
+const state = { days: 30, data: null, busy: false };
+const $ = (id) => document.getElementById(id);
+
+const money = (v) => '$' + (Math.round((v || 0) * 100) / 100).toFixed(2);
+const esc = (s) => (s || '').replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+
+function ago(iso) {
+  if (!iso) return '';
+  const mins = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (mins < 1) return 'только что';
+  if (mins < 60) return mins + ' ' + plural(mins, 'минуту', 'минуты', 'минут') + ' назад';
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return hours + ' ' + plural(hours, 'час', 'часа', 'часов') + ' назад';
+  const days = Math.round(hours / 24);
+  return days + ' ' + plural(days, 'день', 'дня', 'дней') + ' назад';
+}
+
+function lasting(iso) {
+  if (!iso) return '';
+  const mins = Math.round((Date.now() - new Date(iso)) / 60000);
+  return mins < 60 ? mins + ' мин' : Math.floor(mins / 60) + ' ч ' + (mins % 60) + ' мин';
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function say(text, bad) {
+  $('toast').textContent = text;
+  $('toast').className = 'toast' + (bad ? ' bad' : '');
+  if (text) setTimeout(() => { if ($('toast').textContent === text) $('toast').textContent = ''; }, 6000);
+}
+
+/* ---------- запуск ---------- */
+
+async function run(body) {
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    const answer = await api('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Fabrica': '1' },
+      body: JSON.stringify(body),
+    });
+    say(answer.text, !answer.ok);
+    setTimeout(pulse, 1500);
+    setTimeout(load, 8000);
+  } catch (e) { say('не запустилось: ' + e.message, true); }
+  state.busy = false;
+}
+
+document.querySelectorAll('button[data-mode]').forEach((button) =>
+  button.addEventListener('click', () => run({ mode: button.dataset.mode })));
+
+$('runCard').addEventListener('click', () => {
+  const id = ($('cardId').value || '').replace(/\D/g, '');
+  if (!id) { say('номер карточки?', true); return; }
+  run({ mode: 'card', card: Number(id) });
+});
+$('cardId').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('runCard').click(); });
+
+$('stop').addEventListener('click', async () => {
+  const answer = await api('/api/stop', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Fabrica': '1' },
+    body: '{}',
+  });
+  say(answer.text, !answer.ok);
+  setTimeout(pulse, 800);
+});
+
+document.querySelectorAll('button[data-days]').forEach((button) =>
+  button.addEventListener('click', () => {
+    state.days = Number(button.dataset.days);
+    document.querySelectorAll('button[data-days]').forEach((b) =>
+      b.classList.toggle('primary', b === button));
+    load();
+  }));
+
+$('refresh').addEventListener('click', () => load(true));
+
+/* ---------- живой статус ---------- */
+
+async function pulse() {
+  let p;
+  try { p = await api('/api/pulse'); } catch (e) { return; }
+  const running = p.running;
+  $('dot').className = 'dot' + (running ? ' on' : '');
+  if (running) {
+    const card = p.card || {};
+    $('pulseWhat').textContent = p.phase || 'работает';
+    const bits = [];
+    if (p.phase_since) bits.push(lasting(p.phase_since));
+    if (card.id) bits.push('#' + card.id + (card.title ? ' ' + card.title : ''));
+    if (p.agent && p.agent.action) bits.push('⚙ ' + p.agent.action + ' · шаг ' + (p.agent.steps || 0));
+    $('pulseSub').textContent = bits.length ? ' · ' + bits.join(' · ') : '';
+  } else {
+    const last = p.last || {};
+    $('pulseWhat').textContent = 'спит';
+    $('pulseSub').textContent = last.at
+      ? ' · последняя: #' + last.card_id + ' → ' + last.outcome + ', ' + ago(last.at)
+      : '';
+  }
+  $('stop').disabled = !running;
+  document.querySelectorAll('button[data-mode]').forEach((b) => (b.disabled = running));
+  $('runCard').disabled = running;
+}
+
+/* ---------- графики ---------- */
+
+function bars(points, parts, colors) {
+  const max = Math.max(...points.map((p) => parts.reduce((sum, key) => sum + (p[key] || 0), 0)), 0.0001);
+  const cols = points.map((point) => {
+    const total = parts.reduce((sum, key) => sum + (point[key] || 0), 0);
+    if (!total) return `<div class="col empty" title="${point.day}: пусто"></div>`;
+    const hint = point.day + ': ' + point.hint;
+    const segs = parts.map((key, i) => (point[key]
+      ? `<div class="seg" style="height:${(point[key] / total) * 100}%;background:${colors[i]}"></div>` : '')).join('');
+    return `<div class="col" style="height:${Math.max((total / max) * 100, 2)}%" title="${esc(hint)}">${segs}</div>`;
+  }).join('');
+  return { cols, max };
+}
+
+function drawCost(trend, labels) {
+  const groups = ['card', 'review', 'triage', 'epic'];
+  const colors = ['var(--work)', 'var(--review)', 'var(--triage)', 'var(--epic)'];
+  const points = trend.map((day) => {
+    const point = { day: day.day, hint: money(day.cost) + ' за ' + day.runs + ' ' + plural(day.runs, 'прогон', 'прогона', 'прогонов') };
+    groups.forEach((g) => (point[g] = day.by_group[g] || 0));
+    return point;
+  });
+  const { cols, max } = bars(points, groups, colors);
+  const legend = groups.map((g, i) =>
+    `<span><i style="background:${colors[i]}"></i>${labels.group[g]}</span>`).join('');
+  $('chartCost').innerHTML = `
+    <h3>Деньги по дням</h3>
+    <div class="cap">потолок столбика — ${money(max)}</div>
+    <div class="bars">${cols}</div>
+    <div class="axis"><span>${points.length ? points[0].day.slice(5) : ''}</span>
+      <span>${points.length ? points[points.length - 1].day.slice(5) : ''}</span></div>
+    <div class="legend">${legend}</div>`;
+}
+
+function drawFlow(trend) {
+  const parts = ['opened', 'merged', 'failed'];
+  const names = ['довёл до PR', 'уехало в main', 'неудачных прогонов'];
+  const colors = ['var(--accent)', 'var(--ok)', 'var(--bad)'];
+  const points = trend.map((day) => ({
+    day: day.day, opened: day.opened, merged: day.merged, failed: day.failed,
+    hint: `PR ${day.opened} · в main ${day.merged} · неудач ${day.failed}`,
+  }));
+  const { cols, max } = bars(points, parts, colors);
+  const legend = parts.map((p, i) => `<span><i style="background:${colors[i]}"></i>${names[i]}</span>`).join('');
+  $('chartFlow').innerHTML = `
+    <h3>Задачи по дням</h3>
+    <div class="cap">потолок столбика — ${Math.round(max)} шт.</div>
+    <div class="bars">${cols}</div>
+    <div class="axis"><span>${points.length ? points[0].day.slice(5) : ''}</span>
+      <span>${points.length ? points[points.length - 1].day.slice(5) : ''}</span></div>
+    <div class="legend">${legend}</div>`;
+}
+
+/* ---------- блоки ---------- */
+
+function drawKpi(data) {
+  const t = data.totals;
+  const share = (n) => (t.cards ? Math.round((n / t.cards) * 100) + '%' : '—');
+  const tiles = [
+    { value: money(t.cost), name: 'потрачено',
+      hint: `${money(t.cost_per_card)} на задачу · ${t.runs} ${plural(t.runs, 'прогон', 'прогона', 'прогонов')}` },
+    { value: t.done, name: 'довёл до PR', cls: 'ok',
+      hint: `из ${t.cards} ${plural(t.cards, 'задачи', 'задач', 'задач')} в работе` },
+    { value: t.merged, name: 'уехало в main', cls: 'ok',
+      hint: `${share(t.merged)} задач · ${money(t.cost_per_merged)} за штуку` },
+    { value: t.fixed, name: 'вернули на правки', cls: t.fixed ? 'warn' : '',
+      hint: `${t.review_rounds} ${plural(t.review_rounds, 'круг', 'круга', 'кругов')} ревью на задачу` },
+    { value: t.failed, name: 'не смог', cls: t.failed ? 'bad' : '',
+      hint: share(t.failed) + ' задач' },
+    { value: t.waiting, name: 'ждут человека',
+      hint: 'PR открыт или карточка в работе' },
+  ];
+  $('kpi').innerHTML = tiles.map((tile) => `
+    <div class="panel">
+      <div class="value ${tile.cls || ''}">${tile.value}</div>
+      <div class="name">${tile.name}</div>
+      <div class="hint">${tile.hint}</div>
+    </div>`).join('');
+}
+
+function drawBoards(boards) {
+  if (!boards.length) {
+    $('boards').innerHTML = '<div class="panel dim">доска не прочиталась — смотри ошибки внизу</div>';
+    return;
+  }
+  $('boards').innerHTML = boards.map((board) => `
+    ${boards.length > 1 ? `<div class="note" style="margin:0 0 8px">доска «${esc(board.key)}»${board.outside ? ' · ' + board.outside + ' в чужих колонках' : ''}</div>` : ''}
+    <div class="grid board" style="margin-bottom:14px">
+      ${board.columns.map((column) => `
+        <div class="panel">
+          <div class="col-title"><b>${column.label}</b><span class="n">${column.cards.length}</span></div>
+          <div class="col-hint">${column.hint}</div>
+          ${column.cards.length ? column.cards.map((card) => `
+            <div class="col-card">
+              <a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a>
+              ${card.blocked ? ' <span class="badge">блокер</span>' : ''}
+              <div class="id">#${card.id}</div>
+            </div>`).join('') : '<div class="col-empty">пусто</div>'}
+        </div>`).join('')}
+    </div>`).join('');
+}
+
+function badge(card, labels) {
+  return `<span class="badge ${card.outcome}">${labels.outcome[card.outcome]}</span>`;
+}
+
+function drawStuck(data) {
+  const stuck = data.stuck;
+  if (!stuck.length) {
+    $('stuck').innerHTML = '<span class="dim">за этот период всё, что бралось, доехало до PR</span>';
+    return;
+  }
+  $('stuck').innerHTML = stuck.map((card) => `
+    <div class="stuck-item">
+      <div class="stuck-head">
+        <span class="t"><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a></span>
+        ${badge(card, data.labels)}
+        <span class="dim">#${card.id} · ${money(card.cost)} · ${card.runs} ${plural(card.runs, 'заход', 'захода', 'заходов')} · ${ago(card.last)}</span>
+        ${card.pr ? `<a href="${card.pr.url}" target="_blank">PR #${card.pr.number}</a>` : ''}
+      </div>
+      ${card.missing.length ? `<ul>${card.missing.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>`
+        : '<div class="dim" style="margin-top:6px">объяснения агент не оставил</div>'}
+    </div>`).join('');
+}
+
+function drawTasks(data) {
+  const cards = data.cards;
+  if (!cards.length) { $('tasks').innerHTML = '<span class="dim">за этот период фабрика ничего не брала</span>'; return; }
+  $('tasks').innerHTML = `
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Задача</th><th>Исход</th><th class="num">Заходов</th><th class="num">Ревью</th>
+        <th class="num">Стоила</th><th>PR</th><th class="num">Последний раз</th>
+      </tr></thead>
+      <tbody>${cards.map((card) => `
+        <tr>
+          <td><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a>
+              <div class="dim">#${card.id}</div></td>
+          <td>${badge(card, data.labels)}</td>
+          <td class="num">${card.work_runs}</td>
+          <td class="num">${card.needs_changes ? card.needs_changes + ' ↩' : (card.review_runs || '—')}</td>
+          <td class="num">${money(card.cost)}</td>
+          <td>${card.pr ? `<a href="${card.pr.url}" target="_blank">#${card.pr.number}</a>
+               <div class="dim">+${card.pr.additions}/−${card.pr.deletions}</div>`
+              : (card.shipped ? `<span class="dim">${card.shipped.sha}</span>` : '—')}</td>
+          <td class="num dim">${ago(card.last)}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="note">«Заходов» — сколько раз исполнитель брался за карточку, «Ревью» — сколько
+      раз ревьювер вернул её на правки. Стоимость — все прогоны по карточке вместе.</div>`;
+}
+
+function drawHealth(data) {
+  const t = data.totals, p = data.pulse, auth = p.auth || {}, lock = p.lock || {};
+  const triage = data.triage, epics = data.epics;
+  const facts = [
+    { b: p.running ? 'работает' : 'спит',
+      s: p.running ? (p.phase || '') + ' · ' + lasting(p.phase_since)
+                   : (p.last && p.last.at ? 'последний прогон ' + ago(p.last.at) : 'прогонов ещё не было') },
+    { b: auth.ok ? 'авторизация жива' : 'авторизация протухла',
+      s: auth.expires ? 'до ' + new Date(auth.expires).toLocaleString('ru-RU', { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' }) : 'claude setup-token' },
+    { b: t.cut_runs + ' ' + plural(t.cut_runs, 'обрыв', 'обрыва', 'обрывов'),
+      s: 'упёрлись в потолок расхода, ' + money(t.cut_cost) + ' впустую' },
+    { b: t.merge_lag_days ? t.merge_lag_days + ' ' + plural(t.merge_lag_days, 'день', 'дня', 'дней') : '—',
+      s: 'медиана от PR до мержа' },
+    { b: money(t.cost_per_merged), s: 'цена задачи, доехавшей до main' },
+    { b: triage.cards + ' ' + plural(triage.cards, 'карточка', 'карточки', 'карточек'),
+      s: 'разведка инбокса: ' + (Object.entries(triage.by_status).map(([k, v]) => (data.labels.status[k] || k) + ' ' + v).join(', ') || 'тихо') + ' · ' + money(triage.cost) },
+    { b: epics.runs + ' ' + plural(epics.runs, 'шаг', 'шага', 'шагов'),
+      s: 'фазы эпиков · ' + money(epics.cost) },
+    { b: (p.queue || 0) + ' в очереди', s: (p.inbox_pending || 0) + ' не разобрано в инбоксе · ' + (p.night_waiting || 0) + ' ждут ночи' },
+    { b: lock.held ? (lock.alive ? 'замок занят' : 'замок протух') : 'замок свободен',
+      s: lock.held ? 'pid ' + lock.pid + ', ' + lock.age_min + ' мин' : 'следующий прогон стартует сразу' },
+  ];
+  $('health').innerHTML = facts.map((f) =>
+    `<div class="panel fact"><b>${esc(f.b)}</b><span>${esc(f.s)}</span></div>`).join('');
+
+  const top = data.top_cost.map((card) =>
+    `<a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a> ${money(card.cost)}`).join(' · ');
+  if (top) $('health').insertAdjacentHTML('beforeend',
+    `<div class="panel fact" style="grid-column:1/-1"><b>дороже всего</b><span>${top}</span></div>`);
+
+  const errors = Object.entries(data.errors || {});
+  $('errors').innerHTML = errors.length
+    ? errors.map(([key, text]) => `не прочиталось (${key}): ${esc(text)}`).join('<br>') : '';
+}
+
+/* ---------- загрузка ---------- */
+
+async function load(force) {
+  try {
+    const data = await api('/api/overview?days=' + state.days + (force ? '&force=1' : ''));
+    state.data = data;
+    drawKpi(data);
+    drawCost(data.trend, data.labels);
+    drawFlow(data.trend);
+    drawBoards(data.boards);
+    drawStuck(data);
+    drawTasks(data);
+    drawHealth(data);
+    $('freshness').textContent = 'GitHub и доска: ' +
+      (data.outside_at ? ago(new Date(data.outside_at * 1000).toISOString()) : 'ещё едут');
+  } catch (e) {
+    say('витрина не собралась: ' + e.message, true);
+  }
+}
+
+async function loadLog() {
+  if (!$('logBox').open) return;
+  try {
+    const data = await api('/api/log?n=200');
+    $('log').textContent = data.lines.join('\n');
+    $('log').scrollTop = $('log').scrollHeight;
+  } catch (e) { /* лог не критичен */ }
+}
+$('logBox').addEventListener('toggle', loadLog);
+
+pulse(); load(); 
+setInterval(pulse, 5000);
+setInterval(load, 60000);
+setInterval(loadLog, 10000);
+</script>
