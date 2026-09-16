@@ -33,6 +33,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 import webbrowser
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -1097,6 +1098,274 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
 
 
 # --------------------------------------------------------------------------- #
+# настройки
+# --------------------------------------------------------------------------- #
+
+SETTINGS_FILE = factory.STATE / "settings.json"
+
+# Приложение в меню-баре держало расписания в своих UserDefaults, и добраться до них
+# снаружи было нельзя. Теперь они здесь, в общем файле: витрина пишет, приложение
+# читает и перезаводит таймеры. Один писатель на настройку — и не надо гадать, чья
+# запись победит.
+LEGACY_DEFAULTS = {"board": "intervalMinutes", "inbox": "inboxIntervalMinutes",
+                   "epics": "epicsIntervalMinutes"}
+
+SCHEDULES = [
+    {
+        "key": "board", "title": "Доска", "default": 60,
+        "hint": "ревью и работа по карточкам — то, за что идут деньги",
+        "choices": [15, 30, 60, 120, 240, 0],
+    },
+    {
+        # Разведка дешёвая и короткая, поэтому может ходить часто: карточку закинули —
+        # через несколько минут в ней уже лежит комментарий. Но она же единственная
+        # фаза, которая тратит деньги на карточки, о которых её никто не просил,
+        # поэтому в другом конце списка — раз в день.
+        "key": "inbox", "title": "Инбокс", "default": 10,
+        "hint": "посмотреть новые карточки и отписаться в них",
+        "choices": [5, 10, 15, 30, 1440, 0],
+    },
+    {
+        # Проверка эпика и шаг эпика — разные вещи. Проверка дешёвая: фабрика смотрит
+        # блокеры, чек-лист и комментарии и почти всегда уходит ни с чем. Агент
+        # запускается, только когда фаза сменилась, — а сменить её может человек
+        # или предыдущий шаг. Частая проверка не значит частых трат.
+        "key": "epics", "title": "Эпики", "default": 15,
+        "hint": "критерии, спека, ревью спеки, декомпозиция",
+        "choices": [10, 15, 60, 120, 240, 1440, 0],
+    },
+]
+
+
+def minutes_title(minutes: int) -> str:
+    if not minutes:
+        return "Выключено"
+    if minutes % 1440 == 0:
+        return "Раз в день" if minutes == 1440 else f"Раз в {minutes // 1440} дня"
+    if minutes % 60 == 0:
+        return "Каждый час" if minutes == 60 else f"Каждые {minutes // 60} ч"
+    return f"Каждые {minutes} минут"
+
+
+def legacy_schedule(key: str) -> int | None:
+    """Значение из UserDefaults приложения — чтобы переезд ничего не сбросил."""
+    name = LEGACY_DEFAULTS.get(key)
+    if not name:
+        return None
+    try:
+        proc = subprocess.run(["defaults", "read", "local.kaiten-fabrica", name],
+                              capture_output=True, text=True, timeout=10)
+        return int(proc.stdout.strip()) if proc.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def load_settings() -> dict:
+    stored = {}
+    if SETTINGS_FILE.is_file():
+        try:
+            stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+    schedule = dict(stored.get("schedule") or {})
+    missing = {}
+    for item in SCHEDULES:
+        if item["key"] in schedule:
+            continue
+        # первый заход: подбираем то, что человек выставил в меню-баре
+        missing[item["key"]] = legacy_schedule(item["key"])
+        schedule[item["key"]] = (missing[item["key"]] if missing[item["key"]] is not None
+                                 else item["default"])
+    if missing:
+        save_settings({"schedule": schedule})
+    return {**stored, "schedule": schedule}
+
+
+def save_settings(patch: dict) -> dict:
+    """Пишем через временный файл: приложение читает этот же файл каждые десять секунд."""
+    stored = {}
+    if SETTINGS_FILE.is_file():
+        try:
+            stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+    for key, value in patch.items():
+        if isinstance(value, dict):
+            stored[key] = {**(stored.get(key) or {}), **value}
+        else:
+            stored[key] = value
+    factory.STATE.mkdir(exist_ok=True)
+    tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(stored, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(SETTINGS_FILE)
+    return stored
+
+
+# Ручки конфига, которые витрина показывает формой. Проверяет их всё равно
+# `setup.py --set-config` — здесь только как их назвать и как нарисовать.
+EFFORTS = [("low", "низкое"), ("medium", "среднее"), ("high", "высокое")]
+
+SETTING_GROUPS = [
+    {"title": "Разработчик", "fields": [
+        ("bot.name", "Имя", "text", "как его зовут в разговоре и на витрине"),
+        ("bot.tag", "Тег", "text",
+         "признак «это моё» на общей доске. Сменишь — карточки со старым тегом "
+         "перестанут быть его, а ночной тег поедет следом"),
+    ]},
+    {"title": "Сколько берёт за раз", "fields": [
+        ("max_cards_per_run", "Карточек за прогон", "int", ""),
+        ("max_spend_per_run", "Потолок на прогон, $", "money",
+         "бюджеты ниже — на одного агента, а прогон запускает их десятками"),
+        ("inbox.max_cards_per_run", "Карточек инбокса за прогон", "int", ""),
+        ("inbox.max_rounds", "Заходов разведки на карточку", "int",
+         "чтобы не ходить по кругу вокруг одной и той же"),
+        ("inbox.create_cards", "Разведка сама ставит задачу", "flag", ""),
+        ("inbox.target", "Куда ставит задачу", "choice:subtasks=доска сабтасок|own=своя доска", ""),
+    ]},
+    {"title": "Бюджеты и модели", "fields": [
+        ("agent.max_budget_usd", "Исполнитель, $", "money", ""),
+        ("agent.timeout_sec", "Исполнитель, таймаут (сек)", "int", ""),
+        ("agent.model", "Модель исполнителя", "text", ""),
+        ("agent.effort", "Усилие исполнителя", "choice:low=низкое|medium=среднее|high=высокое",
+         "effort «max» подписка claude.ai не отдаёт"),
+        ("reviewer.max_budget_usd", "Ревьювер, $", "money", ""),
+        ("reviewer.max_rounds", "Кругов ревью", "int", ""),
+        ("reviewer.post_to_pr", "Замечания уходят в PR", "flag", ""),
+        ("triager.max_budget_usd", "Разведчик, $", "money", ""),
+        ("epic_flow.agent.max_budget_usd", "Эпик-агент, $", "money", ""),
+    ]},
+    {"title": "Ночное окно", "fields": [
+        ("night.from_hour", "С какого часа", "int", ""),
+        ("night.to_hour", "По какой час", "int",
+         "в это окно берутся карточки с ночным тегом"),
+    ]},
+    {"title": "Эпики", "fields": [
+        ("epic_flow.max_epics_per_run", "Эпиков за прогон", "int", ""),
+        ("epic_flow.max_subtasks", "Сабтасок за декомпозицию", "int", ""),
+        ("epic_flow.answer_wait_hours", "Ждать ответа, часов", "int",
+         "0 — ждать сколько угодно"),
+    ]},
+    {"title": "PR и рабочая копия", "fields": [
+        ("pr.draft", "PR черновой", "flag", ""),
+        ("keep_worktree", "Не удалять рабочую копию", "flag",
+         "удобно разбираться, что агент наделал, но копии копятся"),
+    ]},
+]
+
+
+def config_value(cfg: dict, path: str):
+    section = cfg
+    for name in path.split("."):
+        if not isinstance(section, dict) or name not in section:
+            return None
+        section = section[name]
+    return section
+
+
+def settings_view(cfg: dict) -> dict:
+    """Что показать на странице настроек: расписания, ручки конфига и Time."""
+    schedule = load_settings()["schedule"]
+    groups = []
+    for group in SETTING_GROUPS:
+        fields = []
+        for path, label, kind, hint in group["fields"]:
+            # секции может не быть вовсе: инбокс, ночь и эпики — необязательные режимы,
+            # и заводить их формой мы не станем, это работа мастера
+            parent = path.rsplit(".", 1)[0] if "." in path else ""
+            if parent and config_value(cfg, parent) is None:
+                continue
+            fields.append({"path": path, "label": label, "kind": kind, "hint": hint,
+                           "value": config_value(cfg, path)})
+        if fields:
+            groups.append({"title": group["title"], "fields": fields})
+
+    notify = {}
+    try:
+        proc = subprocess.run(["python3", str(factory.ROOT / "setup.py"), "--get-notify"],
+                              cwd=factory.ROOT, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            notify = json.loads(proc.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        notify = {}
+
+    return {
+        "schedules": [{**item, "minutes": schedule.get(item["key"], item["default"]),
+                       "options": [{"minutes": m, "title": minutes_title(m)}
+                                   for m in item["choices"]]}
+                      for item in SCHEDULES],
+        "groups": groups,
+        "time": notify,
+        "auth": (status_file().get("auth") or {}),
+    }
+
+
+def apply_settings(body: dict) -> dict:
+    """Сохранить присланное со страницы. Конфиг пишет setup.py — он же и проверяет."""
+    said = []
+    schedule = body.get("schedule") or {}
+    if schedule:
+        allowed = {item["key"] for item in SCHEDULES}
+        clean = {}
+        for key, value in schedule.items():
+            if key not in allowed:
+                return {"ok": False, "text": f"неизвестное расписание: {key}"}
+            try:
+                minutes = int(value)
+            except (TypeError, ValueError):
+                return {"ok": False, "text": f"расписание «{key}»: нужно число"}
+            if not 0 <= minutes <= 10080:
+                return {"ok": False, "text": f"расписание «{key}»: от 0 до 10080 минут"}
+            clean[key] = minutes
+        save_settings({"schedule": clean})
+        said.append("расписание")
+
+    knobs = body.get("config") or {}
+    if knobs:
+        answer = run_setup(["--set-config"], json.dumps(knobs, ensure_ascii=False))
+        if not answer["ok"]:
+            return answer
+        said.append("настройки")
+    return {"ok": True, "text": "сохранил: " + " и ".join(said) if said else "нечего сохранять"}
+
+
+def run_setup(args: list[str], stdin_text: str = "") -> dict:
+    """Позвать setup.py и вернуть его ответ человеку. Секреты уходят через stdin."""
+    try:
+        proc = subprocess.run(["python3", str(factory.ROOT / "setup.py"), *args],
+                              cwd=factory.ROOT, input=stdin_text, capture_output=True,
+                              text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"ok": False, "text": f"setup.py не запустился: {e}"}
+    # setup.py рисует рамки и цвета — человеку в браузере нужна последняя строка
+    said = [line.strip() for line in (proc.stdout + proc.stderr).splitlines() if line.strip()]
+    text = re.sub(r"\x1b\[[0-9;]*m", "", said[-1] if said else "").strip("✓✗ ")
+    return {"ok": proc.returncode == 0, "text": text or "готово"}
+
+
+def time_channels() -> dict:
+    """Каналы бота списком — чтобы id канала не спрашивать у человека."""
+    try:
+        proc = subprocess.run(["python3", str(factory.ROOT / "factory.py"), "--time-channels"],
+                              cwd=factory.ROOT, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return {"ok": False, "text": (proc.stderr or proc.stdout).strip()[:200],
+                    "channels": []}
+        return {"ok": True, "channels": json.loads(proc.stdout or "[]")}
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return {"ok": False, "text": str(e)[:200], "channels": []}
+
+
+def time_test() -> dict:
+    try:
+        proc = subprocess.run(["python3", str(factory.ROOT / "factory.py"), "--time-test"],
+                              cwd=factory.ROOT, capture_output=True, text=True, timeout=120)
+        said = [line.strip() for line in (proc.stdout + proc.stderr).splitlines() if line.strip()]
+        return {"ok": proc.returncode == 0, "text": said[-1][:300] if said else "готово"}
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"ok": False, "text": str(e)[:200]}
+
+
+# --------------------------------------------------------------------------- #
 # запуск прогона
 # --------------------------------------------------------------------------- #
 
@@ -1173,6 +1442,16 @@ def shell_quote(value: str) -> str:
 # сервер
 # --------------------------------------------------------------------------- #
 
+# Секреты, которые витрина умеет записывать. Значение уходит в setup.py через stdin
+# и в самой витрине нигде не задерживается: ни в логе, ни в ответе.
+SECRETS = {
+    "TIME_BOT_TOKEN": "токен бота Time",
+    "TIME_WEBHOOK_URL": "URL вебхука Time",
+    "CLAUDE_CODE_OAUTH_TOKEN": "долгоживущий токен клода",
+    "KAITEN_TOKEN": "токен Kaiten",
+}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "fabrica-dashboard"
     cfg: dict = {}
@@ -1192,6 +1471,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/api/log":
             lines = min(int((query.get("n") or ["120"])[0]), 2000)
             return self.send_json({"lines": tail(RUN_LOG, lines)})
+        if url.path == "/api/settings":
+            return self.send_json(settings_view(self.cfg))
+        if url.path == "/api/channels":
+            return self.send_json(time_channels())
         self.send_error(404)
 
     def do_POST(self) -> None:                     # noqa: N802
@@ -1211,7 +1494,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 bool(body.get("epic")), bool(body.get("dry"))))
         if url.path == "/api/stop":
             return self.send_json(stop_run())
+        if url.path == "/api/settings":
+            answer = apply_settings(body)
+            # конфиг мог поменяться — витрина держит его в памяти с запуска
+            if answer.get("ok"):
+                self.reload_config()
+            return self.send_json(answer)
+        if url.path == "/api/secret":
+            name = str(body.get("name") or "")
+            if name not in SECRETS:
+                return self.send_json({"ok": False, "text": f"такой секрет не веду: {name}"})
+            value = str(body.get("value") or "").strip()
+            if not value:
+                return self.send_json({"ok": False, "text": "пустое значение"})
+            return self.send_json(run_setup(["--set-secret", name], value))
+        if url.path == "/api/notify":
+            answer = run_setup(["--set-notify"], json.dumps(body, ensure_ascii=False))
+            if answer.get("ok"):
+                self.reload_config()
+            return self.send_json(answer)
+        if url.path == "/api/time-test":
+            return self.send_json(time_test())
         self.send_error(404)
+
+    def reload_config(self) -> None:
+        """Перечитать config.json после правки: витрина держала его с запуска."""
+        try:
+            Handler.cfg = json.loads(factory.CONFIG_PATH.read_text(encoding="utf-8"))
+            Handler.outside.cfg = Handler.cfg
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"конфиг после правки не перечитался: {e}")
 
     def send_page(self) -> None:
         try:
@@ -1246,6 +1558,16 @@ class Server(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def already_running(port: int) -> bool:
+    """Занятый порт — это наша же витрина? Спрашиваем у неё саму."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/pulse", timeout=3) as answer:
+            json.loads(answer.read())
+        return True
+    except Exception:  # noqa: BLE001 — любой отказ значит «это не мы»
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Витрина фабрики в браузере")
     parser.add_argument("--port", type=int, default=8777)
@@ -1264,12 +1586,19 @@ def main() -> int:
     threading.Thread(target=Handler.outside.refresh, daemon=True).start()
 
     address = ("127.0.0.1", args.port)
+    url = f"http://127.0.0.1:{args.port}/"
     try:
         server = Server(address, Handler)
-    except OSError as e:
-        print(f"порт {args.port} занят ({e}) — возьми другой: --port 9000")
+    except OSError:
+        # Порт занят. Чаще всего — нами же: витрину запускают и кнопкой из меню-бара,
+        # и руками. Второй экземпляр не нужен, нужна вкладка в браузере.
+        if already_running(args.port):
+            print(f"витрина уже работает: {url}")
+            if not args.no_open:
+                webbrowser.open(url)
+            return 0
+        print(f"порт {args.port} занят кем-то другим — возьми другой: --port 9000")
         return 1
-    url = f"http://127.0.0.1:{args.port}/"
     print(f"витрина фабрики: {url}   (Ctrl+C — выход)")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

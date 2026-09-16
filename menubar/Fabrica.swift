@@ -11,45 +11,6 @@ import Foundation
 // `bakedRoot` — путь к папке фабрики, его генерирует build-app.sh в Root.swift.
 // Переменная окружения FABRICA_ROOT перебивает его, если приложение переехало.
 
-let intervalChoices: [(title: String, minutes: Int)] = [
-    ("Каждые 15 минут", 15),
-    ("Каждые 30 минут", 30),
-    ("Каждый час", 60),
-    ("Каждые 2 часа", 120),
-    ("Каждые 4 часа", 240),
-    ("Выключено", 0),
-]
-
-// Разведка инбокса дешёвая и короткая, поэтому может ходить часто: карточку закинули —
-// через несколько минут в ней уже лежит комментарий. Но она же и единственная фаза,
-// которая тратит деньги на карточки, о которых её никто не просил, так что в другом
-// конце списка — раз в день: инбокс пополняется рывками, и разбирать его по расписанию
-// кофеварки нужно не всегда.
-let inboxIntervalChoices: [(title: String, minutes: Int)] = [
-    ("Каждые 5 минут", 5),
-    ("Каждые 10 минут", 10),
-    ("Каждые 15 минут", 15),
-    ("Каждые 30 минут", 30),
-    ("Раз в день", 1440),
-    ("Выключено", 0),
-]
-
-// Проверка эпика и шаг эпика — разные вещи, и путать их дорого стоило. Сам чек дешёвый:
-// фабрика смотрит блокеры, чек-лист и комментарии и почти всегда уходит ни с чем — эпик
-// ждёт человека. Агент запускается, только когда фаза действительно сменилась, а сменить
-// её может лишь человек (ответил, снял блокер) или предыдущий шаг. Поэтому частый чек не
-// значит частых трат — он значит, что снятый блокер подхватится через десять минут,
-// а не через два часа.
-let epicsIntervalChoices: [(title: String, minutes: Int)] = [
-    ("Каждые 10 минут", 10),
-    ("Каждые 15 минут", 15),
-    ("Каждый час", 60),
-    ("Каждые 2 часа", 120),
-    ("Каждые 4 часа", 240),
-    ("Раз в день", 1440),
-    ("Выключено", 0),
-]
-
 /// Карточка, по которой ход человека. Счётчика мало: нужно видеть, какая именно
 /// карточка и чего она ждёт, иначе всё равно лезть искать её на доске.
 struct Waiting {
@@ -134,8 +95,6 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let root: URL
-    private let defaults = UserDefaults.standard
-    private var timeSettings: TimeSettings?
 
     /// Ответ `security` про свежесть сессии и когда мы его получили. Спрашивать на
     /// каждую отрисовку меню незачем: это подпроцесс, а меню перерисовывается часто.
@@ -146,6 +105,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     private var inboxTimer: Timer?
     private var epicsTimer: Timer?
     private var pollTimer: Timer?
+    private var settingsWatch: Timer?
     private var runner: Process?
     private var nextRun: Date?
     private var nextInboxRun: Date?
@@ -159,20 +119,47 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     /// Адрес доски — из config.json, чтобы приложение не знало про конкретную команду.
     private var boardURL: String?
 
-    private var intervalMinutes: Int {
-        get { defaults.object(forKey: "intervalMinutes") as? Int ?? 60 }
-        set { defaults.set(newValue, forKey: "intervalMinutes") }
+    // MARK: - настройки
+
+    /// Настройки живут в `state/settings.json` — одном файле на приложение и на витрину.
+    /// Раньше расписания лежали в UserDefaults приложения: снаружи их было не поменять,
+    /// а о правке приложение всё равно не узнало бы. Теперь правит их кто угодно,
+    /// а следит за файлом тот, кто по расписанию и ходит, — приложение.
+    private var settingsFile: URL { root.appendingPathComponent("state/settings.json") }
+
+    /// Что применено прямо сейчас. По нему видно, что витрина поменяла расписание,
+    /// и перезаводить можно только изменившийся таймер — остальным отсчёт не сбиваем.
+    private var appliedSchedule: [String: Int] = [:]
+
+    private func readSettings() -> [String: Any] {
+        guard let data = try? Data(contentsOf: settingsFile),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return [:] }
+        return json
     }
 
-    private var inboxIntervalMinutes: Int {
-        get { defaults.object(forKey: "inboxIntervalMinutes") as? Int ?? 10 }
-        set { defaults.set(newValue, forKey: "inboxIntervalMinutes") }
+    /// Расписание приложение только читает. Пишет файл витрина — один писатель
+    /// на настройку, и не надо думать, чья запись победит. Старые значения из
+    /// UserDefaults переносит туда же витрина, при первом чтении.
+    private func schedule(_ key: String, fallback: Int) -> Int {
+        guard let all = readSettings()["schedule"] as? [String: Any],
+              let minutes = (all[key] as? NSNumber)?.intValue
+        else { return fallback }
+        return minutes
     }
 
-    private var epicsIntervalMinutes: Int {
-        get { defaults.object(forKey: "epicsIntervalMinutes") as? Int ?? 15 }
-        set { defaults.set(newValue, forKey: "epicsIntervalMinutes") }
+    /// Перезавести таймеры, которые поменяли в витрине. Зовётся по таймеру и при
+    /// открытии меню: файл мог измениться в любую секунду, и ждать перезапуска
+    /// приложения ради нового расписания человек не должен.
+    private func applyScheduleChanges() {
+        if appliedSchedule["board"] != intervalMinutes { rescheduleTimer() }
+        if appliedSchedule["inbox"] != inboxIntervalMinutes { rescheduleInboxTimer() }
+        if appliedSchedule["epics"] != epicsIntervalMinutes { rescheduleEpicsTimer() }
     }
+
+    private var intervalMinutes: Int { schedule("board", fallback: 60) }
+    private var inboxIntervalMinutes: Int { schedule("inbox", fallback: 10) }
+    private var epicsIntervalMinutes: Int { schedule("epics", fallback: 15) }
 
     override init() {
         let env = ProcessInfo.processInfo.environment["FABRICA_ROOT"]
@@ -204,6 +191,16 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         rescheduleEpicsTimer()
         readStatusFile()
         redraw()
+
+        // Расписание меняют в витрине, и узнать об этом больше неоткуда: файл
+        // перечитываем сами. Десять секунд — компромисс между «сразу» и «не дёргать
+        // диск впустую»; при открытии меню проверяем ещё раз, чтобы человек увидел
+        // свежее время следующей проверки.
+        let watch = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            self?.applyScheduleChanges()
+        }
+        RunLoop.main.add(watch, forMode: .common)
+        settingsWatch = watch
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -217,6 +214,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         scheduleTimer = nil
         nextRun = nil
         let minutes = intervalMinutes
+        appliedSchedule["board"] = minutes
         guard minutes > 0 else { return }
         let seconds = TimeInterval(minutes * 60)
         nextRun = Date().addingTimeInterval(seconds)
@@ -234,6 +232,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         inboxTimer = nil
         nextInboxRun = nil
         let minutes = inboxIntervalMinutes
+        appliedSchedule["inbox"] = minutes
         guard minutes > 0 else { return }
         let seconds = TimeInterval(minutes * 60)
         nextInboxRun = Date().addingTimeInterval(seconds)
@@ -251,6 +250,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         epicsTimer = nil
         nextEpicsRun = nil
         let minutes = epicsIntervalMinutes
+        appliedSchedule["epics"] = minutes
         guard minutes > 0 else { return }
         let seconds = TimeInterval(minutes * 60)
         nextEpicsRun = Date().addingTimeInterval(seconds)
@@ -663,23 +663,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Три расписания, и каждое ходит только за своим. Раньше «Расписание» тянуло
-        // за собой ещё и инбокс с эпиками, так что реже сделать эпики, не трогая
-        // доску, было нельзя — а шаг эпика стоит несколько долларов.
-        menu.addItem(intervalMenu(title: "Доска: расписание", choices: intervalChoices,
-                                  current: intervalMinutes, next: nextRun,
-                                  selector: #selector(intervalClicked(_:)),
-                                  hint: "Только доска: ревью и работа по карточкам"))
-        menu.addItem(intervalMenu(title: "Инбокс: расписание", choices: inboxIntervalChoices,
-                                  current: inboxIntervalMinutes, next: nextInboxRun,
-                                  selector: #selector(inboxIntervalClicked(_:)),
-                                  hint: "Только инбокс: посмотреть новые карточки и отписаться"))
-        menu.addItem(intervalMenu(title: "Эпики: расписание", choices: epicsIntervalChoices,
-                                  current: epicsIntervalMinutes, next: nextEpicsRun,
-                                  selector: #selector(epicsIntervalClicked(_:)),
-                                  hint: "Только эпики: критерии, спека, ревью спеки, "
-                                      + "декомпозиция. Чаще всего это дешёвая проверка: "
-                                      + "агент идёт работать, лишь когда фаза сменилась"))
+        // Три расписания, и каждое ходит только за своим. Менять их теперь можно
+        // в витрине — здесь они только видны: настройки в двух местах разъезжаются,
+        // и человек перестаёт понимать, какое из них настоящее.
+        menu.addItem(scheduleLine("Доска", minutes: intervalMinutes, next: nextRun))
+        menu.addItem(scheduleLine("Инбокс", minutes: inboxIntervalMinutes, next: nextInboxRun))
+        menu.addItem(scheduleLine("Эпики", minutes: epicsIntervalMinutes, next: nextEpicsRun))
 
         menu.addItem(.separator())
         if let outcome = status.lastOutcome, let id = status.lastCardID {
@@ -691,7 +680,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
         menu.addItem(action("Открыть доску", #selector(openBoard)))
         menu.addItem(action("Показать лог", #selector(openLog)))
-        menu.addItem(action("Настройки Time…", #selector(timeSettingsClicked)))
+        menu.addItem(action("Открыть витрину…", #selector(openDashboard)))
         menu.addItem(authMenu())
 
         menu.addItem(.separator())
@@ -734,23 +723,22 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     /// Подменю с интервалами: галочка на текущем, время следующего запуска — в подсказке.
-    private func intervalMenu(title: String, choices: [(title: String, minutes: Int)],
-                              current: Int, next: Date?, selector: Selector,
-                              hint: String) -> NSMenuItem {
-        let head = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        for choice in choices {
-            let item = NSMenuItem(title: choice.title, action: selector, keyEquivalent: "")
-            item.target = self
-            item.tag = choice.minutes
-            item.state = choice.minutes == current ? .on : .off
-            submenu.addItem(item)
+    /// Строка расписания: что и как часто. Только для чтения — меняется в витрине.
+    private func scheduleLine(_ what: String, minutes: Int, next: Date?) -> NSMenuItem {
+        var text = "\(what): выключено"
+        if minutes > 0 {
+            text = "\(what): раз в \(humanMinutes(minutes))"
+            if let next { text += ", в \(clock(next))" }
         }
-        head.submenu = submenu
-        head.toolTip = current > 0 && next != nil
-            ? "\(hint). Следующая в \(clock(next!))"
-            : "\(hint). Выключено"
-        return head
+        let item = disabled(text)
+        item.toolTip = "Расписание меняется в витрине — «Открыть витрину» ниже"
+        return item
+    }
+
+    private func humanMinutes(_ minutes: Int) -> String {
+        if minutes % 1440 == 0 { return minutes == 1440 ? "день" : "\(minutes / 1440) дня" }
+        if minutes % 60 == 0 { return minutes == 60 ? "час" : "\(minutes / 60) ч" }
+        return "\(minutes) мин"
     }
 
     private func clock(_ date: Date) -> String {
@@ -795,24 +783,6 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     @objc private func epicsClicked() { startRun(manual: true, mode: .epics) }
     @objc private func stopClicked() { stopRun(); redraw() }
     @objc private func quitClicked() { NSApp.terminate(nil) }
-
-    @objc private func intervalClicked(_ sender: NSMenuItem) {
-        intervalMinutes = sender.tag
-        rescheduleTimer()
-        redraw()
-    }
-
-    @objc private func inboxIntervalClicked(_ sender: NSMenuItem) {
-        inboxIntervalMinutes = sender.tag
-        rescheduleInboxTimer()
-        redraw()
-    }
-
-    @objc private func epicsIntervalClicked(_ sender: NSMenuItem) {
-        epicsIntervalMinutes = sender.tag
-        rescheduleEpicsTimer()
-        redraw()
-    }
 
     @objc private func openCardClicked(_ sender: NSMenuItem) {
         if let url = sender.representedObject as? String { open(url) } else { openBoard() }
@@ -898,10 +868,18 @@ final class Fabrica: NSObject, NSApplicationDelegate {
 
     // MARK: - мелочи
 
-    /// Окно настроек Time. Живёт между открытиями, чтобы не собирать его заново.
-    @objc private func timeSettingsClicked() {
-        if timeSettings == nil { timeSettings = TimeSettings(root: root) }
-        timeSettings?.show()
+    /// Витрина: статистика и все настройки. Запускаем через логин-шелл — python3
+    /// у человека может стоять не там, куда смотрит сокращённый PATH служебного
+    /// процесса. Повторный запуск безвреден: витрина увидит занятый порт, поймёт,
+    /// что это она же, и просто откроет вкладку.
+    @objc private func openDashboard() {
+        let command = "cd \(shellQuote(root.path)) && python3 dashboard.py"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-ilc", command]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 
     private func open(_ string: String) {
@@ -941,6 +919,7 @@ extension Fabrica: NSMenuDelegate {
     // состояние могло измениться, пока меню было закрыто
     func menuWillOpen(_ menu: NSMenu) {
         readStatusFile()
+        applyScheduleChanges()
         redraw()
     }
 }
@@ -972,327 +951,3 @@ enum Main {
 /// респонденту, и если его в цепочке нет, вставка молча не происходит — так и было
 /// в первой попытке. Заодно `currentEditor()` отвечает на главный вопрос: нажатие
 /// адресовано именно этому полю, ведь `performKeyEquivalent` спрашивают у всех подряд.
-private func editingShortcut(_ field: NSTextField, _ event: NSEvent) -> Bool {
-    guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-          let key = event.charactersIgnoringModifiers?.lowercased(),
-          let editor = field.currentEditor()
-    else { return false }
-    switch key {
-    case "v": editor.paste(nil)
-    case "c": editor.copy(nil)
-    case "x": editor.cut(nil)
-    case "a": editor.selectAll(nil)
-    default: return false
-    }
-    return true
-}
-
-final class PasteableTextField: NSTextField {
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        editingShortcut(self, event) || super.performKeyEquivalent(with: event)
-    }
-}
-
-final class PasteableSecureField: NSSecureTextField {
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        editingShortcut(self, event) || super.performKeyEquivalent(with: event)
-    }
-}
-
-/// Окно «Настройки Time»: транспорт, адрес, секрет, канал.
-///
-/// Само оно не пишет ни конфиг, ни файл с секретом: сохранение — это
-/// `setup.py --set-notify` и `--set-secret`, проверка — `factory.py --time-test`.
-/// Так у настроек одна реализация на приложение и на терминал, и config.json пишет
-/// питон: там комментарии лежат ключами и порядок осмысленный, а JSONSerialization
-/// перетасовала бы их так, что файл перестал бы читаться человеком.
-///
-/// Секрет уходит в питон через stdin, а не аргументом: аргументы видны в `ps` любому
-/// процессу пользователя.
-final class TimeSettings: NSObject, NSMenuDelegate {
-    private let root: URL
-    private var window: NSWindow?
-
-    private let transport = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let address = PasteableTextField()
-    private let secret = PasteableSecureField()
-    /// Каналы бота списком: id канала в Time не показывают, а бота в нужные каналы
-    /// обычно добавляют сразу — значит спрашивать id у человека незачем, он и так
-    /// есть в списке. Выбранное лежит в representedObject пункта.
-    private let channel = NSPopUpButton(frame: .zero, pullsDown: false)
-    /// Канал из конфига. Держим отдельно: если список не удалось получить, сохранение
-    /// не должно затереть то, что уже настроено.
-    private var savedChannel = ""
-    private let note = NSTextField(wrappingLabelWithString: "")
-    private var rows: NSStackView?
-
-    init(root: URL) {
-        self.root = root
-        super.init()
-    }
-
-    func show() {
-        if window == nil { window = build() }
-        load()
-        NSApp.activate(ignoringOtherApps: true)
-        window?.center()
-        window?.makeKeyAndOrderFront(nil)
-    }
-
-    // MARK: - сборка окна
-
-    private func build() -> NSWindow {
-        transport.addItems(withTitles: ["Бот", "Вебхук"])
-        transport.target = self
-        transport.action = #selector(transportChanged)
-        // Наполняем список в момент раскрытия, а не при открытии окна: за каналами
-        // надо идти в Time, и на медленной сети окно замирало бы на открытии.
-        channel.menu?.delegate = self
-        address.placeholderString = "https://company.time-messenger.ru"
-        secret.placeholderString = "токен бота"
-        note.textColor = .secondaryLabelColor
-
-        let save = NSButton(title: "Сохранить", target: self, action: #selector(saveClicked))
-        let test = NSButton(title: "Проверить", target: self, action: #selector(testClicked))
-        save.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [test, save])
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-
-        let rows = NSStackView(views: [
-            row("Транспорт", transport),
-            row("Адрес Time", address),
-            row("Секрет", secret),
-            row("Канал", channel),
-            row("", buttons),
-            note,
-        ])
-        rows.orientation = .vertical
-        rows.alignment = .leading
-        rows.spacing = 10
-        rows.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        rows.translatesAutoresizingMaskIntoConstraints = false
-        note.translatesAutoresizingMaskIntoConstraints = false
-        note.widthAnchor.constraint(equalToConstant: 440).isActive = true
-
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
-                              styleMask: [.titled, .closable],
-                              backing: .buffered, defer: false)
-        window.title = "Настройки Time"
-        window.isReleasedWhenClosed = false
-        // Окно по содержимому, а не наоборот: высота полей зависит от системного шрифта,
-        // а строка результата — от длины ответа. Захардкоженная высота оставляла снизу
-        // пустую треть, а длинный ответ обрезала.
-        window.contentView = rows
-        self.rows = rows
-        fit(window)
-        return window
-    }
-
-    /// Подогнать окно под содержимое. Зовётся и после сборки, и после каждого ответа:
-    /// строка результата многострочная, и от неё высота меняется.
-    private func fit(_ window: NSWindow?) {
-        guard let window, let rows else { return }
-        rows.layoutSubtreeIfNeeded()
-        window.setContentSize(rows.fittingSize)
-    }
-
-    private func row(_ title: String, _ field: NSView) -> NSView {
-        let label = NSTextField(labelWithString: title)
-        label.alignment = .right
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        field.translatesAutoresizingMaskIntoConstraints = false
-        if field is NSTextField || field is NSPopUpButton {
-            field.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        }
-        let stack = NSStackView(views: [label, field])
-        stack.orientation = .horizontal
-        stack.spacing = 10
-        return stack
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard isBot, menu == channel.menu else { return }
-        fillChannels()
-    }
-
-    /// Пока список не раскрывали, показываем одним пунктом то, что уже настроено.
-    /// id канала в пункте живёт всегда — иначе сохранение затёрло бы настроенное.
-    private func showSavedChannel() {
-        channel.removeAllItems()
-        if isBot {
-            channel.addItem(withTitle: savedChannel.isEmpty
-                            ? "нажми, чтобы выбрать" : "канал выбран")
-            channel.lastItem?.representedObject = savedChannel.isEmpty ? nil : savedChannel
-            channel.isEnabled = true
-        } else {
-            channel.addItem(withTitle: "у вебхука канал в URL")
-            channel.isEnabled = false
-        }
-    }
-
-    /// Наполнить список каналов тем, что отдал бот. Не получилось — говорим об этом
-    /// пунктом в списке, а настроенный канал не теряем.
-    private func fillChannels() {
-        channel.removeAllItems()
-        guard isBot else {
-            channel.addItem(withTitle: "у вебхука канал в URL")
-            channel.isEnabled = false
-            return
-        }
-        let answer = run(["factory.py", "--time-channels"])
-        let data = answer.out.data(using: .utf8) ?? Data()
-        let parsed = try? JSONSerialization.jsonObject(with: data)
-        guard let list = parsed as? [[String: Any]], !list.isEmpty else {
-            let why = (parsed as? [String: Any])?["error"] as? String
-            channel.addItem(withTitle: why ?? "сначала сохрани токен")
-            channel.isEnabled = false
-            return
-        }
-        channel.isEnabled = true
-        for entry in list {
-            guard let id = entry["id"] as? String else { continue }
-            let name = (entry["name"] as? String) ?? id
-            let team = (entry["team"] as? String) ?? ""
-            let lock = (entry["private"] as? Bool) == true ? " 🔒" : ""
-            let title = team.isEmpty ? "\(name)\(lock)" : "\(team) / \(name)\(lock)"
-            channel.addItem(withTitle: title)
-            channel.lastItem?.representedObject = id
-            if id == savedChannel { channel.select(channel.lastItem) }
-        }
-    }
-
-    /// Что выбрано в списке. Пусто — список не наполнился, и трогать конфиг нельзя.
-    private var chosenChannel: String {
-        (channel.selectedItem?.representedObject as? String) ?? ""
-    }
-
-    private var isBot: Bool { transport.indexOfSelectedItem == 0 }
-
-    private var secretName: String { isBot ? "TIME_BOT_TOKEN" : "TIME_WEBHOOK_URL" }
-
-    @objc private func transportChanged() {
-        secret.placeholderString = isBot ? "токен бота" : "URL вебхука"
-        // у вебхука канал зашит в сам URL, спрашивать его второй раз незачем
-        address.isEnabled = isBot
-        note.stringValue = isBot ? "" : "У вебхука канал зашит в URL, и тред он читать "
-            + "не умеет: сообщения про PR пойдут, а правки из треда — нет."
-        showSavedChannel()
-        fit(window)
-    }
-
-    // MARK: - чтение и запись
-
-    private func load() {
-        let answer = run(["setup.py", "--get-notify"])
-        let shown = answer.out
-        guard let data = shown.data(using: .utf8),
-              let conf = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else {
-            note.stringValue = "Не смог прочитать настройки: " + said(answer)
-            fit(window)
-            return
-        }
-        defer { fit(window) }
-        transport.selectItem(at: (conf["transport"] as? String) == "webhook" ? 1 : 0)
-        address.stringValue = (conf["base_url"] as? String) ?? ""
-        savedChannel = ((conf["channels"] as? [String: Any])?["default"] as? String) ?? ""
-        secret.stringValue = ""
-        transportChanged()
-        let key = "has_" + secretName.lowercased()
-        if (conf[key] as? Bool) == true {
-            secret.placeholderString = "уже задан, можно не вводить"
-        }
-    }
-
-    /// Сохраняет и возвращает, что сказал питон. Пустой секрет — не ошибка: значит его
-    /// уже задали раньше и трогать не надо.
-    private func save() -> String {
-        var conf: [String: Any] = ["transport": isBot ? "bot" : "webhook"]
-        if isBot {
-            conf["base_url"] = address.stringValue.trimmingCharacters(in: .whitespaces)
-            // канал пишем только когда он реально выбран: список мог не наполниться,
-            // и затирать уже настроенное нечем — незачем
-            let id = chosenChannel
-            if !id.isEmpty {
-                conf["channels"] = ["default": id]
-                savedChannel = id
-            }
-        }
-        guard let json = try? JSONSerialization.data(withJSONObject: conf),
-              let text = String(data: json, encoding: .utf8)
-        else { return "не собрал настройки" }
-
-        var report = said(run(["setup.py", "--set-notify"], input: text))
-        let value = secret.stringValue.trimmingCharacters(in: .whitespaces)
-        if !value.isEmpty {
-            report += "\n" + said(run(["setup.py", "--set-secret", secretName], input: value))
-            secret.stringValue = ""
-            secret.placeholderString = "уже задан, можно не вводить"
-            // с новым токеном каналы наконец можно спросить
-            if isBot && chosenChannel.isEmpty { fillChannels() }
-        }
-        return report
-    }
-
-    @objc private func saveClicked() {
-        note.stringValue = save()
-        fit(window)
-    }
-
-    @objc private func testClicked() {
-        // сначала сохраняем: проверять надо то, что человек видит в полях, а проверка
-        // идёт тем же кодом, которым потом пишет фабрика, — он читает конфиг с диска
-        note.stringValue = save() + "\n\n" + said(run(["factory.py", "--time-test"]))
-        fit(window)
-    }
-
-    // MARK: - запуск питона
-
-    /// Потоки держим раздельно: у машинных команд stdout — чистый JSON, а лог фабрика
-    /// пишет в stderr. Слитые вместе, они ломали разбор списка каналов.
-    private func run(_ arguments: [String], input: String? = nil)
-        -> (out: String, err: String, code: Int32) {
-        let task = Process()
-        // /usr/bin/python3 есть на маке всегда; в логин-шелл лезть незачем — этим
-        // командам не нужны ни nvm, ни токены из профиля
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        task.arguments = arguments
-        task.currentDirectoryURL = root
-
-        let output = Pipe()
-        let errors = Pipe()
-        task.standardOutput = output
-        task.standardError = errors
-        let stdin = Pipe()
-        if input != nil { task.standardInput = stdin }
-
-        guard (try? task.run()) != nil else {
-            return ("", "не смог запустить python3", -1)
-        }
-        if let input {
-            stdin.fileHandleForWriting.write(Data(input.utf8))
-            stdin.fileHandleForWriting.closeFile()
-        }
-        // читаем оба до конца прежде, чем ждать: иначе процесс упрётся в полный канал
-        let out = output.fileHandleForReading.readDataToEndOfFile()
-        let err = errors.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        return (clean(out), clean(err), task.terminationStatus)
-    }
-
-    /// Что показать человеку: обычно питон говорит по делу в stdout, а если промолчал —
-    /// причина будет в stderr.
-    private func said(_ answer: (out: String, err: String, code: Int32)) -> String {
-        answer.out.isEmpty ? answer.err : answer.out
-    }
-
-    /// Питон красит вывод для терминала — в окне эти escape-последовательности лишние.
-    private func clean(_ data: Data) -> String {
-        let text = String(data: data, encoding: .utf8) ?? ""
-        return text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "",
-                                         options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}

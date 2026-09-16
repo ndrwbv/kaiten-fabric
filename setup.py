@@ -233,6 +233,144 @@ def get_notify() -> int:
     return 0
 
 
+# Ручки, которые разрешено крутить снаружи — из витрины. Всё, чего в этом списке
+# нет, правится мастером или руками, и это осознанно: id доски и колонок — не
+# «настройка», а описание доски. Опечатка в них уводит карточки в никуда молча,
+# и заметит это только доктор `--check`, а форма в браузере — нет.
+#
+# Значение пары — как проверить. Проверка возвращает то, что ляжет в конфиг,
+# или бросает ValueError с человеческим объяснением.
+def _num(low, high, whole=False):
+    def check(value):
+        try:
+            number = int(value) if whole else float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"нужно число от {low} до {high}") from None
+        if not low <= number <= high:
+            raise ValueError(f"нужно число от {low} до {high}, а не {number}")
+        return number
+    return check
+
+
+def _flag(value):
+    if isinstance(value, bool):
+        return value
+    raise ValueError("нужно да или нет")
+
+
+def _one_of(*allowed):
+    def check(value):
+        text = str(value).strip()
+        if text not in allowed:
+            raise ValueError("нужно одно из: " + ", ".join(allowed))
+        return text
+    return check
+
+
+def _text(limit=60):
+    def check(value):
+        text = str(value).strip()
+        if not text:
+            raise ValueError("пустое значение")
+        if len(text) > limit:
+            raise ValueError(f"длиннее {limit} символов")
+        return text
+    return check
+
+
+def _tag(value):
+    text = str(value).strip()
+    if not re.fullmatch(r"[a-zA-Zа-яА-Я0-9_:.-]{2,40}", text):
+        raise ValueError("тег — 2–40 символов без пробелов")
+    return text
+
+
+CONFIG_KNOBS = {
+    "bot.name": _text(),
+    "bot.tag": _tag,
+    "max_cards_per_run": _num(1, 10, whole=True),
+    "max_spend_per_run": _num(1, 500),
+    "keep_worktree": _flag,
+    "agent.model": _text(),
+    "agent.effort": _one_of("low", "medium", "high"),
+    "agent.max_budget_usd": _num(0.5, 100),
+    "agent.timeout_sec": _num(60, 10800, whole=True),
+    "reviewer.model": _text(),
+    "reviewer.effort": _one_of("low", "medium", "high"),
+    "reviewer.max_budget_usd": _num(0.5, 100),
+    "reviewer.timeout_sec": _num(60, 10800, whole=True),
+    "reviewer.max_rounds": _num(1, 10, whole=True),
+    "reviewer.post_to_pr": _flag,
+    "triager.model": _text(),
+    "triager.effort": _one_of("low", "medium", "high"),
+    "triager.max_budget_usd": _num(0.5, 100),
+    "triager.timeout_sec": _num(60, 10800, whole=True),
+    "night.from_hour": _num(0, 23, whole=True),
+    "night.to_hour": _num(0, 23, whole=True),
+    "inbox.max_cards_per_run": _num(1, 20, whole=True),
+    "inbox.max_rounds": _num(1, 5, whole=True),
+    "inbox.create_cards": _flag,
+    "inbox.target": _one_of("subtasks", "own"),
+    "epic_flow.max_epics_per_run": _num(1, 5, whole=True),
+    "epic_flow.max_subtasks": _num(1, 10, whole=True),
+    "epic_flow.answer_wait_hours": _num(0, 72, whole=True),
+    "epic_flow.agent.max_budget_usd": _num(0.5, 100),
+    "pr.draft": _flag,
+}
+
+
+def set_config() -> int:
+    """
+    Записать в конфиг разрешённые ручки из JSON со stdin: `{"agent.effort": "high"}`.
+
+    Проверяем всё до единой записи: половина применённых настроек хуже, чем ни одной.
+    Секцию, которой в конфиге нет, не создаём — секция это выключатель режима
+    (`night`, `inbox`, `epic_flow`), и включать режим правкой числа было бы сюрпризом.
+    """
+    if not CONFIG_PATH.is_file():
+        bad(f"{CONFIG_PATH.name} не найден — сначала пройди мастер")
+        return 1
+    try:
+        incoming = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as e:
+        bad(f"на входе не JSON: {e}")
+        return 1
+    if not isinstance(incoming, dict):
+        bad("на входе ожидается объект вида {\"agent.effort\": \"high\"}")
+        return 1
+
+    config = json.loads(strip_jsonc(CONFIG_PATH.read_text(encoding="utf-8")))
+    planned = []
+    for path, value in incoming.items():
+        check = CONFIG_KNOBS.get(path)
+        if not check:
+            bad(f"{path}: такую настройку снаружи менять нельзя")
+            return 1
+        try:
+            clean = check(value)
+        except ValueError as e:
+            bad(f"{path}: {e}")
+            return 1
+        *parents, key = path.split(".")
+        section = config
+        for name in parents:
+            if not isinstance(section.get(name), dict):
+                bad(f"{path}: в конфиге нет секции «{name}» — её заводит мастер")
+                return 1
+            section = section[name]
+        planned.append((section, key, clean, path))
+
+    changed = []
+    for section, key, clean, path in planned:
+        if section.get(key) != clean:
+            section[key] = clean
+            changed.append(f"{path}={clean}")
+    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+    ok("конфиг обновлён: " + (", ".join(changed) if changed else "всё и так так стояло"))
+    return 0
+
+
 def set_notify() -> int:
     """
     Слить пришедший со stdin JSON в секцию notify.time конфига.
@@ -1219,6 +1357,8 @@ def main() -> int:
                         help="слить JSON со stdin в секцию notify.time конфига")
     parser.add_argument("--get-notify", action="store_true",
                         help="показать настройки notify.time (без секретов)")
+    parser.add_argument("--set-config", action="store_true",
+                        help="записать разрешённые настройки из JSON со stdin")
     args = parser.parse_args()
 
     if args.check:
@@ -1231,6 +1371,8 @@ def main() -> int:
         return set_notify()
     if args.get_notify:
         return get_notify()
+    if args.set_config:
+        return set_config()
 
     if args.spaces is not None:
         query = normalize(args.spaces)

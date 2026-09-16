@@ -184,6 +184,17 @@ tr:last-child td { border-bottom: 0; }
 .rules li { margin: 7px 0; }
 .rules code { background: color-mix(in srgb, var(--accent) 12%, transparent);
               color: var(--accent); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+       padding: 9px 0; border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; padding-top: 0; }
+.row .name { flex: 1; min-width: 190px; }
+.row .name i { display: block; font-style: normal; color: var(--dim); font-size: 12px; }
+.row select, .row input[type=text], .row input[type=number], .row input[type=password] {
+  font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 5px 8px; min-width: 140px;
+}
+.row input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--accent); }
+.saved { color: var(--ok); font-size: 12px; }
 .facts { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .fact b { display: block; font-size: 16px; font-weight: 600; }
 .fact span { color: var(--dim); font-size: 12px; }
@@ -220,6 +231,7 @@ pre.log { margin: 0; max-height: 60vh; overflow: auto; font-size: 12px; line-hei
   <a href="#/stuck" data-page="stuck">Не смог <span class="n" id="navStuck"></span></a>
   <a href="#/money" data-page="money">Деньги</a>
   <a href="#/rules" data-page="rules">Правила</a>
+  <a href="#/settings" data-page="settings">Настройки</a>
   <a href="#/log" data-page="log">Лог</a>
   <span class="right">
     <button data-days="7">7 дней</button>
@@ -287,6 +299,14 @@ pre.log { margin: 0; max-height: 60vh; overflow: auto; font-size: 12px; line-hei
         по которому он работает прямо сейчас. Поменял потолок расхода или тег —
         поменялась и эта страница.</div>
     </section>
+  </div>
+
+  <div class="page" id="page-settings">
+    <section><h2>Расписание</h2><div class="panel" id="schedules"></div></section>
+    <section><h2>Настройки</h2><div class="grid rules" id="knobs"></div></section>
+    <section><h2>Сообщения в Time</h2><div class="panel" id="timeSettings"></div></section>
+    <section><h2>Токены</h2><div class="panel" id="secrets"></div></section>
+    <section><div class="note" id="settingsNote"></div></section>
   </div>
 
   <div class="page" id="page-log">
@@ -405,6 +425,7 @@ function route() {
     el.classList.toggle('on', el.dataset.page === state.page));
   window.scrollTo(0, 0);
   if (state.page === 'log') loadLog();
+  if (state.page === 'settings') loadSettings();
 }
 window.addEventListener('hashchange', route);
 
@@ -750,6 +771,205 @@ function drawRules(data) {
       <h3>${esc(block.title)}</h3>
       <ul>${block.lines.map((line) => `<li>${markup(line)}</li>`).join('')}</ul>
     </div>`).join('');
+}
+
+/* ---------- настройки ---------- */
+
+let settingsData = null;
+
+async function loadSettings() {
+  try { settingsData = await api('/api/settings'); } catch (e) { return; }
+  drawSchedules();
+  drawKnobs();
+  drawTime();
+  drawSecrets();
+}
+
+async function post(path, body) {
+  return api(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Fabrica': '1' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function saveSettings(patch, where) {
+  try {
+    const answer = await post('/api/settings', patch);
+    say(answer.text, !answer.ok);
+    if (where) where.innerHTML = answer.ok ? '<span class="saved">сохранено</span>'
+                                           : `<span class="toast bad">${esc(answer.text)}</span>`;
+    if (answer.ok) setTimeout(loadSettings, 300);
+  } catch (e) { say('не сохранилось: ' + e.message, true); }
+}
+
+function drawSchedules() {
+  $('schedules').innerHTML = settingsData.schedules.map((item) => `
+    <div class="row">
+      <span class="name">${esc(item.title)}<i>${esc(item.hint)}</i></span>
+      <select data-schedule="${item.key}">
+        ${item.options.map((o) =>
+          `<option value="${o.minutes}"${o.minutes === item.minutes ? ' selected' : ''}>${o.title}</option>`).join('')}
+      </select>
+      <span class="mark"></span>
+    </div>`).join('')
+    + `<div class="note">Расписание держит приложение в меню-баре: оно перечитывает
+       этот файл раз в десять секунд, так что менять можно на ходу. Закрыл приложение —
+       прогоны по расписанию останавливаются, кнопки в шапке работать продолжают.</div>`;
+  $('schedules').querySelectorAll('select[data-schedule]').forEach((select) =>
+    select.addEventListener('change', () => saveSettings(
+      { schedule: { [select.dataset.schedule]: Number(select.value) } },
+      select.nextElementSibling)));
+}
+
+function field(f) {
+  const id = 'f-' + f.path.replace(/\./g, '-');
+  let control;
+  if (f.kind === 'flag') {
+    control = `<input type="checkbox" id="${id}" data-path="${f.path}" data-kind="flag"
+                      ${f.value ? 'checked' : ''}>`;
+  } else if (f.kind.startsWith('choice:')) {
+    const options = f.kind.slice(7).split('|').map((pair) => {
+      const [value, title] = pair.split('=');
+      return `<option value="${value}"${value === String(f.value) ? ' selected' : ''}>${title}</option>`;
+    }).join('');
+    control = `<select id="${id}" data-path="${f.path}" data-kind="choice">${options}</select>`;
+  } else if (f.kind === 'int' || f.kind === 'money') {
+    control = `<input type="number" id="${id}" data-path="${f.path}" data-kind="${f.kind}"
+                      step="${f.kind === 'money' ? '0.5' : '1'}" value="${f.value ?? ''}">`;
+  } else {
+    control = `<input type="text" id="${id}" data-path="${f.path}" data-kind="text"
+                      value="${esc(String(f.value ?? ''))}">`;
+  }
+  return `<div class="row">
+      <span class="name"><label for="${id}">${esc(f.label)}</label>
+        ${f.hint ? `<i>${esc(f.hint)}</i>` : ''}</span>
+      ${control}<span class="mark"></span>
+    </div>`;
+}
+
+function drawKnobs() {
+  $('knobs').innerHTML = settingsData.groups.map((group) => `
+    <div class="panel">
+      <h3>${esc(group.title)}</h3>
+      ${group.fields.map(field).join('')}
+    </div>`).join('');
+  $('knobs').querySelectorAll('[data-path]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const kind = input.dataset.kind;
+      let value = input.value;
+      if (kind === 'flag') value = input.checked;
+      else if (kind === 'int') value = parseInt(value, 10);
+      else if (kind === 'money') value = parseFloat(value);
+      saveSettings({ config: { [input.dataset.path]: value } }, input.nextElementSibling);
+    });
+  });
+  $('settingsNote').textContent = 'Доски, колонки и репозитории здесь не правятся: '
+    + 'их описывает мастер, python3 setup.py, а проверяет доктор setup.py --check. '
+    + 'Опечатка в id колонки уводит карточки в никуда молча, и форма в браузере '
+    + 'этого не заметит.';
+}
+
+function drawTime() {
+  const t = settingsData.time || {};
+  const bot = (t.transport || 'bot') === 'bot';
+  const channel = ((t.channels || {}).default) || '';
+  $('timeSettings').innerHTML = `
+    <div class="row">
+      <span class="name">Транспорт<i>бот умеет треды и ответы, вебхук — только писать</i></span>
+      <select id="timeTransport">
+        <option value="bot"${bot ? ' selected' : ''}>Бот</option>
+        <option value="webhook"${bot ? '' : ' selected'}>Вебхук</option>
+      </select>
+    </div>
+    <div class="row">
+      <span class="name">Адрес Time</span>
+      <input type="text" id="timeBase" style="min-width:280px"
+             value="${esc(t.base_url || '')}" placeholder="https://company.time-messenger.ru">
+    </div>
+    <div class="row">
+      <span class="name">Канал по умолчанию<i>${channel ? 'сейчас: ' + esc(channel) : 'не задан'}</i></span>
+      <select id="timeChannel"><option value="">— оставить как есть —</option></select>
+      <button id="loadChannels">Показать каналы</button>
+    </div>
+    <div class="row">
+      <span class="name">Секрет<i>${t.has_time_bot_token ? 'токен бота задан' : 'токена бота нет'}
+        · ${t.has_time_webhook_url ? 'вебхук задан' : 'вебхука нет'}</i></span>
+      <input type="password" id="timeSecret" placeholder="вводить только чтобы заменить">
+    </div>
+    <div class="row">
+      <span class="name"></span>
+      <button id="saveTime" class="primary">Сохранить</button>
+      <button id="testTime">Проверить связь</button>
+      <span class="mark" id="timeMark"></span>
+    </div>`;
+
+  $('loadChannels').addEventListener('click', async () => {
+    $('loadChannels').disabled = true;
+    const answer = await api('/api/channels');
+    $('loadChannels').disabled = false;
+    if (!answer.ok) { say('каналы не пришли: ' + (answer.text || ''), true); return; }
+    $('timeChannel').innerHTML = '<option value="">— оставить как есть —</option>'
+      + answer.channels.map((c) =>
+          `<option value="${esc(c.id)}"${c.id === channel ? ' selected' : ''}>${esc(c.title || c.name || c.id)}</option>`).join('');
+  });
+
+  $('saveTime').addEventListener('click', async () => {
+    const body = { transport: $('timeTransport').value };
+    const base = $('timeBase').value.trim();
+    if (base) body.base_url = base;
+    const picked = $('timeChannel').value;
+    if (picked) body.channels = { default: picked };
+    const answer = await post('/api/notify', body);
+    say(answer.text, !answer.ok);
+    const secret = $('timeSecret').value.trim();
+    if (secret) {
+      const name = body.transport === 'bot' ? 'TIME_BOT_TOKEN' : 'TIME_WEBHOOK_URL';
+      const kept = await post('/api/secret', { name, value: secret });
+      say(kept.text, !kept.ok);
+      $('timeSecret').value = '';
+    }
+    loadSettings();
+  });
+
+  $('testTime').addEventListener('click', async () => {
+    $('timeMark').textContent = 'проверяю…';
+    const answer = await post('/api/time-test', {});
+    $('timeMark').innerHTML = answer.ok ? '<span class="saved">дошло</span>'
+                                        : `<span class="toast bad">${esc(answer.text)}</span>`;
+  });
+}
+
+function drawSecrets() {
+  const auth = settingsData.auth || {};
+  $('secrets').innerHTML = `
+    <div class="row">
+      <span class="name">Долгоживущий токен клода<i>${auth.ok ? 'авторизация сейчас жива' : 'авторизация протухла'}
+        — получить его можно только в терминале: <code>claude setup-token</code></i></span>
+      <input type="password" id="claudeToken" placeholder="вставить и сохранить">
+      <button data-secret="CLAUDE_CODE_OAUTH_TOKEN">Сохранить</button>
+      <span class="mark"></span>
+    </div>
+    <div class="row">
+      <span class="name">Токен Kaiten<i>меняется редко — только если старый отозвали</i></span>
+      <input type="password" id="kaitenToken" placeholder="вставить и сохранить">
+      <button data-secret="KAITEN_TOKEN">Сохранить</button>
+      <span class="mark"></span>
+    </div>
+    <div class="note">Значение уходит в setup.py через канал, а не аргументом: аргументы
+      видны в <code>ps</code> любому процессу. В витрине оно нигде не сохраняется.</div>`;
+  $('secrets').querySelectorAll('button[data-secret]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const input = button.previousElementSibling;
+      const value = input.value.trim();
+      if (!value) { say('пустое значение', true); return; }
+      const answer = await post('/api/secret', { name: button.dataset.secret, value });
+      input.value = '';
+      button.nextElementSibling.innerHTML = answer.ok
+        ? '<span class="saved">сохранено</span>'
+        : `<span class="toast bad">${esc(answer.text)}</span>`;
+      say(answer.text, !answer.ok);
+    });
+  });
 }
 
 function drawHealth(data) {

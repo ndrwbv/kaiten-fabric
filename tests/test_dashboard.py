@@ -279,4 +279,59 @@ check("одна из них с первого раза",
       weeks["2026-08-31"]["clean"] == 1 and weeks["2026-08-31"]["rework"] == 1)
 check("неудача — в свою неделю", weeks["2026-09-07"]["failed"] == 1)
 
+print("=== 22. расписание живёт в общем файле ===")
+d.SETTINGS_FILE = Path(tempfile.mkdtemp()) / "settings.json"
+d.factory.STATE = d.SETTINGS_FILE.parent
+d.legacy_schedule = lambda key: {"inbox": 30}.get(key)   # что было в меню-баре
+
+settings = d.load_settings()
+check("старое значение подхвачено", settings["schedule"]["inbox"] == 30,
+      str(settings["schedule"]))
+check("остальное — по умолчанию", settings["schedule"]["board"] == 60
+      and settings["schedule"]["epics"] == 15, str(settings["schedule"]))
+check("и сразу записано в файл", d.SETTINGS_FILE.is_file())
+
+d.save_settings({"schedule": {"board": 120}})
+saved = d.load_settings()["schedule"]
+check("правка легла", saved["board"] == 120, str(saved))
+check("а соседей не затёрла", saved["inbox"] == 30 and saved["epics"] == 15, str(saved))
+
+print("=== 23. что витрина принимает от страницы ===")
+check("расписание", d.apply_settings({"schedule": {"epics": 0}})["ok"])
+check("выключенное расписание так и записано",
+      d.load_settings()["schedule"]["epics"] == 0)
+answer = d.apply_settings({"schedule": {"чужое": 5}})
+check("чужой ключ не пишем", not answer["ok"], answer["text"])
+answer = d.apply_settings({"schedule": {"board": -1}})
+check("отрицательные минуты тоже", not answer["ok"], answer["text"])
+answer = d.apply_settings({"schedule": {"board": "часто"}})
+check("и слова вместо числа", not answer["ok"], answer["text"])
+
+print("=== 24. конфиг правится только по списку разрешённого ===")
+setup_spec = importlib.util.spec_from_file_location("setup", ROOT / "setup.py")
+setup = importlib.util.module_from_spec(setup_spec); setup_spec.loader.exec_module(setup)
+
+check("id доски крутить нельзя", "kaiten.board_id" not in setup.CONFIG_KNOBS)
+check("колонки тоже", not any(k.startswith("kaiten.columns") for k in setup.CONFIG_KNOBS))
+check("а бюджет можно", "agent.max_budget_usd" in setup.CONFIG_KNOBS)
+
+check("усилие — из трёх", setup.CONFIG_KNOBS["agent.effort"]("high") == "high")
+for bad_value, why in (("max", "чужое усилие"), ("", "пустое")):
+    try:
+        setup.CONFIG_KNOBS["agent.effort"](bad_value)
+        check(why + " не прошло", False, "приняли")
+    except ValueError:
+        check(why + " не прошло", True)
+try:
+    setup.CONFIG_KNOBS["night.from_hour"](25)
+    check("час 25 не прошёл", False, "приняли")
+except ValueError:
+    check("час 25 не прошёл", True)
+try:
+    setup.CONFIG_KNOBS["bot.tag"]("два слова")
+    check("тег с пробелом не прошёл", False, "приняли")
+except ValueError:
+    check("тег с пробелом не прошёл", True)
+check("а нормальный тег прошёл", setup.CONFIG_KNOBS["bot.tag"](" stepa ") == "stepa")
+
 print("\nвсё сошлось")
