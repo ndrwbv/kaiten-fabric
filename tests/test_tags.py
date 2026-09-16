@@ -92,7 +92,76 @@ check("сабтаску эпика — нет, она уже на эпике",
 check("чужую карточку с тегом — нет, это не наша карточка",
       not f.wants_debt(sub, {"description": "Поправить текст"}))
 
-print("=== 8. стоп-фраза знает разработчика по имени ===")
+print("=== 8. задача из инбокса: тег, инбокс-родитель и след для долга ===")
+
+INBOX_CARD = 3001
+
+
+class FakeKaiten:
+    """Kaiten, который только записывает, о чём его попросили."""
+
+    def __init__(self):
+        self.created, self.tags, self.children_of, self.written = [], [], [], []
+        self.next_id = 5001
+
+    def cards_on_board(self, board_id, with_description=False):
+        return []                       # такой задачи ещё нет
+
+    def create_card(self, body):
+        card = {"id": self.next_id, **body}
+        self.next_id += 1
+        self.created.append(body)
+        return card
+
+    def add_tag(self, card_id, name):
+        self.tags.append((card_id, name))
+
+    def children(self, card_id):
+        return []
+
+    def add_child(self, parent_id, child_id):
+        self.children_of.append((parent_id, child_id))
+
+    def comment(self, card_id, text):
+        self.written.append(text)
+
+    def card_url(self, card):
+        return f"https://kaiten.example/card/{card['id']}"
+
+
+kaiten = FakeKaiten()
+inbox_card = {"id": INBOX_CARD, "title": "Кнопка не нажимается", "description": "жмёшь — тишина"}
+note = f.hand_off_to_factory(kaiten, CFG, inbox_card, [],
+                             {"problem": "не работает кнопка", "plan": ["починить"]},
+                             "https://kaiten.example/card/3001", dry_run=False)
+created = kaiten.created[0]
+check("завёл на доске сабтасок", created["board_id"] == SUB_BOARD, str(created["board_id"]))
+check("в «Очередь»", created["column_id"] == SUB_COLUMNS["queue"], str(created["column_id"]))
+check("повесил свой тег", kaiten.tags == [(5001, "stepa")], str(kaiten.tags))
+check("привязал дочерней к карточке инбокса",
+      kaiten.children_of == [(INBOX_CARD, 5001)], str(kaiten.children_of))
+check("в описании — откуда задача выросла",
+      f.INBOX_ORIGIN_RE.search(created["description"]) is not None)
+check("а значит, к долгу спринта её привяжет и доска сабтасок",
+      f.wants_debt({"attach_to_debt": False}, created))
+check("и в инбокс отчитался ссылкой", "5001" in note, note)
+
+print("=== 9. не встал тег — говорит об этом, а не молчит ===")
+
+
+class NoTags(FakeKaiten):
+    def add_tag(self, card_id, name):
+        raise RuntimeError("Kaiten не в духе")
+
+
+kaiten = NoTags()
+f.hand_off_to_factory(kaiten, CFG, inbox_card, [], {"problem": "", "plan": []},
+                      "https://kaiten.example/card/3001", dry_run=False)
+check("предупредил прямо в карточке",
+      any("тег" in text.lower() and "руками" in text for text in kaiten.written),
+      str(kaiten.written))
+
+print("=== 10. стоп-фраза знает разработчика по имени ===")
 for phrase in ("Стёпа не трогай эту карточку", "СТЕПА НЕ ТРОГАЙ", "не трогай стёпу"):
     check(f"«{phrase[:22]}»", bool(f.hands_off({"title": "Тест", "description": phrase},
                                                [], {})))
