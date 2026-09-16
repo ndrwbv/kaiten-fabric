@@ -154,6 +154,22 @@ check("ушло в тред", body.get("root_id") == "new-post", str(body))
 check("сказано, что поправил", body["message"].startswith("Чекай, поправил:"),
       body["message"])
 
+print("=== 4б. пересказ заголовка вместо отчёта в тред не уходит ===")
+echo = {"id": 556, "title": "Брать флаги из библиотеки автоматически и вернуть круг только Додо"}
+check("эхо постановки распознано",
+      f.echoes_title("Брать флаги из библиотеки автоматически и вернуть круг только Додо",
+                     echo["title"]))
+check("настоящий отчёт эхом не считается",
+      not f.echoes_title("Флаги стали квадратными из flag-icons, круглая обрезка на месте.",
+                         echo["title"]))
+json.loads(state_file.read_text())  # состояние на месте, тред 555 переиспользуем
+f.notify_pr(cfg, "kiosk", card, "https://kaiten/card/555",
+            "https://github.com/o/r/pull/7",
+            {"summary": card["title"]}, False, updated=True, env=env)
+body = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")][-1][2])
+check("заголовок в чат не уехал", card["title"] not in body["message"], body["message"])
+check("вместо него — куда смотреть", "в PR" in body["message"], body["message"])
+
 print("=== 5. ответ человека в треде → комментарий в карточку и «Правки» ===")
 class Args: dry_run = False; prompt_only = True
 kaiten = FakeKaiten()
