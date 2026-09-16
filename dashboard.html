@@ -7,6 +7,10 @@
   Никаких внешних библиотек: графики — это div-ы с высотой в процентах, и этого
   для десятка столбиков достаточно. Править можно на живую — страница читается
   с диска на каждый запрос.
+
+  Главный вопрос страницы — «помогает ли фабрика работать». Отсюда и порядок:
+  сначала сколько работы уехало в main и сколько её пришлось переделывать, потом
+  что стоит и ждёт человека, и только на отдельной странице — деньги.
 -->
 <style>
 :root {
@@ -29,25 +33,23 @@ body {
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px 60px; }
 
-/* шапка */
-header {
-  position: sticky; top: 0; z-index: 5; background: var(--bg);
-  border-bottom: 1px solid var(--line); padding: 12px 16px;
-}
-.head { max-width: 1180px; margin: 0 auto; display: flex; flex-wrap: wrap;
-        gap: 10px 16px; align-items: center; }
-.brand { font-weight: 650; font-size: 15px; margin-right: 4px; }
-.pulse { display: flex; align-items: center; gap: 8px; min-width: 260px; flex: 1;
+/* шапка и навигация */
+header { background: var(--panel); border-bottom: 1px solid var(--line); }
+.head { max-width: 1120px; margin: 0 auto; padding: 10px 16px; display: flex;
+        flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.brand { font-weight: 650; font-size: 15px; }
+.pulse { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 240px;
          white-space: nowrap; overflow: hidden; }
 .pulse > span:last-child { overflow: hidden; text-overflow: ellipsis; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: none; }
-.dot.on { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 22%, transparent); }
+.dot.on { background: var(--ok);
+          box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 22%, transparent); }
 .pulse .what { font-weight: 600; }
 .pulse .sub { color: var(--dim); }
 .buttons { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-button, .tab {
+button {
   font: inherit; color: var(--ink); background: var(--panel); cursor: pointer;
   border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px;
 }
@@ -55,7 +57,8 @@ button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent);
 button:disabled { opacity: .45; cursor: default; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
-button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+button.danger { color: var(--bad);
+                border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
 input[type=text] {
   font: inherit; color: var(--ink); background: var(--panel); width: 96px;
   border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
@@ -63,38 +66,80 @@ input[type=text] {
 .toast { color: var(--dim); font-size: 13px; }
 .toast.bad { color: var(--bad); }
 
-/* блоки */
-section { margin-top: 22px; }
+nav { border-bottom: 1px solid var(--line); background: var(--panel); position: sticky;
+      top: 0; z-index: 5; }
+.tabs { max-width: 1120px; margin: 0 auto; padding: 0 16px; display: flex;
+        flex-wrap: wrap; gap: 2px; align-items: center; }
+.tabs a { padding: 10px 12px; color: var(--dim); border-bottom: 2px solid transparent;
+          font-weight: 550; }
+.tabs a:hover { color: var(--ink); text-decoration: none; }
+.tabs a.on { color: var(--ink); border-bottom-color: var(--accent); }
+.tabs a .n { color: var(--dim); font-weight: 600; }
+.tabs a.on .n, .tabs a:hover .n { color: var(--accent); }
+.tabs .right { margin-left: auto; display: flex; gap: 6px; align-items: center;
+               padding: 5px 0; }
+
+/* общее */
+.page { display: none; }
+.page.on { display: block; }
+section { margin-top: 24px; }
 h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
      color: var(--dim); margin: 0 0 10px; font-weight: 600; }
 .panel { background: var(--panel); border: 1px solid var(--line);
-         border-radius: var(--radius); padding: 14px; }
+         border-radius: var(--radius); padding: 16px; }
 .grid { display: grid; gap: 12px; }
-.kpi { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-.kpi .panel { padding: 12px 14px; }
-.kpi .value { font-size: 26px; font-weight: 650; letter-spacing: -.02em; }
-.kpi .name { color: var(--dim); margin-top: 2px; }
-.kpi .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
-.kpi .value.ok { color: var(--ok); } .kpi .value.bad { color: var(--bad); }
-.kpi .value.warn { color: var(--warn); }
+.dim { color: var(--dim); }
+.note { color: var(--dim); font-size: 12px; margin-top: 10px; }
+
+/* лендинг */
+.verdict { padding: 26px 24px; margin-top: 24px; }
+.verdict .line { font-size: 26px; font-weight: 600; letter-spacing: -.02em;
+                 line-height: 1.3; }
+.verdict .line b.ok { color: var(--ok); } .verdict .line b.bad { color: var(--bad); }
+.verdict .line b.warn { color: var(--warn); }
+.verdict .sub { color: var(--dim); margin-top: 10px; font-size: 14px; }
+.big { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.big .value { font-size: 32px; font-weight: 650; letter-spacing: -.02em; line-height: 1.1; }
+.big .name { margin-top: 4px; font-weight: 550; }
+.big .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+.big .value.ok { color: var(--ok); } .big .value.bad { color: var(--bad); }
+.big .value.warn { color: var(--warn); } .big .value.accent { color: var(--accent); }
+
+.split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; gap: 2px; }
+.split div { display: flex; align-items: center; justify-content: center; color: #fff;
+             font-size: 12px; font-weight: 600; min-width: 2px; }
+.split-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px;
+                font-size: 13px; }
+.split-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+                  margin-right: 6px; }
 
 /* графики */
 .charts { grid-template-columns: 1fr 1fr; }
-@media (max-width: 800px) { .charts { grid-template-columns: 1fr; } }
+@media (max-width: 820px) { .charts { grid-template-columns: 1fr; } }
 .chart h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
-.chart .cap { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
-.bars { display: flex; align-items: flex-end; gap: 3px; height: 116px;
+.chart .cap { color: var(--dim); font-size: 12px; margin-bottom: 12px; }
+.bars { display: flex; align-items: flex-end; gap: 4px; height: 120px;
         border-bottom: 1px solid var(--line); }
 .bars .col { flex: 1; min-width: 3px; display: flex; flex-direction: column-reverse;
              border-radius: 3px 3px 0 0; overflow: hidden; min-height: 1px; }
-.bars .col.empty { background: var(--line); height: 1px !important; }
+.bars .col.empty { background: var(--line); height: 2px !important; }
 .bars .seg { width: 100%; }
 .axis { display: flex; justify-content: space-between; color: var(--dim);
-        font-size: 11px; margin-top: 5px; }
-.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px;
+        font-size: 11px; margin-top: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px;
           color: var(--dim); font-size: 12px; }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
             margin-right: 4px; }
+
+/* списки ожидания */
+.wait-item { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline;
+             padding: 12px 0; border-top: 1px solid var(--line); }
+.wait-item:first-child { border-top: 0; padding-top: 0; }
+.wait-item .t { font-weight: 600; flex: 1; min-width: 240px; }
+.wait-item .age { font-weight: 650; font-variant-numeric: tabular-nums; }
+.wait-item .age.old { color: var(--bad); }
+.wait-item .age.warm { color: var(--warn); }
+.wait-item .meta { color: var(--dim); font-size: 13px; }
 
 /* доска */
 .board { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
@@ -106,13 +151,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
 .col-empty { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line);
              padding-top: 8px; }
 
-/* списки и таблицы */
-.stuck-item { border-top: 1px solid var(--line); padding: 12px 0; }
-.stuck-item:first-child { border-top: 0; padding-top: 0; }
-.stuck-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
-.stuck-head .t { font-weight: 600; }
-.stuck-item ul { margin: 8px 0 0; padding-left: 18px; color: var(--dim); }
-.stuck-item li { margin: 3px 0; }
+/* таблицы и списки */
 .scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 table td:first-child { min-width: 220px; }
@@ -125,22 +164,26 @@ td:last-child, th:last-child { padding-right: 0; }
 tr:last-child td { border-bottom: 0; }
 .badge { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 12px;
          white-space: nowrap; border: 1px solid var(--line); color: var(--dim); }
-.badge.merged { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
-.badge.waiting, .badge.working, .badge.fixes {
+.badge.merged { color: var(--ok);
+                border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.badge.waiting, .badge.working, .badge.fixes, .badge.review {
   color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .badge.question, .badge.budget {
   color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
 .badge.broken, .badge.closed, .badge.none {
   color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.stuck-item { border-top: 1px solid var(--line); padding: 14px 0; }
+.stuck-item:first-child { border-top: 0; padding-top: 0; }
+.stuck-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.stuck-head .t { font-weight: 600; }
+.stuck-item ul { margin: 8px 0 0; padding-left: 18px; color: var(--dim); }
+.stuck-item li { margin: 3px 0; }
 .facts { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .fact b { display: block; font-size: 16px; font-weight: 600; }
 .fact span { color: var(--dim); font-size: 12px; }
-.dim { color: var(--dim); }
-.note { color: var(--dim); font-size: 12px; margin-top: 8px; }
-details summary { cursor: pointer; color: var(--dim); }
-pre.log { margin: 10px 0 0; max-height: 320px; overflow: auto; font-size: 12px;
-          line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-.err { color: var(--bad); font-size: 12px; margin-top: 8px; }
+pre.log { margin: 0; max-height: 60vh; overflow: auto; font-size: 12px; line-height: 1.5;
+          white-space: pre-wrap; word-break: break-word; }
+.err { color: var(--bad); font-size: 12px; margin-top: 10px; }
 </style>
 
 <header>
@@ -163,61 +206,81 @@ pre.log { margin: 10px 0 0; max-height: 320px; overflow: auto; font-size: 12px;
   </div>
 </header>
 
+<nav><div class="tabs" id="tabs">
+  <a href="#/" data-page="home">Главная</a>
+  <a href="#/waiting" data-page="waiting">Ждёт тебя <span class="n" id="navWaiting"></span></a>
+  <a href="#/board" data-page="board">Доска</a>
+  <a href="#/tasks" data-page="tasks">Задачи <span class="n" id="navTasks"></span></a>
+  <a href="#/stuck" data-page="stuck">Не смог <span class="n" id="navStuck"></span></a>
+  <a href="#/money" data-page="money">Деньги</a>
+  <a href="#/log" data-page="log">Лог</a>
+  <span class="right">
+    <button data-days="7">7 дней</button>
+    <button data-days="30" class="primary">30 дней</button>
+    <button data-days="0">всё время</button>
+    <button id="refresh" title="сходить в GitHub и Kaiten прямо сейчас">↻</button>
+  </span>
+</div></nav>
+
 <div class="wrap">
-  <div class="buttons" style="justify-content: space-between">
-    <div class="buttons">
-      <button data-days="7">7 дней</button>
-      <button data-days="30" class="primary">30 дней</button>
-      <button data-days="0">всё время</button>
-    </div>
-    <div class="buttons">
-      <span class="toast" id="freshness"></span>
-      <button id="refresh">Обновить</button>
-    </div>
+
+  <div class="page on" id="page-home">
+    <div class="panel verdict"><div class="line" id="verdict">…</div>
+      <div class="sub" id="verdictSub"></div></div>
+    <section><div class="grid big" id="homeBig"></div></section>
+    <section>
+      <h2>Что стало с задачами, которые фабрика взяла</h2>
+      <div class="panel" id="quality"></div>
+    </section>
+    <section>
+      <h2>Ждёт тебя</h2>
+      <div class="panel" id="homeWaiting"></div>
+    </section>
+    <section>
+      <h2>По неделям</h2>
+      <div class="grid charts">
+        <div class="panel chart" id="chartWeeks"></div>
+        <div class="panel chart" id="chartWait"></div>
+      </div>
+    </section>
+    <section>
+      <h2>Здоровье</h2>
+      <div class="grid facts" id="health"></div>
+      <div class="err" id="errors"></div>
+    </section>
   </div>
 
-  <section><div class="grid kpi" id="kpi"></div></section>
+  <div class="page" id="page-waiting">
+    <section><div class="grid big" id="waitBig"></div></section>
+    <section><h2>Ход человека</h2><div class="panel" id="waitList"></div></section>
+  </div>
 
-  <section>
-    <h2>Тренды</h2>
-    <div class="grid charts">
-      <div class="panel chart" id="chartCost"></div>
-      <div class="panel chart" id="chartFlow"></div>
-    </div>
-  </section>
+  <div class="page" id="page-board">
+    <section><h2>Где карточки стоят сейчас</h2><div id="boards"></div></section>
+  </div>
 
-  <section>
-    <h2>Где карточки стоят сейчас</h2>
-    <div id="boards"></div>
-  </section>
+  <div class="page" id="page-tasks">
+    <section><h2>Все задачи</h2><div class="panel" id="tasks"></div></section>
+  </div>
 
-  <section>
-    <h2>Не смог — и чего не хватило</h2>
-    <div class="panel" id="stuck"></div>
-  </section>
+  <div class="page" id="page-stuck">
+    <section><h2>Не смог — и чего не хватило</h2><div class="panel" id="stuck"></div></section>
+  </div>
 
-  <section>
-    <h2>Все задачи</h2>
-    <div class="panel" id="tasks"></div>
-  </section>
+  <div class="page" id="page-money">
+    <section><div class="grid big" id="moneyBig"></div></section>
+    <section><h2>Деньги по дням</h2><div class="panel chart" id="chartCost"></div></section>
+    <section><h2>Дороже всего</h2><div class="panel" id="topCost"></div></section>
+  </div>
 
-  <section>
-    <h2>Здоровье</h2>
-    <div class="grid facts" id="health"></div>
-    <div class="err" id="errors"></div>
-  </section>
+  <div class="page" id="page-log">
+    <section><h2>Лог прогона</h2><div class="panel"><pre class="log" id="log"></pre></div></section>
+  </div>
 
-  <section>
-    <h2>Лог прогона</h2>
-    <div class="panel">
-      <details id="logBox"><summary>последние строки logs/run.log</summary>
-        <pre class="log" id="log"></pre></details>
-    </div>
-  </section>
 </div>
 
 <script>
-const state = { days: 30, data: null, busy: false };
+const state = { days: 30, page: 'home', data: null, busy: false };
 const $ = (id) => document.getElementById(id);
 
 const money = (v) => '$' + (Math.round((v || 0) * 100) / 100).toFixed(2);
@@ -225,22 +288,28 @@ const esc = (s) => (s || '').replace(/[&<>"]/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function plural(n, one, few, many) {
-  const a = Math.abs(n) % 100, b = a % 10;
+  const a = Math.abs(Math.round(n)) % 100, b = a % 10;
   if (a > 10 && a < 20) return many;
   if (b > 1 && b < 5) return few;
   if (b === 1) return one;
   return many;
 }
+const count = (n, one, few, many) => n + ' ' + plural(n, one, few, many);
+
+/* Длительность словами. Дробных дней тут нет намеренно: «0.9 дня» — это ребус,
+   а «21 час» понятно сразу. */
+function dur(seconds) {
+  const s = Math.max(Math.round(seconds || 0), 0);
+  if (!s) return '—';
+  if (s < 3600) return count(Math.max(Math.round(s / 60), 1), 'минуту', 'минуты', 'минут');
+  if (s < 48 * 3600) return count(Math.round(s / 3600), 'час', 'часа', 'часов');
+  return count(Math.round(s / 86400), 'день', 'дня', 'дней');
+}
 
 function ago(iso) {
   if (!iso) return '';
-  const mins = Math.round((Date.now() - new Date(iso)) / 60000);
-  if (mins < 1) return 'только что';
-  if (mins < 60) return mins + ' ' + plural(mins, 'минуту', 'минуты', 'минут') + ' назад';
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return hours + ' ' + plural(hours, 'час', 'часа', 'часов') + ' назад';
-  const days = Math.round(hours / 24);
-  return days + ' ' + plural(days, 'день', 'дня', 'дней') + ' назад';
+  const s = (Date.now() - new Date(iso)) / 1000;
+  return s < 60 ? 'только что' : dur(s) + ' назад';
 }
 
 function lasting(iso) {
@@ -258,7 +327,9 @@ async function api(path, options) {
 function say(text, bad) {
   $('toast').textContent = text;
   $('toast').className = 'toast' + (bad ? ' bad' : '');
-  if (text) setTimeout(() => { if ($('toast').textContent === text) $('toast').textContent = ''; }, 6000);
+  if (text) setTimeout(() => {
+    if ($('toast').textContent === text) $('toast').textContent = '';
+  }, 6000);
 }
 
 /* ---------- запуск ---------- */
@@ -307,6 +378,20 @@ document.querySelectorAll('button[data-days]').forEach((button) =>
 
 $('refresh').addEventListener('click', () => load(true));
 
+/* ---------- страницы ---------- */
+
+function route() {
+  const page = (location.hash.replace('#/', '') || 'home');
+  state.page = document.getElementById('page-' + page) ? page : 'home';
+  document.querySelectorAll('.page').forEach((el) =>
+    el.classList.toggle('on', el.id === 'page-' + state.page));
+  document.querySelectorAll('.tabs a').forEach((el) =>
+    el.classList.toggle('on', el.dataset.page === state.page));
+  window.scrollTo(0, 0);
+  if (state.page === 'log') loadLog();
+}
+window.addEventListener('hashchange', route);
+
 /* ---------- живой статус ---------- */
 
 async function pulse() {
@@ -320,7 +405,9 @@ async function pulse() {
     const bits = [];
     if (p.phase_since) bits.push(lasting(p.phase_since));
     if (card.id) bits.push('#' + card.id + (card.title ? ' ' + card.title : ''));
-    if (p.agent && p.agent.action) bits.push('⚙ ' + p.agent.action + ' · шаг ' + (p.agent.steps || 0));
+    if (p.agent && p.agent.action) {
+      bits.push('⚙ ' + p.agent.action + ' · шаг ' + (p.agent.steps || 0));
+    }
     $('pulseSub').textContent = bits.length ? ' · ' + bits.join(' · ') : '';
   } else {
     const last = p.last || {};
@@ -336,30 +423,75 @@ async function pulse() {
 
 /* ---------- графики ---------- */
 
-function bars(points, parts, colors) {
-  const max = Math.max(...points.map((p) => parts.reduce((sum, key) => sum + (p[key] || 0), 0)), 0.0001);
+function bars(points, parts, colors, label) {
+  const total = (p) => parts.reduce((sum, key) => sum + (p[key] || 0), 0);
+  const max = Math.max(...points.map(total), 0.0001);
   const cols = points.map((point) => {
-    const total = parts.reduce((sum, key) => sum + (point[key] || 0), 0);
-    if (!total) return `<div class="col empty" title="${point.day}: пусто"></div>`;
-    const hint = point.day + ': ' + point.hint;
+    const sum = total(point);
+    if (!sum) return `<div class="col empty" title="${esc(point.hint)}"></div>`;
     const segs = parts.map((key, i) => (point[key]
-      ? `<div class="seg" style="height:${(point[key] / total) * 100}%;background:${colors[i]}"></div>` : '')).join('');
-    return `<div class="col" style="height:${Math.max((total / max) * 100, 2)}%" title="${esc(hint)}">${segs}</div>`;
+      ? `<div class="seg" style="height:${(point[key] / sum) * 100}%;background:${colors[i]}"></div>`
+      : '')).join('');
+    return `<div class="col" style="height:${Math.max((sum / max) * 100, 3)}%"
+                 title="${esc(point.hint)}">${segs}</div>`;
   }).join('');
-  return { cols, max };
+  const legend = parts.map((key, i) =>
+    `<span><i style="background:${colors[i]}"></i>${label[i]}</span>`).join('');
+  return { cols, max, legend };
+}
+
+function drawWeeks(weeks) {
+  const points = weeks.map((w) => ({
+    clean: w.clean, rework: w.rework, failed: w.failed,
+    day: w.week,
+    hint: `неделя с ${w.week.slice(5)}: в main ${w.merged} (с первого раза ${w.clean}), `
+        + `не смог ${w.failed}`,
+  }));
+  const { cols, legend } = bars(points, ['clean', 'rework', 'failed'],
+    ['var(--ok)', 'var(--warn)', 'var(--bad)'],
+    ['уехало с первого раза', 'уехало после переделок', 'не смог']);
+  $('chartWeeks').innerHTML = `
+    <h3>Задачи по неделям</h3>
+    <div class="cap">столбик — неделя, всегда последние 10: тренд не должен
+      зависеть от выбранного периода</div>
+    <div class="bars">${cols}</div>
+    <div class="axis"><span>${points.length ? points[0].day.slice(5) : ''}</span>
+      <span>${points.length ? points[points.length - 1].day.slice(5) : ''}</span></div>
+    <div class="legend">${legend}</div>`;
+}
+
+function drawWaitChart(cards) {
+  // сколько задача пролежала готовой, прежде чем её работа доехала до main
+  const merged = cards.filter((c) => c.merged_at && c.merge_wait_s)
+    .sort((a, b) => a.merged_at.localeCompare(b.merged_at));
+  if (!merged.length) {
+    $('chartWait').innerHTML = '<h3>Сколько ждала ревью</h3>'
+      + '<div class="cap">за этот период в main ничего не уехало</div>';
+    return;
+  }
+  const points = merged.map((c) => ({
+    wait: c.merge_wait_s / 86400, day: c.merged_at.slice(0, 10),
+    hint: `${c.title || ('#' + c.id)}: ждала ${dur(c.merge_wait_s)}`,
+  }));
+  const { cols, max } = bars(points, ['wait'], ['var(--accent)'], ['ждала']);
+  $('chartWait').innerHTML = `
+    <h3>Сколько каждая задача ждала тебя</h3>
+    <div class="cap">столбик — задача, уехавшая в main; самая долгая ждала
+      ${dur(max * 86400)}</div>
+    <div class="bars">${cols}</div>
+    <div class="axis"><span>${points[0].day.slice(5)}</span>
+      <span>${points[points.length - 1].day.slice(5)}</span></div>`;
 }
 
 function drawCost(trend, labels) {
   const groups = ['card', 'review', 'triage', 'epic'];
   const colors = ['var(--work)', 'var(--review)', 'var(--triage)', 'var(--epic)'];
   const points = trend.map((day) => {
-    const point = { day: day.day, hint: money(day.cost) + ' за ' + day.runs + ' ' + plural(day.runs, 'прогон', 'прогона', 'прогонов') };
+    const point = { day: day.day, hint: `${day.day}: ${money(day.cost)} за ${count(day.runs, 'прогон', 'прогона', 'прогонов')}` };
     groups.forEach((g) => (point[g] = day.by_group[g] || 0));
     return point;
   });
-  const { cols, max } = bars(points, groups, colors);
-  const legend = groups.map((g, i) =>
-    `<span><i style="background:${colors[i]}"></i>${labels.group[g]}</span>`).join('');
+  const { cols, max, legend } = bars(points, groups, colors, groups.map((g) => labels.group[g]));
   $('chartCost').innerHTML = `
     <h3>Деньги по дням</h3>
     <div class="cap">потолок столбика — ${money(max)}</div>
@@ -369,60 +501,136 @@ function drawCost(trend, labels) {
     <div class="legend">${legend}</div>`;
 }
 
-function drawFlow(trend) {
-  const parts = ['opened', 'merged', 'failed'];
-  const names = ['довёл до PR', 'уехало в main', 'неудачных прогонов'];
-  const colors = ['var(--accent)', 'var(--ok)', 'var(--bad)'];
-  const points = trend.map((day) => ({
-    day: day.day, opened: day.opened, merged: day.merged, failed: day.failed,
-    hint: `PR ${day.opened} · в main ${day.merged} · неудач ${day.failed}`,
-  }));
-  const { cols, max } = bars(points, parts, colors);
-  const legend = parts.map((p, i) => `<span><i style="background:${colors[i]}"></i>${names[i]}</span>`).join('');
-  $('chartFlow').innerHTML = `
-    <h3>Задачи по дням</h3>
-    <div class="cap">потолок столбика — ${Math.round(max)} шт.</div>
-    <div class="bars">${cols}</div>
-    <div class="axis"><span>${points.length ? points[0].day.slice(5) : ''}</span>
-      <span>${points.length ? points[points.length - 1].day.slice(5) : ''}</span></div>
-    <div class="legend">${legend}</div>`;
+/* ---------- лендинг ---------- */
+
+function drawVerdict(data) {
+  const t = data.totals;
+  const period = state.days ? `За ${count(state.days, 'день', 'дня', 'дней')}` : 'За всё время';
+  if (!t.cards) {
+    $('verdict').textContent = period + ' фабрика ничего не брала.';
+    $('verdictSub').textContent = 'Положи карточку в «Очередь» и нажми «Проверить доску».';
+    return;
+  }
+  $('verdict').innerHTML = `${period} в main уехало <b class="ok">${count(t.merged, 'задача', 'задачи', 'задач')}</b>`
+    + (t.merged ? `, из них <b class="${t.clean === t.merged ? 'ok' : ''}">${t.clean}</b> — с первого захода` : '')
+    + (t.failed ? `. Не вытянул <b class="bad">${count(t.failed, 'задачу', 'задачи', 'задач')}</b>` : '')
+    + '.';
+  const bits = [];
+  if (t.reworked) {
+    bits.push(`Переделывать пришлось ${count(t.reworked, 'задачу', 'задачи', 'задач')}: `
+      + `ревьювер возвращал ${count(t.reviewer_returns, 'раз', 'раза', 'раз')}`
+      + ((t.returns.returning || t.returns.again)
+         ? `, человек — ${count((t.returns.returning || 0) + (t.returns.again || 0), 'раз', 'раза', 'раз')}` : ''));
+  }
+  if (t.waiting) {
+    bits.push(`Прямо сейчас ${count(t.waiting, 'задача ждёт', 'задачи ждут', 'задач ждут')} тебя`
+      + (t.wait_max_s ? `, дольше всех — ${dur(t.wait_max_s)}` : ''));
+  }
+  $('verdictSub').textContent = bits.join('. ') + (bits.length ? '.' : '');
 }
 
-/* ---------- блоки ---------- */
-
-function drawKpi(data) {
+function drawHomeBig(data) {
   const t = data.totals;
-  const share = (n) => (t.cards ? Math.round((n / t.cards) * 100) + '%' : '—');
+  const share = (n, of) => (of ? Math.round((n / of) * 100) + '%' : '—');
   const tiles = [
-    { value: money(t.cost), name: 'потрачено',
-      hint: `${money(t.cost_per_card)} на задачу · ${t.runs} ${plural(t.runs, 'прогон', 'прогона', 'прогонов')}` },
-    { value: t.done, name: 'довёл до PR', cls: 'ok',
-      hint: `из ${t.cards} ${plural(t.cards, 'задачи', 'задач', 'задач')} в работе` },
-    { value: t.merged, name: 'уехало в main', cls: 'ok',
-      hint: `${share(t.merged)} задач · ${money(t.cost_per_merged)} за штуку` },
-    { value: t.fixed, name: 'вернули на правки', cls: t.fixed ? 'warn' : '',
-      hint: `${t.review_rounds} ${plural(t.review_rounds, 'круг', 'круга', 'кругов')} ревью на задачу` },
-    { value: t.failed, name: 'не смог', cls: t.failed ? 'bad' : '',
-      hint: share(t.failed) + ' задач' },
-    { value: t.waiting, name: 'ждут человека',
-      hint: 'PR открыт или карточка в работе' },
+    { value: t.merged, cls: 'ok', name: 'уехало в main',
+      hint: `смерженные PR и правки, забранные в сборный релиз` },
+    { value: t.clean, cls: 'ok', name: 'с первого захода',
+      hint: `${share(t.clean, t.merged)} от уехавшего — ни ревьювер, ни ты не возвращали` },
+    { value: t.reworked, cls: t.reworked ? 'warn' : '', name: 'переделывались',
+      hint: `${count(t.reviewer_returns, 'возврат', 'возврата', 'возвратов')} от ревьювера, `
+          + `${count((t.returns.returning || 0) + (t.returns.again || 0), 'возврат', 'возврата', 'возвратов')} от человека` },
+    { value: t.failed, cls: t.failed ? 'bad' : '', name: 'не смог',
+      hint: `${share(t.failed, t.cards)} от всех взятых — смотри «Не смог»` },
+    { value: t.waiting, cls: t.waiting ? 'accent' : '', name: 'ждут тебя',
+      hint: t.wait_median_s ? `в среднем уже ${dur(t.wait_median_s)}` : 'ничего не висит' },
   ];
-  $('kpi').innerHTML = tiles.map((tile) => `
+  $('homeBig').innerHTML = tiles.map((tile) => `
     <div class="panel">
-      <div class="value ${tile.cls || ''}">${tile.value}</div>
+      <div class="value ${tile.cls}">${tile.value}</div>
       <div class="name">${tile.name}</div>
       <div class="hint">${tile.hint}</div>
     </div>`).join('');
 }
 
+function drawQuality(data) {
+  const t = data.totals;
+  const waitingOwn = data.cards.filter((c) => ['waiting', 'review', 'working', 'fixes'].includes(c.outcome)).length;
+  const parts = [
+    { n: t.clean, color: 'var(--ok)', name: 'уехало с первого захода' },
+    { n: t.reworked, color: 'var(--warn)', name: 'уехало после переделок' },
+    { n: waitingOwn, color: 'var(--accent)', name: 'ещё в пути' },
+    { n: t.failed, color: 'var(--bad)', name: 'не смог' },
+  ].filter((p) => p.n);
+  const total = parts.reduce((sum, p) => sum + p.n, 0);
+  if (!total) { $('quality').innerHTML = '<span class="dim">пока нечего показывать</span>'; return; }
+  $('quality').innerHTML = `
+    <div class="split">${parts.map((p) =>
+      `<div style="width:${(p.n / total) * 100}%;background:${p.color}"
+            title="${p.name}: ${p.n}">${(p.n / total) > 0.08 ? p.n : ''}</div>`).join('')}</div>
+    <div class="split-legend">${parts.map((p) =>
+      `<span><i style="background:${p.color}"></i>${p.name} — ${p.n}</span>`).join('')}</div>
+    <div class="note">Всего фабрика взялась за ${count(total, 'задачу', 'задачи', 'задач')}.
+      «С первого захода» значит, что после её работы никто — ни ревьювер, ни ты —
+      не просил переделать.</div>`;
+}
+
+function waitAge(seconds) {
+  const days = seconds / 86400;
+  return days >= 7 ? 'old' : days >= 2 ? 'warm' : '';
+}
+
+function waitRow(item) {
+  return `<div class="wait-item">
+      <span class="t"><a href="${item.url}" target="_blank">${esc(item.title) || ('#' + item.id)}</a></span>
+      <span class="age ${waitAge(item.wait_s)}">${item.wait_s ? dur(item.wait_s) : 'только что'}</span>
+      <span class="meta">${esc(item.reason)}${item.pr ? ` · <a href="${item.pr.url}" target="_blank">PR #${item.pr.number}</a>` : ''}
+        · #${item.id}${item.rework ? ' · переделывалась ' + count(item.rework, 'раз', 'раза', 'раз') : ''}</span>
+    </div>`;
+}
+
+function drawHomeWaiting(data) {
+  const list = data.waiting_cards;
+  if (!list.length) {
+    $('homeWaiting').innerHTML = '<span class="dim">ничего не ждёт — мяч на стороне фабрики</span>';
+    return;
+  }
+  $('homeWaiting').innerHTML = list.slice(0, 4).map(waitRow).join('')
+    + (list.length > 4 ? `<div class="note"><a href="#/waiting">и ещё ${list.length - 4} —
+        вся очередь на странице «Ждёт тебя»</a></div>` : '');
+}
+
+/* ---------- страницы ---------- */
+
+function drawWaitingPage(data) {
+  const t = data.totals, list = data.waiting_cards;
+  $('waitBig').innerHTML = [
+    { value: t.waiting, cls: t.waiting ? 'accent' : '', name: 'ждут тебя прямо сейчас',
+      hint: 'карточки, по которым ход человека' },
+    { value: dur(t.wait_median_s), cls: '', name: 'средняя из них ждёт',
+      hint: 'половина ждёт дольше, половина меньше' },
+    { value: dur(t.wait_max_s), cls: t.wait_max_s > 7 * 86400 ? 'bad' : '',
+      name: 'дольше всех', hint: 'самая заждавшаяся карточка' },
+    { value: dur(t.merge_wait_median_s), cls: '', name: 'ждали те, что уже уехали',
+      hint: 'от готового PR до появления работы в main' },
+  ].map((tile) => `
+    <div class="panel"><div class="value ${tile.cls}">${tile.value}</div>
+      <div class="name">${tile.name}</div><div class="hint">${tile.hint}</div></div>`).join('');
+  $('waitList').innerHTML = list.length
+    ? list.map(waitRow).join('')
+      + `<div class="note">Время считается с последнего шага фабрики по карточке:
+         с этого момента она ничего не может сделать сама.</div>`
+    : '<span class="dim">ничего не ждёт — мяч на стороне фабрики</span>';
+}
+
 function drawBoards(boards) {
   if (!boards.length) {
-    $('boards').innerHTML = '<div class="panel dim">доска не прочиталась — смотри ошибки внизу</div>';
+    $('boards').innerHTML = '<div class="panel dim">доска не прочиталась — смотри ошибки на главной</div>';
     return;
   }
   $('boards').innerHTML = boards.map((board) => `
     ${boards.length > 1 ? `<div class="note" style="margin:0 0 8px">доска «${esc(board.key)}»${board.outside ? ' · ' + board.outside + ' в чужих колонках' : ''}</div>` : ''}
-    <div class="grid board" style="margin-bottom:14px">
+    <div class="grid board" style="margin-bottom:16px">
       ${board.columns.map((column) => `
         <div class="panel">
           <div class="col-title"><b>${column.label}</b><span class="n">${column.cards.length}</span></div>
@@ -437,8 +645,42 @@ function drawBoards(boards) {
     </div>`).join('');
 }
 
-function badge(card, labels) {
-  return `<span class="badge ${card.outcome}">${labels.outcome[card.outcome]}</span>`;
+const badge = (card, labels) =>
+  `<span class="badge ${card.outcome}">${labels.outcome[card.outcome]}</span>`;
+
+function drawTasks(data) {
+  const cards = data.cards;
+  if (!cards.length) {
+    $('tasks').innerHTML = '<span class="dim">за этот период фабрика ничего не брала</span>';
+    return;
+  }
+  $('tasks').innerHTML = `
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Задача</th><th>Исход</th><th class="num">Заходов</th><th>Переделки</th>
+        <th class="num">Ждала</th><th>PR</th><th class="num">Последний раз</th>
+      </tr></thead>
+      <tbody>${cards.map((card) => {
+        const why = Object.entries(card.rounds)
+          .filter(([key, n]) => n && key !== 'first' && key !== 'resuming')
+          .map(([key, n]) => data.labels.round[key] + (n > 1 ? ' ×' + n : ''));
+        return `
+        <tr>
+          <td><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a>
+              <div class="dim">#${card.id}</div></td>
+          <td>${badge(card, data.labels)}</td>
+          <td class="num">${card.passes}${card.rounds.resuming ? ' <span class="dim">+' + card.rounds.resuming + '</span>' : ''}</td>
+          <td class="dim">${why.join(', ') || '—'}</td>
+          <td class="num">${card.merged_at ? dur(card.merge_wait_s) : '—'}</td>
+          <td>${card.pr ? `<a href="${card.pr.url}" target="_blank">#${card.pr.number}</a>
+               <div class="dim">+${card.pr.additions}/−${card.pr.deletions}</div>`
+              : (card.shipped ? `<span class="dim">${card.shipped.sha}</span>` : '—')}</td>
+          <td class="num dim">${ago(card.last)}</td>
+        </tr>`; }).join('')}</tbody>
+    </table></div>
+    <div class="note">«Заходов» — сколько раз исполнитель брался за карточку; серым —
+      продолжения прерванного, это та же попытка. «Ждала» — от готового PR до появления
+      работы в main.</div>`;
 }
 
 function drawStuck(data) {
@@ -452,7 +694,7 @@ function drawStuck(data) {
       <div class="stuck-head">
         <span class="t"><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a></span>
         ${badge(card, data.labels)}
-        <span class="dim">#${card.id} · ${money(card.cost)} · ${card.runs} ${plural(card.runs, 'заход', 'захода', 'заходов')} · ${ago(card.last)}</span>
+        <span class="dim">#${card.id} · ${count(card.work_runs, 'заход', 'захода', 'заходов')} · ${ago(card.last)}</span>
         ${card.pr ? `<a href="${card.pr.url}" target="_blank">PR #${card.pr.number}</a>` : ''}
       </div>
       ${card.missing.length ? `<ul>${card.missing.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>`
@@ -460,63 +702,54 @@ function drawStuck(data) {
     </div>`).join('');
 }
 
-function drawTasks(data) {
-  const cards = data.cards;
-  if (!cards.length) { $('tasks').innerHTML = '<span class="dim">за этот период фабрика ничего не брала</span>'; return; }
-  $('tasks').innerHTML = `
-    <div class="scroll"><table>
-      <thead><tr>
-        <th>Задача</th><th>Исход</th><th class="num">Заходов</th><th class="num">Ревью</th>
-        <th class="num">Стоила</th><th>PR</th><th class="num">Последний раз</th>
-      </tr></thead>
-      <tbody>${cards.map((card) => `
-        <tr>
-          <td><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a>
-              <div class="dim">#${card.id}</div></td>
-          <td>${badge(card, data.labels)}</td>
-          <td class="num">${card.work_runs}</td>
-          <td class="num">${card.needs_changes ? card.needs_changes + ' ↩' : (card.review_runs || '—')}</td>
-          <td class="num">${money(card.cost)}</td>
-          <td>${card.pr ? `<a href="${card.pr.url}" target="_blank">#${card.pr.number}</a>
-               <div class="dim">+${card.pr.additions}/−${card.pr.deletions}</div>`
-              : (card.shipped ? `<span class="dim">${card.shipped.sha}</span>` : '—')}</td>
-          <td class="num dim">${ago(card.last)}</td>
-        </tr>`).join('')}</tbody>
-    </table></div>
-    <div class="note">«Заходов» — сколько раз исполнитель брался за карточку, «Ревью» — сколько
-      раз ревьювер вернул её на правки. Стоимость — все прогоны по карточке вместе.</div>`;
+function drawMoney(data) {
+  const t = data.totals;
+  $('moneyBig').innerHTML = [
+    { value: money(t.cost), name: 'потрачено за период',
+      hint: `${count(t.runs, 'прогон', 'прогона', 'прогонов')} агентов` },
+    { value: money(t.cost_per_merged), name: 'за задачу в main',
+      hint: 'вся история карточки, включая ревью и переделки' },
+    { value: money(t.cut_cost), cls: t.cut_cost ? 'warn' : '', name: 'сгорело на обрывах',
+      hint: `${count(t.cut_runs, 'прогон', 'прогона', 'прогонов')} упёрлись в потолок расхода` },
+    { value: money((data.epics || {}).cost), name: 'на эпики',
+      hint: `${count((data.epics || {}).runs || 0, 'шаг', 'шага', 'шагов')} — критерии, спека, ревью спеки` },
+  ].map((tile) => `
+    <div class="panel"><div class="value ${tile.cls || ''}">${tile.value}</div>
+      <div class="name">${tile.name}</div><div class="hint">${tile.hint}</div></div>`).join('');
+  drawCost(data.trend, data.labels);
+  $('topCost').innerHTML = data.top_cost.map((card) => `
+    <div class="wait-item">
+      <span class="t"><a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a></span>
+      <span class="age">${money(card.cost)}</span>
+      <span class="meta">${badge(card, data.labels)} · ${count(card.work_runs, 'заход', 'захода', 'заходов')}</span>
+    </div>`).join('') || '<span class="dim">пусто</span>';
 }
 
 function drawHealth(data) {
   const t = data.totals, p = data.pulse, auth = p.auth || {}, lock = p.lock || {};
-  const triage = data.triage, epics = data.epics;
+  const triage = data.triage;
   const facts = [
     { b: p.running ? 'работает' : 'спит',
       s: p.running ? (p.phase || '') + ' · ' + lasting(p.phase_since)
                    : (p.last && p.last.at ? 'последний прогон ' + ago(p.last.at) : 'прогонов ещё не было') },
     { b: auth.ok ? 'авторизация жива' : 'авторизация протухла',
-      s: auth.expires ? 'до ' + new Date(auth.expires).toLocaleString('ru-RU', { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' }) : 'claude setup-token' },
-    { b: t.cut_runs + ' ' + plural(t.cut_runs, 'обрыв', 'обрыва', 'обрывов'),
-      s: 'упёрлись в потолок расхода, ' + money(t.cut_cost) + ' впустую' },
-    { b: t.merge_lag_days ? t.merge_lag_days + ' ' + plural(t.merge_lag_days, 'день', 'дня', 'дней') : '—',
-      s: 'медиана от PR до мержа' },
-    { b: money(t.cost_per_merged), s: 'цена задачи, доехавшей до main' },
-    { b: triage.cards + ' ' + plural(triage.cards, 'карточка', 'карточки', 'карточек'),
-      s: 'разведка инбокса: ' + (Object.entries(triage.by_status).map(([k, v]) => (data.labels.status[k] || k) + ' ' + v).join(', ') || 'тихо') + ' · ' + money(triage.cost) },
-    { b: epics.runs + ' ' + plural(epics.runs, 'шаг', 'шага', 'шагов'),
-      s: 'фазы эпиков · ' + money(epics.cost) },
-    { b: (p.queue || 0) + ' в очереди', s: (p.inbox_pending || 0) + ' не разобрано в инбоксе · ' + (p.night_waiting || 0) + ' ждут ночи' },
+      s: auth.expires ? 'до ' + new Date(auth.expires).toLocaleString('ru-RU',
+          { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' })
+        : 'claude setup-token' },
+    { b: count(t.cut_runs, 'обрыв', 'обрыва', 'обрывов'),
+      s: 'прогонов упёрлось в потолок расхода' },
+    { b: count(triage.cards, 'карточка', 'карточки', 'карточек'),
+      s: 'разобрано в инбоксе: ' + (Object.entries(triage.by_status)
+          .map(([k, v]) => (data.labels.status[k] || k) + ' ' + v).join(', ') || 'тихо') },
+    { b: (p.queue || 0) + ' в очереди',
+      s: (p.inbox_pending || 0) + ' не разобрано в инбоксе · ' + (p.night_waiting || 0) + ' ждут ночи' },
     { b: lock.held ? (lock.alive ? 'замок занят' : 'замок протух') : 'замок свободен',
-      s: lock.held ? 'pid ' + lock.pid + ', ' + lock.age_min + ' мин' : 'следующий прогон стартует сразу' },
+      s: lock.held ? 'pid ' + lock.pid + ', ' + lock.age_min + ' мин'
+                   : 'следующий прогон стартует сразу' },
+    { b: money(t.cost), s: 'потрачено за период — подробности на «Деньгах»' },
   ];
   $('health').innerHTML = facts.map((f) =>
     `<div class="panel fact"><b>${esc(f.b)}</b><span>${esc(f.s)}</span></div>`).join('');
-
-  const top = data.top_cost.map((card) =>
-    `<a href="${card.url}" target="_blank">${esc(card.title) || ('#' + card.id)}</a> ${money(card.cost)}`).join(' · ');
-  if (top) $('health').insertAdjacentHTML('beforeend',
-    `<div class="panel fact" style="grid-column:1/-1"><b>дороже всего</b><span>${top}</span></div>`);
-
   const errors = Object.entries(data.errors || {});
   $('errors').innerHTML = errors.length
     ? errors.map(([key, text]) => `не прочиталось (${key}): ${esc(text)}`).join('<br>') : '';
@@ -528,31 +761,36 @@ async function load(force) {
   try {
     const data = await api('/api/overview?days=' + state.days + (force ? '&force=1' : ''));
     state.data = data;
-    drawKpi(data);
-    drawCost(data.trend, data.labels);
-    drawFlow(data.trend);
-    drawBoards(data.boards);
-    drawStuck(data);
-    drawTasks(data);
+    $('navWaiting').textContent = data.totals.waiting || '';
+    $('navTasks').textContent = data.totals.cards || '';
+    $('navStuck').textContent = data.totals.failed || '';
+    drawVerdict(data);
+    drawHomeBig(data);
+    drawQuality(data);
+    drawHomeWaiting(data);
+    drawWeeks(data.weeks);
+    drawWaitChart(data.cards);
     drawHealth(data);
-    $('freshness').textContent = 'GitHub и доска: ' +
-      (data.outside_at ? ago(new Date(data.outside_at * 1000).toISOString()) : 'ещё едут');
+    drawWaitingPage(data);
+    drawBoards(data.boards);
+    drawTasks(data);
+    drawStuck(data);
+    drawMoney(data);
   } catch (e) {
     say('витрина не собралась: ' + e.message, true);
   }
 }
 
 async function loadLog() {
-  if (!$('logBox').open) return;
+  if (state.page !== 'log') return;
   try {
-    const data = await api('/api/log?n=200');
+    const data = await api('/api/log?n=300');
     $('log').textContent = data.lines.join('\n');
     $('log').scrollTop = $('log').scrollHeight;
   } catch (e) { /* лог не критичен */ }
 }
-$('logBox').addEventListener('toggle', loadLog);
 
-pulse(); load(); 
+route(); pulse(); load();
 setInterval(pulse, 5000);
 setInterval(load, 60000);
 setInterval(loadLog, 10000);

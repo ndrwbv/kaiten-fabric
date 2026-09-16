@@ -407,7 +407,8 @@ class Outside:
 # Исходы карточки. Порядок ключей — порядок колонок в витрине.
 OUTCOMES = {
     "merged": "уехало в main",
-    "waiting": "ждёт человека",
+    "waiting": "ждёт тебя",
+    "review": "у ревьювера",
     "working": "в работе",
     "fixes": "на правках",
     "question": "не хватило данных",
@@ -419,29 +420,91 @@ OUTCOMES = {
 
 FAILED_OUTCOMES = ("question", "budget", "broken", "closed", "none")
 
+# Почему исполнитель взялся за карточку ещё раз. Те же четыре причины, что различает
+# и сама фабрика, когда берёт карточку в работу (см. `reason` в `process`).
+ROUND_LABELS = {
+    "first": "первый заход",
+    "fixing": "правки после ревью",
+    "resuming": "продолжил прерванное",
+    "returning": "после ответа человека",
+    "again": "повторный заход",
+}
+
+# Заходы, которые значат «сделано не с первого раза». Продолжение прерванного сюда
+# не входит: это та же попытка, просто разорванная потолком расхода.
+REWORK_ROUNDS = ("fixing", "returning", "again")
+
+# Что человек должен сделать с карточкой, по роли колонки, где она стоит.
+WAIT_REASONS = {
+    "review": "посмотреть PR",
+    "question": "ответить на вопрос агента",
+    "failed": "разобрать поломку",
+}
+BLOCKED_REASON = "снять блокер"
+
+
+def moment(stamp) -> datetime | None:
+    """ISO-метка в datetime. Пусто или мусор — None."""
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def seconds_between(start, end=None) -> float:
+    """Сколько секунд прошло от метки до метки (по умолчанию — до сейчас)."""
+    began = moment(start)
+    if not began:
+        return 0.0
+    finished = moment(end) or datetime.now(timezone.utc)
+    return max((finished - began).total_seconds(), 0.0)
+
+
+def median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
 
 def card_outcome(card: dict) -> str:
     """
-    Чем кончилось по карточке. Признаки проверяем в том же порядке, что и фабрика.
+    Чем кончилось по карточке — и, если ещё не кончилось, чей сейчас ход.
 
     Работа в main сильнее всего остального: карточку могли закрыть чужим PR, и это
-    «сделано», а не «PR закрыт». Дальше — открытый PR: он значит, что мяч у человека.
-    И только потом разбираем, почему до PR не дошло.
+    «сделано», а не «PR закрыт». Дальше решает колонка: она и есть ответ на вопрос,
+    кто держит мяч — фабрика, ревьювер или человек. И только если карточки на доске
+    уже нет (уехала в архив), разбираем, чем кончился последний заход.
     """
     pull = card.get("pr") or {}
-    if pull.get("state") == "MERGED" or card.get("shipped"):
+    column = card.get("column")
+    if pull.get("state") == "MERGED" or card.get("shipped") or column == "done":
         return "merged"
-    if card.get("column") == "done":
-        return "merged"
-    if pull.get("state") == "OPEN":
-        return "fixes" if card.get("column") in ("fixes", "in_progress") else "waiting"
-    if card.get("column") in ("in_progress", "agent_review", "fixes"):
-        return "working"
-    if card.get("column") == "failed" or card.get("last_outcome", "").startswith("упало"):
+    if column == "failed" or card.get("last_outcome", "").startswith("упало"):
         return "broken"
+    if column == "question":
+        return "question"
+    if column == "agent_review":
+        # блокер на карточке ревьювера значит, что он уже отработал и позвал человека:
+        # на доске, где ревью агента и ревью человека делят колонку, разницы больше нет
+        return "waiting" if card.get("blocked") else "review"
+    if column == "review":
+        return "waiting"
+    if column == "fixes":
+        return "fixes"
+    if column in ("in_progress", "queue"):
+        return "working"
+    if pull.get("state") == "OPEN":
+        return "waiting"
     if card.get("cut") or card.get("last_outcome") == "не влез в бюджет":
         return "budget"
-    if card.get("column") == "question" or card["status"] in ("unclear", "blocked"):
+    if card["status"] in ("unclear", "blocked"):
         return "question"
     if pull.get("state") == "CLOSED":
         return "closed"
@@ -466,6 +529,40 @@ def missing(card: dict) -> list[str]:
     return [r[:400] for r in reasons[:5]]
 
 
+def classify_rounds(history: list[dict]) -> list[str]:
+    """
+    Почему исполнитель брался за карточку в каждый из заходов.
+
+    В логах прогона причины нет, но восстанавливается она однозначно — теми же
+    признаками, по которым её определяет сама фабрика, когда берёт карточку:
+
+    - перед заходом ревьювер вернул замечания  → правки после ревью (`fixing`);
+    - прошлый заход оборвали по потолку        → продолжение (`resuming`);
+    - прошлый заход кончился вопросом          → человек ответил (`returning`);
+    - ничего из этого                          → человек вернул карточку сам.
+
+    Последний случай — самый интересный: значит, работу приняли, а потом всё равно
+    пришлось переделывать.
+    """
+    rounds, previous = [], None
+    for run in history:
+        if run["kind"] != "card":
+            previous = run
+            continue
+        if previous is None:
+            rounds.append("first")
+        elif previous["kind"] == "review":
+            rounds.append("fixing" if previous["status"] == "needs_changes" else "again")
+        elif previous["cut"]:
+            rounds.append("resuming")
+        elif previous["status"] in ("unclear", "blocked"):
+            rounds.append("returning")
+        else:
+            rounds.append("again")
+        previous = run
+    return rounds
+
+
 def collect_cards(runs: list[dict], events: list[dict], outside: dict,
                   titles: dict[int, str], cfg: dict) -> list[dict]:
     """Карточки рабочей доски: по одной строке на каждую, со всей её историей."""
@@ -474,76 +571,128 @@ def collect_cards(runs: list[dict], events: list[dict], outside: dict,
     cap = float((cfg.get("agent") or {}).get("max_budget_usd") or 0)
 
     # где карточка стоит сейчас и как называется — из живого снимка доски
-    column_of: dict[int, str] = {}
-    board_titles: dict[int, str] = {}
+    board_cards: dict[int, dict] = {}
     for board in outside.get("boards") or []:
         for column in board["columns"]:
             for card in column["cards"]:
-                column_of[card["id"]] = column["role"]
-                board_titles[card["id"]] = card["title"]
+                board_cards[card["id"]] = {**card, "role": column["role"]}
 
     last_event: dict[int, dict] = {}
     for event in events:
         if event.get("kind") in ("card", "review") and event.get("card_id"):
             last_event[int(event["card_id"])] = event
 
-    cards: dict[int, dict] = {}
+    history: dict[int, list[dict]] = defaultdict(list)
     for run in runs:
-        if run["kind"] not in ("card", "review"):
-            continue
-        card = cards.setdefault(run["card_id"], {
-            "id": run["card_id"], "runs": 0, "cost": 0.0, "work_runs": 0,
-            "review_runs": 0, "needs_changes": 0, "major": 0, "first": run["at"],
-            "last": run["at"], "status": None, "cut": "", "questions": [],
-            "risks": "", "summary": "", "last_cost": 0.0, "cap": cap,
-        })
-        card["runs"] += 1
-        card["cost"] += run["cost"]
-        card["last"] = run["at"]
-        card["major"] += run["major"]
-        if run["kind"] == "review":
-            card["review_runs"] += 1
-            if run["status"] == "needs_changes":
-                card["needs_changes"] += 1
-            continue
-        card["work_runs"] += 1
-        card["last_cost"] = run["cost"]
-        card["cut"] = run["cut"]
-        # вердикт без статуса — это продолженный прогон, он ничего не решает
-        if run["status"]:
-            card["status"] = run["status"]
-        if run["questions"]:
-            card["questions"] = run["questions"]
-        if run["risks"]:
-            card["risks"] = run["risks"]
-        if run["summary"]:
-            card["summary"] = run["summary"]
+        if run["kind"] in ("card", "review"):
+            history[run["card_id"]].append(run)
 
     result = []
-    for card_id, card in cards.items():
+    for card_id, story in history.items():
+        work = [run for run in story if run["kind"] == "card"]
+        reviews = [run for run in story if run["kind"] == "review"]
+        rounds = classify_rounds(story)
+        counted = {name: rounds.count(name) for name in ROUND_LABELS}
+        last_work = work[-1] if work else {}
+        on_board = board_cards.get(card_id) or {}
         event = last_event.get(card_id) or {}
-        card["url"] = f"https://{domain}/space/{space}/boards/card/{card_id}"
-        card["pr"] = (outside.get("prs") or {}).get(card_id)
-        # Названия ищем там, где они целые. В логе и в журнале они подрезаны под
-        # меню-бар: туда влезает 60 знаков, и «...на финальном экране к» — это не
-        # обрыв витрины, а всё, что фабрика про карточку записала.
-        pr_title = re.sub(r"^#\d+\s*", "", (card["pr"] or {}).get("title") or "")
-        card["title"] = (board_titles.get(card_id) or pr_title
-                         or titles.get(card_id) or event.get("title") or "")
-        card["shipped"] = (outside.get("shipped") or {}).get(card_id)
-        card["column"] = column_of.get(card_id)
-        card["last_outcome"] = event.get("outcome") or ""
-        card["detail"] = event.get("detail") or ""
-        card["cost"] = round(card["cost"], 2)
+        pull = (outside.get("prs") or {}).get(card_id)
+        pr_title = re.sub(r"^#\d+\s*", "", (pull or {}).get("title") or "")
+
+        card = {
+            "id": card_id,
+            # Названия ищем там, где они целые. В логе и в журнале они подрезаны под
+            # меню-бар: туда влезает 60 знаков, и «...на финальном экране к» — это
+            # не обрыв витрины, а всё, что фабрика про карточку записала.
+            "title": (on_board.get("title") or pr_title or titles.get(card_id)
+                      or event.get("title") or ""),
+            "url": f"https://{domain}/space/{space}/boards/card/{card_id}",
+            "pr": pull,
+            "shipped": (outside.get("shipped") or {}).get(card_id),
+            "column": on_board.get("role"),
+            "blocked": bool(on_board.get("blocked")),
+            "first": story[0]["at"],
+            "last": story[-1]["at"],
+            "runs": len(story),
+            "work_runs": len(work),
+            "review_runs": len(reviews),
+            "needs_changes": sum(1 for r in reviews if r["status"] == "needs_changes"),
+            "rounds": counted,
+            # заходы, не считая продолжений прерванного: это та же попытка
+            "passes": len(work) - counted["resuming"],
+            "rework": sum(counted[name] for name in REWORK_ROUNDS),
+            "cost": round(sum(run["cost"] for run in story), 2),
+            "last_cost": last_work.get("cost", 0.0),
+            "cut": last_work.get("cut", ""),
+            "status": next((r["status"] for r in reversed(work) if r["status"]), None),
+            "questions": next((r["questions"] for r in reversed(work) if r["questions"]), []),
+            "risks": next((r["risks"] for r in reversed(work) if r["risks"]), ""),
+            "summary": next((r["summary"] for r in reversed(work) if r["summary"]), ""),
+            "last_outcome": event.get("outcome") or "",
+            "detail": event.get("detail") or "",
+            "cap": cap,
+        }
         card["outcome"] = card_outcome(card)
+        card["clean"] = card["outcome"] == "merged" and card["rework"] == 0
         card["missing"] = missing(card) if card["outcome"] in FAILED_OUTCOMES else []
-        # разбор вердикта на страницу не едет: в нём страницы текста на карточку,
-        # а нужное из него уже переехало в «чего не хватило»
+
+        # Ход перешёл человеку тогда, когда фабрика сделала последний шаг. Если PR
+        # открыли позже (бывает: ревьювер прошёлся, а PR создался следующим шагом) —
+        # считаем от PR: раньше этого смотреть всё равно было нечего.
+        handover = max([stamp for stamp in (card["last"], (pull or {}).get("createdAt"))
+                        if stamp] or [""])
+        card["handover"] = handover
+        merged_at = (pull or {}).get("mergedAt") or (card["shipped"] or {}).get("at")
+        card["merged_at"] = merged_at if card["outcome"] == "merged" else None
+        card["merge_wait_s"] = (round(seconds_between(handover, merged_at))
+                                if card["merged_at"] else 0)
         for heavy in ("summary", "risks", "questions", "detail"):
             card.pop(heavy, None)
         result.append(card)
+
     result.sort(key=lambda c: c["last"], reverse=True)
     return result
+
+
+def waiting_list(cards: list[dict], outside: dict, cfg: dict) -> list[dict]:
+    """
+    Карточки, по которым ход человека, — с временем ожидания.
+
+    Собираем по доске, а не по логам: карточку мог положить в «На ревью» человек,
+    и в логах фабрики её не будет вовсе, а ждать она всё равно ждёт. Заблокированные
+    считаются всегда и в любой колонке: блокер — это и есть способ фабрики сказать
+    «дальше ты», когда отдельной колонки под роль на доске нет.
+    """
+    domain = cfg["kaiten"]["domain"]
+    known = {card["id"]: card for card in cards}
+    waiting = []
+    for board in outside.get("boards") or []:
+        for column in board["columns"]:
+            for entry in column["cards"]:
+                reason = WAIT_REASONS.get(column["role"], "")
+                if entry.get("blocked"):
+                    reason = BLOCKED_REASON
+                if not reason:
+                    continue
+                card = known.get(entry["id"]) or {}
+                pull = card.get("pr") or {}
+                since = card.get("handover") or pull.get("createdAt") or ""
+                waiting.append({
+                    "id": entry["id"],
+                    "title": entry["title"] or card.get("title") or "",
+                    "url": entry["url"],
+                    "board": board["key"],
+                    "column": column["label"],
+                    "reason": reason,
+                    "since": since,
+                    "wait_s": round(seconds_between(since)) if since else 0,
+                    "pr": {"url": pull.get("url"), "number": pull.get("number")}
+                          if pull.get("url") else None,
+                    "runs": card.get("work_runs", 0),
+                    "rework": card.get("rework", 0),
+                })
+    waiting.sort(key=lambda item: item["wait_s"], reverse=True)
+    return waiting
 
 
 def daily(runs: list[dict], cards: list[dict], days: int) -> list[dict]:
@@ -569,9 +718,8 @@ def daily(runs: list[dict], cards: list[dict], days: int) -> list[dict]:
         pull = card.get("pr") or {}
         if pull.get("createdAt"):
             day(local_day(pull["createdAt"]))["opened"] += 1
-        stamp = pull.get("mergedAt") or (card.get("shipped") or {}).get("at")
-        if stamp and (pull.get("state") == "MERGED" or card.get("shipped")):
-            day(local_day(stamp))["merged"] += 1
+        if card.get("merged_at"):
+            day(local_day(card["merged_at"]))["merged"] += 1
 
     # дни без работы тоже рисуем: без них тихая неделя выглядит как плотная
     if series:
@@ -591,15 +739,47 @@ def daily(runs: list[dict], cards: list[dict], days: int) -> list[dict]:
     return points[-days:] if days else points
 
 
+def weekly(cards: list[dict], weeks: int = 10) -> list[dict]:
+    """
+    Ряд по неделям: сколько задач уехало в main, сколько с первого раза, сколько
+    потерялось. Недели, а не дни: по дням у фабрики то густо, то пусто, и тренд
+    в такой ряби не виден.
+    """
+    series: dict[str, dict] = {}
+
+    def week(stamp: str) -> dict:
+        when = moment(stamp)
+        if not when:
+            return {}
+        local = when.astimezone()
+        monday = (local - timedelta(days=local.weekday())).strftime("%Y-%m-%d")
+        return series.setdefault(monday, {"week": monday, "merged": 0, "clean": 0,
+                                          "rework": 0, "failed": 0})
+
+    for card in cards:
+        if card.get("merged_at"):
+            point = week(card["merged_at"])
+            if point:
+                point["merged"] += 1
+                point["clean" if card["clean"] else "rework"] += 1
+        elif card["outcome"] in FAILED_OUTCOMES:
+            point = week(card["last"])
+            if point:
+                point["failed"] += 1
+
+    if series:
+        cursor = datetime.strptime(min(series), "%Y-%m-%d").date()
+        today = datetime.now().date()
+        while cursor <= today:
+            week(cursor.isoformat())
+            cursor += timedelta(days=7)
+    return sorted(series.values(), key=lambda p: p["week"])[-weeks:]
+
+
 def local_day(stamp: str) -> str:
     """ISO-метка (обычно UTC от GitHub) — в местный день."""
-    try:
-        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    if not when.tzinfo:
-        when = when.replace(tzinfo=timezone.utc)
-    return when.astimezone().strftime("%Y-%m-%d")
+    when = moment(stamp)
+    return when.astimezone().strftime("%Y-%m-%d") if when else ""
 
 
 def since(days: int) -> str:
@@ -665,12 +845,20 @@ def pulse() -> dict:
 
 
 def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dict:
-    """Всё, что показывает страница, одним ответом."""
+    """
+    Всё, что показывает витрина, одним ответом.
+
+    Главный вопрос страницы — «помогает ли эта штука работать», и числа подобраны
+    под него: сколько работы уехало в main, сколько из неё пришлось переделывать
+    и сколько задач стоит и ждёт человека. Деньги тоже считаются, но живут
+    на отдельной странице: они отвечают на другой вопрос.
+    """
     external = outside.snapshot(force=force)
     runs = parse_runs()
     events = read_events()
     titles = card_titles()
     cards = collect_cards(runs, events, external, titles, cfg)
+    waiting = waiting_list(cards, external, cfg)
 
     edge = since(days)
     window_runs = [run for run in runs if run["at"] >= edge]
@@ -682,21 +870,20 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
         by_group[run["group"]] += run["cost"]
 
     merged = [c for c in window_cards if c["outcome"] == "merged"]
+    clean = [c for c in merged if c["clean"]]
+    reworked = [c for c in merged if not c["clean"]]
     with_pr = [c for c in window_cards if c.get("pr")]
-    fixed = [c for c in window_cards if c["needs_changes"]]
     failed = [c for c in window_cards if c["outcome"] in FAILED_OUTCOMES]
-    waiting = [c for c in window_cards if c["outcome"] in ("waiting", "fixes", "working")]
 
-    # сколько задача живёт от первого PR до мержа — единственная честная длительность:
-    # в метаданных прогона лежит время последнего вызова агента, а не всей работы
-    lags = []
+    # ожидание считаем только по тем, где оно осмысленно: по смерженным — сколько
+    # задача пролежала готовой, по ждущим — сколько лежит прямо сейчас
+    merge_waits = [c["merge_wait_s"] for c in merged if c["merge_wait_s"]]
+    live_waits = [item["wait_s"] for item in waiting if item["wait_s"]]
+
+    returns = defaultdict(int)
     for card in merged:
-        pull = card.get("pr") or {}
-        if pull.get("createdAt") and pull.get("mergedAt"):
-            start = datetime.fromisoformat(pull["createdAt"].replace("Z", "+00:00"))
-            end = datetime.fromisoformat(pull["mergedAt"].replace("Z", "+00:00"))
-            lags.append((end - start).total_seconds() / 86400)
-    lags.sort()
+        for name in REWORK_ROUNDS:
+            returns[name] += card["rounds"][name]
 
     triage_runs = [run for run in window_runs if run["kind"] == "triage"]
     triage_by_status = defaultdict(int)
@@ -705,8 +892,8 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
 
     epic_runs = [run for run in window_runs if run["group"] == "epic"]
     cut_runs = [run for run in window_runs if run["cut"]]
-
     cost = round(sum(run["cost"] for run in window_runs), 2)
+
     return {
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "days": days,
@@ -714,27 +901,32 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
         "errors": external.get("errors") or {},
         "pulse": pulse(),
         "totals": {
+            "merged": len(merged),
+            "clean": len(clean),
+            "reworked": len(reworked),
+            "returns": dict(returns),
+            "reviewer_returns": sum(c["needs_changes"] for c in merged),
+            "done": len(with_pr),
+            "failed": len(failed),
+            "cards": len(window_cards),
+            "waiting": len(waiting),
+            "wait_median_s": round(median(live_waits)),
+            "wait_max_s": round(max(live_waits)) if live_waits else 0,
+            "merge_wait_median_s": round(median(merge_waits)),
+            "merge_wait_max_s": round(max(merge_waits)) if merge_waits else 0,
             "cost": cost,
             "by_group": {key: round(value, 2) for key, value in by_group.items()},
             "runs": len(window_runs),
-            "cards": len(window_cards),
-            "done": len(with_pr),
-            "merged": len(merged),
-            "fixed": len(fixed),
-            "failed": len(failed),
-            "waiting": len(waiting),
-            "cost_per_card": round(cost / len(window_cards), 2) if window_cards else 0,
             "cost_per_merged": round(sum(c["cost"] for c in merged) / len(merged), 2)
                                if merged else 0,
-            "merge_lag_days": round(lags[len(lags) // 2], 1) if lags else 0,
-            "review_rounds": round(sum(c["review_runs"] for c in with_pr) / len(with_pr), 1)
-                             if with_pr else 0,
             "cut_runs": len(cut_runs),
             "cut_cost": round(sum(run["cost"] for run in cut_runs), 2),
         },
         "trend": daily(window_runs, window_cards, days or 0),
+        "weeks": weekly(cards),
         "boards": external.get("boards") or [],
         "cards": window_cards,
+        "waiting_cards": waiting,
         "stuck": [c for c in window_cards if c["outcome"] in FAILED_OUTCOMES],
         "triage": {
             "runs": len(triage_runs),
@@ -749,7 +941,7 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
         },
         "top_cost": sorted(window_cards, key=lambda c: c["cost"], reverse=True)[:5],
         "labels": {"kind": KIND_LABELS, "status": STATUS_LABELS,
-                   "group": GROUP_LABELS, "outcome": OUTCOMES},
+                   "group": GROUP_LABELS, "outcome": OUTCOMES, "round": ROUND_LABELS},
         "caps": {
             "agent": (cfg.get("agent") or {}).get("max_budget_usd"),
             "reviewer": (cfg.get("reviewer") or {}).get("max_budget_usd"),

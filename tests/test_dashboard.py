@@ -185,4 +185,98 @@ lines = d.tail(log, 3)
 check("последние три", lines == ["строка 498", "строка 499", "строка 500"], str(lines))
 check("файла нет — и ладно", d.tail(log.parent / "нет.log", 5) == [])
 
+print("=== 16. почему исполнитель брался за карточку ещё раз ===")
+
+
+def story(*items):
+    """Последовательность заходов: `c:done`, `r:needs_changes`, `c:обрыв`."""
+    out = []
+    for item in items:
+        kind, _, status = item.partition(":")
+        out.append({"kind": "card" if kind == "c" else "review",
+                    "status": None if status in ("обрыв", "—") else status,
+                    "cut": "упёрся в потолок расхода" if status == "обрыв" else ""})
+    return out
+
+
+check("первый заход", d.classify_rounds(story("c:done")) == ["first"])
+check("ревьювер вернул — это правки",
+      d.classify_rounds(story("c:done", "r:needs_changes", "c:done"))
+      == ["first", "fixing"])
+check("ревью прошло, а карточку всё равно вернули — это уже человек",
+      d.classify_rounds(story("c:done", "r:ok", "c:done")) == ["first", "again"])
+check("после обрыва — продолжение, а не переделка",
+      d.classify_rounds(story("c:обрыв", "c:done")) == ["first", "resuming"])
+check("после вопроса — ответ человека",
+      d.classify_rounds(story("c:unclear", "c:done")) == ["first", "returning"])
+
+print("=== 17. «с первого захода» — это без единого возврата ===")
+runs = [{**r, "card_id": CARD, "at": f"2026-09-0{n + 1}T10:00:00+00:00", "cost": 1.0,
+         "day": f"2026-09-0{n + 1}", "questions": [], "risks": "", "summary": "",
+         "major": 0, "minor": 0, "steps": 1, "group": "card"}
+        for n, r in enumerate(story("c:done", "r:needs_changes", "c:done", "r:ok"))]
+outside = {"prs": {CARD: {"state": "MERGED", "number": 1, "title": "",
+                          "createdAt": "2026-09-01T12:00:00Z",
+                          "mergedAt": "2026-09-05T12:00:00Z"}},
+           "shipped": {}, "boards": []}
+cfg = {"kaiten": {"domain": "example.kaiten.ru", "space_id": 1}, "agent": {}}
+card = d.collect_cards(runs, [], outside, {}, cfg)[0]
+check("уехало в main", card["outcome"] == "merged", card["outcome"])
+check("но не с первого захода", card["clean"] is False)
+check("возврат посчитан один", card["rework"] == 1 and card["rounds"]["fixing"] == 1,
+      str(card["rounds"]))
+check("заходов два", card["passes"] == 2, str(card["passes"]))
+
+clean = d.collect_cards(runs[:1] + runs[3:], [], outside, {}, cfg)[0]
+check("а без возвратов — с первого", clean["clean"] is True and clean["rework"] == 0)
+
+print("=== 18. ожидание считается с последнего шага фабрики ===")
+# PR открыли первого числа в полдень, но фабрика возилась с карточкой до четвёртого:
+# человек ждал сутки с небольшим, а не четыре дня
+check("от последнего шага фабрики до мержа", card["merge_wait_s"] == 26 * 3600,
+      str(card["merge_wait_s"] / 3600) + " ч")
+
+print("=== 19. в «Ревью агента» ход не человека, а ревьювера ===")
+base = {"pr": {"state": "OPEN"}, "shipped": None, "status": "done", "cut": "",
+        "last_outcome": ""}
+check("ревьювер смотрит", d.card_outcome({**base, "column": "agent_review"}) == "review")
+check("а с блокером — уже человек",
+      d.card_outcome({**base, "column": "agent_review", "blocked": True}) == "waiting")
+check("«На ревью» — человек", d.card_outcome({**base, "column": "review"}) == "waiting")
+check("«В работе» — фабрика", d.card_outcome({**base, "column": "in_progress"}) == "working")
+
+print("=== 20. «ждёт тебя» собирается по доске, а не по логам ===")
+outside = {"prs": {}, "shipped": {}, "boards": [{"key": "работа", "outside": 0, "columns": [
+    {"role": "queue", "label": "Очередь", "hint": "",
+     "cards": [{"id": 1, "title": "Ждёт фабрику", "url": "u1", "blocked": False}]},
+    {"role": "review", "label": "На ревью", "hint": "",
+     "cards": [{"id": 2, "title": "Посмотри PR", "url": "u2", "blocked": False}]},
+    {"role": "question", "label": "Вопрос", "hint": "",
+     "cards": [{"id": 3, "title": "Ответь", "url": "u3", "blocked": False}]},
+    {"role": "agent_review", "label": "Ревью агента", "hint": "",
+     "cards": [{"id": 4, "title": "Ревьювер смотрит", "url": "u4", "blocked": False},
+               {"id": 5, "title": "Заблокирована", "url": "u5", "blocked": True}]},
+]}]}
+waiting = d.waiting_list([], outside, cfg)
+check("очередь не ждёт человека", 1 not in [w["id"] for w in waiting], str(waiting))
+check("«На ревью» ждёт", any(w["id"] == 2 and w["reason"] == "посмотреть PR" for w in waiting))
+check("вопрос ждёт", any(w["id"] == 3 and "вопрос" in w["reason"] for w in waiting))
+check("ревьювер — не человек", 4 not in [w["id"] for w in waiting])
+check("а блокер — человек",
+      any(w["id"] == 5 and w["reason"] == d.BLOCKED_REASON for w in waiting))
+
+print("=== 21. недели, а не дни ===")
+cards = [{"merged_at": "2026-09-01T10:00:00+00:00", "clean": True, "outcome": "merged",
+          "last": "2026-09-01T10:00:00+00:00", "rounds": {}},
+         {"merged_at": "2026-09-03T10:00:00+00:00", "clean": False, "outcome": "merged",
+          "last": "2026-09-03T10:00:00+00:00", "rounds": {}},
+         {"merged_at": None, "clean": False, "outcome": "question",
+          "last": "2026-09-08T10:00:00+00:00", "rounds": {}}]
+weeks = {point["week"]: point for point in d.weekly(cards, weeks=99)}
+check("обе задачи попали в одну неделю",
+      weeks["2026-08-31"]["merged"] == 2, str(weeks.get("2026-08-31")))
+check("одна из них с первого раза",
+      weeks["2026-08-31"]["clean"] == 1 and weeks["2026-08-31"]["rework"] == 1)
+check("неудача — в свою неделю", weeks["2026-09-07"]["failed"] == 1)
+
 print("\nвсё сошлось")
