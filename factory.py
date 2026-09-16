@@ -1466,7 +1466,11 @@ def thread_asks(asks: list[str], again: bool = False) -> str:
     clean = [ask for ask in (ASK_MARK_RE.sub("", a).strip() for a in asks) if ask]
     if not clean:
         return ""
-    after_fix = "Перечитал ещё раз после правки, и вот что вылезло" if again else ""
+    # «и вот что вылезло» читалось как список замечаний, а не как вопрос: на такое
+    # человеку нечего ответить, и он справедливо переспрашивал, чего от него хотят
+    after_fix = "Перечитал ещё раз после правки, и появился вопрос" if again else ""
+    if again and len(clean) > 1:
+        after_fix = "Перечитал ещё раз после правки, и появились вопросы"
     if len(clean) == 1:
         return f"{after_fix or 'Есть вопрос'}: {clean[0]}"
     return (f"{after_fix or 'Есть следующие вопросы'}:\n"
@@ -1561,7 +1565,9 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
 
         profile = profile_for_board(profiles, card.get("board_id"))
         comments = kaiten.comments(card["id"])
-        asks = open_questions(comments)
+        # В канал — только вопросы: замечания ревьювера читает тот, кто открыл PR,
+        # а человеку в треде от них нечего ответить
+        asks = human_questions(comments)
         role, status = time_status(profile, card, asks)
 
         # Вопросы агента — в тред: человеку сказали «позырьте», и он должен увидеть,
@@ -5587,6 +5593,20 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
 ASK_HEADS = ("Что нужно уточнить", "Замечания", "Что уточнить")
 ASK_BULLETS = ("- ", "• ", "🛑 ", "⚠️ ", "💬 ", "❓ ")
 
+# Заголовки, под которыми агент спрашивает человека. «Замечания» сюда не входят:
+# замечания ревьювера адресованы исполнителю и живут в PR, а не в разговоре с людьми.
+QUESTION_HEADS = ("Что нужно уточнить", "Что уточнить")
+
+# Значок в начале строки делает её пунктом сам по себе — замечания ревьювера идут
+# без заголовка, просто «🛑 …». А голый дефис — нет: списки в отчёте есть везде,
+# и «⚠️ Додумал сам — проверь» состоит ровно из таких строк. Раз в тред уехало
+# «Принял, что у Drinkit флаг должен остаться прямоугольным» — под видом вопроса,
+# на который человек якобы должен ответить.
+MARK_BULLETS = ("🛑 ", "⚠️ ", "💬 ", "❓ ")
+
+# Продолжение длинного комментария, разрезанного по 4096 символов: «🤖 _(продолжение 2/3)_».
+CONTINUED_RE = re.compile(r"^\S+\s+_\(продолжение \d+/\d+\)_")
+
 # Значок в начале строки: в карточке он к месту — строк много и они разной
 # срочности, — а в мессенджере лишний. Собираем из ASK_BULLETS, чтобы новый
 # значок не пришлось дописывать в двух местах.
@@ -5595,39 +5615,51 @@ ASK_MARK_RE = re.compile("^(?:"
                          + r")\s*")
 
 
-def open_questions(comments: list, limit: int = 4) -> list[str]:
+def last_agent_say(comments: list) -> list[str]:
     """
-    Чего именно фабрика ждёт от человека — по последнему комментарию агента.
+    Последнее, что агент сказал в карточке, — одним куском.
 
-    Без этого «ждёт твоего ответа» бесполезно: вопросы лежат в карточке, иногда
-    разрезанные на три комментария по 4096 символов, и человек не понимает,
-    на что отвечать. Берём последний агентский комментарий и вытаскиваем из него
-    пункты списка.
+    Куском, а не комментарием, потому что длинный ответ Kaiten режет по 4096 символов,
+    и первая часть с блокерами оказывается не последней. Части узнаём по метке
+    «(продолжение N/M)»: она для того и ставится.
+
+    Раньше сюда собиралось всё, что агент наговорил после последней реплики человека.
+    Но за один прогон карточка проходит несколько шагов — ревью с замечаниями, правки,
+    отчёт, ревью начисто, — и человек между ними молчит. Замечания, которые исполнитель
+    уже разобрал следующим же комментарием, считались открытыми и уезжали человеку
+    как «вот что вылезло» — при том что последним словом ревьювера было «Замечаний нет».
     """
-    # Берём всё, что агент сказал после последней реплики человека: длинный ответ
-    # Kaiten режет на несколько комментариев по 4096 символов, и блокеры оказываются
-    # в первой части, а не в последней. Один последний комментарий давал только хвост.
-    round_texts = []
+    say = []
     for comment in reversed(comments):
         text = strip_html(comment.get("text", ""))
         if not text.startswith(AGENT_MARKS):
             break
-        round_texts.append(text)
-    round_texts.reverse()
-    if not round_texts:
-        return []
+        say.append(text)
+        if not CONTINUED_RE.match(text):
+            break  # это первая часть: всё, что раньше, — уже другой шаг
+    say.reverse()
+    return say
 
+
+def collect_asks(comments: list, heads: tuple, marks: tuple, limit: int) -> list[str]:
+    """
+    Пункты списка из последнего слова агента: под заголовками `heads` — любые,
+    а со значком из `marks` — где бы они ни стояли.
+
+    Голый дефис вне заголовка не берём: списками в отчёте написана половина текста,
+    и без этого различения в вопросы попадало «Додумал сам — проверь».
+    """
     asks = []
-    for text in round_texts:
+    for text in last_agent_say(comments):
         in_list = False
         for raw in text.splitlines():
             line = raw.strip()
             if not line:
                 continue
-            if any(head.lower() in line.lower() for head in ASK_HEADS):
+            if any(head.lower() in line.lower() for head in heads):
                 in_list = True
                 continue
-            if line.startswith(ASK_BULLETS):
+            if line.startswith(marks) or (in_list and line.startswith(ASK_BULLETS)):
                 # маркер severity оставляем: по нему сразу видно, что блокирует
                 asks.append(re.sub(r"^[-•]\s*", "", line))
                 in_list = True
@@ -5639,6 +5671,29 @@ def open_questions(comments: list, limit: int = 4) -> list[str]:
     order = {"🛑": 0, "⚠️": 1, "💬": 2}
     asks.sort(key=lambda a: order.get(a[:2].strip(), 1))
     return [a[:180] for a in asks[:limit]]
+
+
+def open_questions(comments: list, limit: int = 4) -> list[str]:
+    """
+    Чего фабрика ждёт от человека: вопросы агента и замечания ревьювера вместе.
+
+    Без этого «ждёт твоего ответа» бесполезно: вопросы лежат в карточке, иногда
+    разрезанные на три комментария по 4096 символов, и человек не понимает,
+    на что отвечать.
+    """
+    return collect_asks(comments, ASK_HEADS, MARK_BULLETS, limit)
+
+
+def human_questions(comments: list, limit: int = 4) -> list[str]:
+    """
+    То же, но только вопросы — то, на что человек должен ответить словами.
+
+    Для разговора в Time. В карточке и в PR замечания ревьювера к месту: там их читает
+    тот, кто будет смотреть код. В канале же вопрос — это обращение к человеку, и
+    отправить ему под видом вопроса разбор чужих замечаний значит потребовать ответа
+    там, где отвечать не на что: «это вопрос или что?» — справедливо спросили в треде.
+    """
+    return collect_asks(comments, QUESTION_HEADS, ("❓ ",), limit)
 
 
 def take_epic(kaiten: Kaiten, flow: dict, card: dict) -> None:

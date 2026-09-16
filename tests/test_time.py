@@ -88,9 +88,12 @@ class FakeKaiten:
                                      "board_id": 1000, "column_id": self.column}
     def comment(self, card_id, text): self.comments_written.append((card_id, text))
     def comments(self, card_id):
+        # ровно тем же шаблоном, каким вопросы пишет живой агент: по заголовку
+        # «Что нужно уточнить» их и отличают от прочих списков в отчёте
         if not self.asks:
             return []
-        body = "🤖 **Не хватило данных.**\n\n" + "\n".join(f"- {a}" for a in self.asks)
+        body = ("🤖 **Не берусь — не хватает информации.** Ничего не менял."
+                + f.format_list("Что нужно уточнить", self.asks))
         return [{"text": body, "created": "2026-09-09T00:00:00Z"}]
     def move(self, card_id, column): self.moves.append((card_id, column))
     def blockers(self, card_id): return []
@@ -366,7 +369,7 @@ check("в тред не отвечает",
 check("но сообщение считает прочитанным", json.loads(f.TIME_STATE_FILE.read_text())
       ["threads"]["555"]["last_post_id"] == "reply")
 
-print("=== 17. вопросы ревьювера начинаются с «❓» — их тоже видно ===")
+print("=== 17. вопрос ревьювера виден, а замечание прошлого круга — нет ===")
 
 
 class Reviewer(FakeKaiten):
@@ -390,7 +393,11 @@ asked = [json.loads(g[2])["message"] for g in GOT
          if g[0] == "POST" and g[1].endswith("/posts")]
 check("сообщение одно", len(asked) == 1, str(asked))
 check("вопрос ревьювера на месте", "Какой unitId у пиццерии Алматы-9?" in asked[0], asked[0])
-check("замечание тоже", "Быстрый заказ обходит обязательный телефон" in asked[0], asked[0])
+# Замечание — из прошлого круга, и к тому времени его уже разобрали. Пока оно уезжало
+# в тред наравне с вопросом, человек получал список, в котором нечего отвечать, и
+# справедливо спрашивал в ответ: «это вопрос или что?»
+check("замечание прошлого круга не поехало",
+      "Быстрый заказ обходит обязательный телефон" not in asked[0], asked[0])
 check("и ни одного значка", not any(m in asked[0] for m in ("❓", "⚠️", "🔍")), asked[0])
 
 print("=== 18. сухой прогон состояние не трогает ===")
@@ -593,6 +600,48 @@ broken = json.loads(json.dumps(cfg))
 broken["notify"]["time"]["base_url"] = "http://127.0.0.1:1"   # там никто не слушает
 f.refresh_time_status(FakeKaiten(), broken, Args(), profiles)
 check("вернулись живыми", True)
+
+print("=== 27. «Додумал сам» и разобранные замечания вопросами не считаются ===")
+# Живой случай с карточкой про флаги: за прогон карточка прошла ревью с замечаниями,
+# правки, отчёт и ревью начисто — человек всё это время молчал. В тред уехали
+# замечания, которые исполнитель уже разобрал, и строка из «Додумал сам», а сверху
+# было написано «вот что вылезло». В треде спросили: «это вопрос или что?»
+flags = [
+    {"text": "🔍 **Нужны правки: 2 из 5.**\n\n"
+             "🛑 getByRole('img') не находит картинку с пустым alt\n\n"
+             "⚠️ У Drinkit флаг стал квадратным",
+     "created": "2026-09-16T05:50:19Z"},
+    {"text": "🤖 **Готово, нужен ревью.**\n\nФлаг у Drinkit снова прямоугольный.\n\n"
+             "**⚠️ Додумал сам — проверь**\n"
+             "- Принял, что у Drinkit флаг должен остаться прямоугольным",
+     "created": "2026-09-16T06:04:10Z"},
+    {"text": "🔍 **Замечаний нет.**\n\nПодробно: https://github.com/o/r/pull/7",
+     "created": "2026-09-16T08:17:33Z"},
+]
+check("в канал ехать нечему", f.human_questions(flags) == [], str(f.human_questions(flags)))
+check("и «Додумал сам» вопросом не стало",
+      not any("Принял, что" in a for a in f.open_questions(flags)), str(f.open_questions(flags)))
+
+# а вот настоящий вопрос из того же отчёта — едет
+asked_report = [flags[0], {"text": "🤖 **Готово, нужен ревью.**\n\nСделал."
+                                   + f.format_list("Что нужно уточнить",
+                                                   ["Круглый флаг только у Додо?"]),
+                           "created": "2026-09-16T06:04:10Z"}]
+check("вопрос из последнего отчёта на месте",
+      f.human_questions(asked_report) == ["Круглый флаг только у Додо?"],
+      str(f.human_questions(asked_report)))
+check("а замечание прошлого круга — нет",
+      not any("getByRole" in a for a in f.human_questions(asked_report)))
+
+print("=== 28. длинный комментарий, разрезанный на части, читается целиком ===")
+long_ask = f.split_comment("🤖 **Не берусь — не хватает информации.**\n\n"
+                           + "Разбирался долго. " * 300
+                           + f.format_list("Что нужно уточнить", ["А какой бизнес?"]))
+check("Kaiten разрезал бы это на части", len(long_ask) > 1, str(len(long_ask)))
+cut = [{"text": part, "created": f"2026-09-16T06:0{i}:00Z"}
+       for i, part in enumerate(long_ask)]
+check("вопрос найден в хвосте", f.human_questions(cut) == ["А какой бизнес?"],
+      str(f.human_questions(cut)))
 
 srv.shutdown()
 print("\nвсё сошлось")
