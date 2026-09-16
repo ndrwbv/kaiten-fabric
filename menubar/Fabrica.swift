@@ -138,6 +138,21 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         return json
     }
 
+    /// Адрес витрины она сама и кладёт в настройки при запуске. Не запускалась
+    /// ни разу — показываем адрес по умолчанию: пункт меню её же и поднимет.
+    private var dashboardURL: String {
+        let stored = (readSettings()["dashboard"] as? [String: Any])?["url"] as? String
+        return stored ?? "http://127.0.0.1:8777/"
+    }
+
+    /// То же, но коротко — как это пишут в адресной строке.
+    private var dashboardHost: String {
+        dashboardURL
+            .replacingOccurrences(of: "http://", with: "")
+            .replacingOccurrences(of: "https://", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     /// Расписание приложение только читает. Пишет файл витрина — один писатель
     /// на настройку, и не надо думать, чья запись победит. Старые значения из
     /// UserDefaults переносит туда же витрина, при первом чтении.
@@ -663,6 +678,15 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Витрина — второе окно в фабрику и единственное место, где меняются
+        // настройки. Стоит рядом с кнопками и показывает адрес: пункт «Открыть
+        // витрину…» в хвосте меню человек глазами просто не находил.
+        do {
+            let item = action("Витрина: \(dashboardHost)", #selector(openDashboard))
+            item.toolTip = "Статистика, правила и все настройки. Откроется в браузере"
+            menu.addItem(item)
+        }
+
         // Три расписания, и каждое ходит только за своим. Менять их теперь можно
         // в витрине — здесь они только видны: настройки в двух местах разъезжаются,
         // и человек перестаёт понимать, какое из них настоящее.
@@ -680,7 +704,6 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
         menu.addItem(action("Открыть доску", #selector(openBoard)))
         menu.addItem(action("Показать лог", #selector(openLog)))
-        menu.addItem(action("Открыть витрину…", #selector(openDashboard)))
         menu.addItem(authMenu())
 
         menu.addItem(.separator())
@@ -879,7 +902,20 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         process.arguments = ["-ilc", command]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
+        // Молча не падаем: человек нажал и ждёт браузер. Вкладку витрина открывает
+        // сама — и когда поднимается, и когда уже работает, — так что сообщать тут
+        // нечего, кроме поломки.
+        process.terminationHandler = { [weak self] proc in
+            guard proc.terminationStatus != 0 else { return }
+            DispatchQueue.main.async {
+                self?.lastError = "витрина не поднялась — запусти python3 dashboard.py руками"
+                self?.redraw()
+            }
+        }
+        do { try process.run() } catch {
+            lastError = "витрина не запустилась: \(error.localizedDescription)"
+            redraw()
+        }
     }
 
     private func open(_ string: String) {

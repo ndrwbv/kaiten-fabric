@@ -1599,6 +1599,12 @@ def main() -> int:
             return 0
         print(f"порт {args.port} занят кем-то другим — возьми другой: --port 9000")
         return 1
+    # Адрес кладём в общие настройки: меню-бар показывает его пунктом «Витрина»,
+    # и порт в двух местах руками больше не держим
+    save_settings({"dashboard": {
+        "url": url, "port": args.port,
+        "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }})
     print(f"витрина фабрики: {url}   (Ctrl+C — выход)")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
