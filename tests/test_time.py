@@ -563,5 +563,36 @@ check("блокер без причины — говорим своими сло
       said == ["Меня блочит блокер на карточке — сними, и поеду."], str(said))
 f.blocked_by = lambda k, c: None
 
+print("=== 25. карточка переехала в конце прогона — канал узнаёт тем же прогоном ===")
+# Ровно то, на чём фабрика попалась: треды читаются в начале прогона, а ревью
+# уводит карточку человеку в конце — и в канале час висело «пока не смотрите»
+# по работе, которую уже доделали.
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)",
+    "status": "пацаны, пока не смотрите, сыровато"}}}), encoding="utf-8")
+GOT.clear()
+working = FakeKaiten(); working.column = 105      # «Ревью агента»
+f.follow_time_threads(working, cfg, Args(), profiles)
+check("пока карточка у ревьювера — статус тот же",
+      [g for g in GOT if g[0] == "PUT"] == [], str(GOT))
+
+GOT.clear()
+reviewed = FakeKaiten(); reviewed.column = 107    # ревью прошло, карточка у человека
+f.refresh_time_status(reviewed, cfg, Args(), profiles)
+edits = [g for g in GOT if g[0] == "PUT"]
+check("сообщение переписано в конце прогона", len(edits) == 1, str(GOT))
+check("и в канале теперь «позырьте»",
+      json.loads(edits[0][2])["message"].splitlines()[-1] == "пацанчики, позырьте плз",
+      edits[0][2])
+check("тред при этом не перечитывали",
+      [g for g in GOT if "/thread" in g[1]] == [], str(GOT))
+
+print("=== 26. упавший Time не роняет прогон ===")
+broken = json.loads(json.dumps(cfg))
+broken["notify"]["time"]["base_url"] = "http://127.0.0.1:1"   # там никто не слушает
+f.refresh_time_status(FakeKaiten(), broken, Args(), profiles)
+check("вернулись живыми", True)
+
 srv.shutdown()
 print("\nвсё сошлось")

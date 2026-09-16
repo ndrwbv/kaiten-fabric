@@ -1514,50 +1514,38 @@ def profile_for_board(profiles: list[dict], board_id: int) -> dict | None:
     return next((p for p in profiles if p["board_id"] == board_id), None)
 
 
-def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
+def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
+                     client: Time | None = None) -> tuple[dict, dict]:
     """
-    Фаза чтения тредов: что человек написал в треде — то и станет правкой.
+    Привести строку статуса в канале к тому, что сейчас в карточке.
 
-    Тред здесь — второй вход в ту же машину, а не своя. Сообщение переносится
-    комментарием в карточку, карточка уезжает в «Правки», и дальше всё идёт обычным
-    порядком: исполнитель, ревьювер, тот же PR в той же ветке. Прямой путь
-    «сообщение → агент» пришлось бы снабдить своим счётчиком кругов, стоп-фразой,
-    бюджетом и ночным тегом — и через месяц он разъехался бы с оригиналом.
+    Статус берём из колонки, а не из событий фабрики: карточку двигают в десятке мест,
+    и хук в каждом однажды забыли бы поставить. А так источник правды один, и статус
+    верен даже после прогона, который убили на середине.
 
-    Опрос, а не входящий вебхук: фабрика — пакетный процесс по расписанию, принимать
-    входящий HTTP ей некуда. На сервере можно будет реагировать сразу, но опрос
-    останется — он же и восстановление после простоя.
+    Отдельной функцией — потому что смотреть на колонку надо дважды за прогон. Прогон
+    сам же карточки и двигает: ревью уводит их человеку или в «Правки». Пока это
+    делалось только в начале чтения тредов, между двумя прогонами в канале час висело
+    «пока не смотрите, сыровато» по работе, которую час назад доделали, — и канал
+    расходился с витриной, где всё это время было честное «на ревью у человека».
+
+    Возвращает состояние тредов и разбор карточек: чтение тредов идёт сразу следом,
+    и спрашивать Kaiten про те же карточки второй раз незачем.
     """
     conf = time_config(cfg)
     if not conf:
-        return 0
-    env = load_env()
-    client = time_client(cfg, env, args.dry_run)
-    if not client:
-        return 0
-    if not client.can_read:
-        log("Time на вебхуке: тред читать нечем, правки из треда не заработают")
-        return 0
+        return {}, {}
+    client = client or time_client(cfg, load_env(), args.dry_run)
+    # На вебхуке ни сообщение поправить, ни в тред написать нечем: статуса там не будет
+    if not client or not client.can_read:
+        return {}, {}
 
     state = load_time_state()
     threads = state.get("threads") or {}
     if not threads:
-        return 0
+        return state, {}
 
-    try:
-        me = client.me()
-    except FactoryError as e:
-        log(f"Time: не смог узнать себя ({e}) — треды не читаю")
-        return 0
-    bot_id = me.get("id") or ""
-    # По этому обращению фабрика понимает, что говорят с ней. Берём из токена, а не
-    # из конфига: имя бота знает он сам, и лишней настройке тут делать нечего
-    handle = f"@{me.get('username')}".lower() if me.get("username") else ""
-
-    allowed = [name.lstrip("@").lower() for name in (conf.get("allow_from") or [])]
-    note_phase(args, "читаю треды в Time")
-    moved = 0
-
+    known = {}
     for card_key, info in list(threads.items()):
         root_id = info.get("root_id")
         if not root_id:
@@ -1571,9 +1559,6 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             save_time_state(state)
             continue
 
-        # Статус берём из колонки, а не из событий фабрики: карточку двигают в десятке
-        # мест, и хук в каждом однажды забыли бы поставить. А так источник правды один,
-        # и статус верен даже после прогона, который убили на середине.
         profile = profile_for_board(profiles, card.get("board_id"))
         comments = kaiten.comments(card["id"])
         asks = open_questions(comments)
@@ -1616,8 +1601,72 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             save_time_state(state)
             continue
 
-        if not conf.get("follow_threads", True):
+        known[card_key] = {"card": card, "profile": profile,
+                           "comments": comments, "asks": asks}
+    return state, known
+
+
+def refresh_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> None:
+    """То же самое в конце прогона: карточки переехали — пусть и в канале переедут."""
+    try:
+        sync_time_status(kaiten, cfg, args, profiles)
+    except Exception as e:  # noqa: BLE001 — мессенджер не важнее сделанной работы
+        log(f"статус в Time не обновился: {e}")
+
+
+def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
+    """
+    Фаза чтения тредов: что человек написал в треде — то и станет правкой.
+
+    Тред здесь — второй вход в ту же машину, а не своя. Сообщение переносится
+    комментарием в карточку, карточка уезжает в «Правки», и дальше всё идёт обычным
+    порядком: исполнитель, ревьювер, тот же PR в той же ветке. Прямой путь
+    «сообщение → агент» пришлось бы снабдить своим счётчиком кругов, стоп-фразой,
+    бюджетом и ночным тегом — и через месяц он разъехался бы с оригиналом.
+
+    Опрос, а не входящий вебхук: фабрика — пакетный процесс по расписанию, принимать
+    входящий HTTP ей некуда. На сервере можно будет реагировать сразу, но опрос
+    останется — он же и восстановление после простоя.
+    """
+    conf = time_config(cfg)
+    if not conf:
+        return 0
+    env = load_env()
+    client = time_client(cfg, env, args.dry_run)
+    if not client:
+        return 0
+    if not client.can_read:
+        log("Time на вебхуке: тред читать нечем, правки из треда не заработают")
+        return 0
+
+    state, known = sync_time_status(kaiten, cfg, args, profiles, client=client)
+    if not known:
+        return 0
+    if not conf.get("follow_threads", True):
+        return 0
+    threads = state.get("threads") or {}
+
+    try:
+        me = client.me()
+    except FactoryError as e:
+        log(f"Time: не смог узнать себя ({e}) — треды не читаю")
+        return 0
+    bot_id = me.get("id") or ""
+    # По этому обращению фабрика понимает, что говорят с ней. Берём из токена, а не
+    # из конфига: имя бота знает он сам, и лишней настройке тут делать нечего
+    handle = f"@{me.get('username')}".lower() if me.get("username") else ""
+
+    allowed = [name.lstrip("@").lower() for name in (conf.get("allow_from") or [])]
+    note_phase(args, "читаю треды в Time")
+    moved = 0
+
+    for card_key, seen in known.items():
+        info = threads.get(card_key)
+        if not info:
             continue
+        root_id = info["root_id"]
+        card, profile = seen["card"], seen["profile"]
+        comments, asks = seen["comments"], seen["asks"]
 
         try:
             posts = client.thread(root_id)
@@ -5976,6 +6025,10 @@ def main() -> int:
     finally:
         if snapshot:
             refresh_flow(kaiten, cfg, profiles)
+            # Канал — та же витрина, только для тех, кто в Kaiten не смотрит. Прогон
+            # только что развёз карточки по колонкам, и знать об этом канал должен
+            # сейчас, а не через час, когда доска поедет в следующий раз.
+            refresh_time_status(kaiten, cfg, args, profiles)
 
 
 def refresh_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
