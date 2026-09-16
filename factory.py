@@ -99,11 +99,29 @@ INBOX_ORIGIN_RE = re.compile(r"Из инбокса:\s*#(\d+)")
 
 # Строка в комментарии инбокса: задача уже поставлена. Разведка к такой карточке
 # больше не возвращается, даже если в ней продолжают переписку.
-HANDOFF_LINE = "Поставил задачу на «Доску для клода»:"
+#
+# Доску в строке больше не называем: задача теперь заводится там, где работает
+# команда. Старую формулировку держим для узнавания — по ней помечены карточки,
+# разобранные до переезда, и забыть их значит разобрать их заново, за деньги.
+HANDOFF_LINE = "Поставил задачу:"
+HANDOFF_LINES = (HANDOFF_LINE, "Поставил задачу на «Доску для клода»:")
+
+# Как зовут разработчика и по какому тегу он берёт задачи. Имя — не украшение:
+# фабрика работает на общих досках наравне с людьми, и команде удобнее говорить
+# «Стёпа возьмёт», а не «фабрика обработает карточку». Меняется в config.json,
+# секция `bot`.
+BOT_NAME = "Stepa Tugarev"
+# Тег «это моё». На общей доске он — единственный способ сказать «Стёпа, возьми»,
+# и он же висит на всём, что Стёпа ведёт: на эпиках, на сабтасках, на задачах
+# из инбокса. Ночной тег растёт из него же: `<тег>:night`.
+BOT_TAG = "stepa"
+NIGHT_SUFFIX = ":night"
 
 # Ручной стоп-кран: фраза в карточке выключает по ней всех агентов. Список можно
 # дополнить в config.json, ключ stop_phrases.
 STOP_PHRASES = [
+    "стёпа не трогай", "степа не трогай", "не трогай стёпу", "не трогай степу",
+    "стёпа не бери", "степа не бери", "не для стёпы", "не для степы",
     "клод не трогай", "не трогай клод", "клод не бери", "не для клода",
     "claude не трогай", "не трогай claude",
 ]
@@ -319,6 +337,23 @@ class AgentAuthError(FactoryError):
     работать, и прогон не разваливается трейсбеком. Разведка ловит этот класс
     отдельно — ей важно не записать протухший токен в счёт карточке.
     """
+
+
+def bot_name(cfg: dict) -> str:
+    """Как зовут разработчика."""
+    return ((cfg.get("bot") or {}).get("name") or BOT_NAME).strip()
+
+
+def bot_tag(cfg: dict) -> str:
+    """
+    Тег «это моё».
+
+    Один тег на всё: на общей доске он говорит «Стёпа, возьми», на эпике — «этот
+    эпик ведёт Стёпа», на сабтаске — «эту написал он». Разные теги под каждый случай
+    были бы честнее по смыслу, но человеку пришлось бы помнить три слова вместо
+    одного, а он помнит имя.
+    """
+    return ((cfg.get("bot") or {}).get("tag") or BOT_TAG).strip()
 
 
 def utf16_len(text: str) -> int:
@@ -1740,14 +1775,17 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
 
 # Карточку с этим тегом фабрика берёт только ночью. Смысл — тяжёлые и шумные задачи:
 # долгие прогоны тестов, массовые правки, всё, что мешает работать днём.
-NIGHT_TAG = "claude:night"
 NIGHT_FROM = 22
 NIGHT_TO = 5
 
 
 def night_config(cfg: dict) -> tuple[str, int, int]:
+    """
+    Ночной тег и окно. Тег по умолчанию — `<тег бота>:night`: переименовали бота,
+    и ночной тег переехал за ним, а не остался напоминанием о прошлой жизни.
+    """
     night = cfg.get("night") or {}
-    return (night.get("tag") or NIGHT_TAG,
+    return (night.get("tag") or (bot_tag(cfg) + NIGHT_SUFFIX),
             int(night.get("from_hour", NIGHT_FROM)),
             int(night.get("to_hour", NIGHT_TO)))
 
@@ -1917,7 +1955,8 @@ HANDOFF_BLOCKERS = {
 
 
 def make_profile(key: str, board: dict, repo_key: str | None = None,
-                 attach_to_debt: bool = True, own_only: bool = False) -> dict:
+                 attach_to_debt: bool = True, own_only: bool = False,
+                 tag: str = BOT_TAG) -> dict:
     columns = {role: value for role, value in (board.get("columns") or {}).items() if value}
     missing = [role for role in REQUIRED_ROLES if not columns.get(role)]
     if missing:
@@ -1931,9 +1970,10 @@ def make_profile(key: str, board: dict, repo_key: str | None = None,
         "repo": repo_key,
         "attach_to_debt": attach_to_debt,
         # На своей доске фабрика хозяйка и берёт всё, что лежит в «Очереди». На доске
-        # команды так нельзя: там свой бэклог, и фабрика должна трогать только те
-        # карточки, которые сама и создала — их узнаём по строке «Из эпика: #<id>».
+        # команды так нельзя: там свой бэклог, и трогать можно только помеченное —
+        # тег и есть эта пометка.
         "own_only": own_only,
+        "tag": tag,
     }
 
 
@@ -1944,13 +1984,14 @@ def board_profiles(cfg: dict) -> list[dict]:
     Рабочая доска есть всегда. Доска сабтасок появляется, когда включён режим эпиков:
     у неё и колонки другие, и репозиторий может быть другой.
     """
-    profiles = [make_profile("работа", cfg["kaiten"])]
+    tag = bot_tag(cfg)
+    profiles = [make_profile("работа", cfg["kaiten"], tag=tag)]
     subtasks = ((cfg.get("epic_flow") or {}).get("subtasks") or {})
     if subtasks.get("board_id"):
         # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
         # только раздует описание долга, поэтому туда её не привязываем
         profiles.append(make_profile("сабтаски", subtasks, subtasks.get("repo"),
-                                     attach_to_debt=False, own_only=True))
+                                     attach_to_debt=False, own_only=True, tag=tag))
     return profiles
 
 
@@ -3054,6 +3095,26 @@ def sprint_debt(cfg: dict) -> dict | None:
     return cfg.get("sprint_debt") or cfg.get("epic") or None
 
 
+def wants_debt(profile: dict, card: dict) -> bool:
+    """
+    Привязывать ли карточку к долгу спринта.
+
+    Долг существует, чтобы мелкий техдолг был виден в процессе, а не расползался
+    по доске ничьим. Поэтому привязываем то, у чего нет своего родителя:
+
+    - на своей доске — всё, как и раньше;
+    - задачу, выросшую из инбокса, — где бы она ни лежала: своего эпика у неё нет,
+      и без долга её в спринте никто не увидит;
+    - сабтаску эпика — никогда: она уже висит на эпике, и второй родитель только
+      раздувает описание долга;
+    - чужую карточку, которую человек пометил тегом, — тоже никогда: это его
+      карточка, и менять ей родителей мы не в праве.
+    """
+    if profile.get("attach_to_debt"):
+        return True
+    return bool(INBOX_ORIGIN_RE.search(strip_html(card.get("description")) or ""))
+
+
 def attach_to_debt_card(kaiten: Kaiten, cfg: dict, card_id: int, dry_run: bool) -> str:
     """
     Вешает карточку дочерней на эпик долга. Возвращает строку для комментария.
@@ -3240,6 +3301,20 @@ def own_subtask(card: dict) -> bool:
     return bool(EPIC_ORIGIN_RE.search(strip_html(card.get("description")) or ""))
 
 
+def mine(profile: dict, card: dict) -> bool:
+    """
+    Моя ли это карточка на общей доске.
+
+    Признак один и ставится мышкой — тег. Так человек может отдать разработчику любую
+    свою задачу, не заводя её заново на отдельной доске: повесил тег — взял в работу,
+    снял — забрал обратно.
+
+    Строку «Из эпика: #<id>» проверяем следом, и только ради совместимости: сабтаски,
+    созданные до тега, никуда с доски не делись, и терять их на полпути нельзя.
+    """
+    return has_tag(card, profile.get("tag") or BOT_TAG) or own_subtask(card)
+
+
 def theirs(profile: dict, card: dict) -> bool:
     """
     Чужая ли карточка. На своей доске чужих нет, на доске команды — почти все.
@@ -3249,7 +3324,7 @@ def theirs(profile: dict, card: dict) -> bool:
     лежит живой бэклог команды. Без этого стража фабрика объявляла чужие карточки
     ждущими её ответа.
     """
-    return bool(profile.get("own_only")) and not own_subtask(card)
+    return bool(profile.get("own_only")) and not mine(profile, card)
 
 
 def skip_hands_off(kaiten: Kaiten, cards: list, cfg: dict) -> list:
@@ -3588,7 +3663,7 @@ def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     Идёт первой в прогоне, до ревьювера: смерженный PR он иначе отревьюит заново
     за отдельные деньги.
 
-    Ночное окно этой фазе не указ: тег `claude:night` придуман для тяжёлых прогонов
+    Ночное окно этой фазе не указ: ночной тег придуман для тяжёлых прогонов
     агента, а передвинуть карточку не дороже, чем её прочитать.
     """
     note_phase(args, "смотрю, что смержено")
@@ -4122,7 +4197,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
                              verdict, cfg, args.dry_run, repo_key)
 
         epic_note = ""
-        if profile.get("attach_to_debt"):
+        if wants_debt(profile, card):
             write_status(phase="привязываю к долгу спринта")
             epic_note = attach_to_debt_card(kaiten, cfg, card_id, args.dry_run)
 
@@ -4267,7 +4342,8 @@ def pick_inbox_cards(kaiten: Kaiten, cfg: dict, state: dict) -> list[tuple[dict,
         texts = [strip_html(c.get("text", "")) for c in comments]
         # задача уже стоит на рабочей доске — разведке тут больше делать нечего,
         # что бы дальше ни писали в переписке
-        if any(t.startswith(TRIAGE_MARK) and HANDOFF_LINE in t for t in texts):
+        if any(t.startswith(TRIAGE_MARK) and any(line in t for line in HANDOFF_LINES)
+               for t in texts):
             continue
         rounds = count_triage_rounds(comments)
         if not rounds:
@@ -4340,12 +4416,37 @@ def work_card_description(card: dict, comments: list, verdict: dict, card_url: s
     return "\n\n".join(parts)
 
 
+def handoff_profile(cfg: dict) -> dict:
+    """
+    Куда разведка ставит разобранную задачу.
+
+    Стёпа ходит в инбокс и, если задача понятна, заводит её там же, где живёт работа
+    команды, — на доске сабтасок, с тегом «это моё». Так у него одно рабочее место,
+    а не собственная вселенная рядом с командной доской.
+
+    Своя доска остаётся запасным вариантом: она нужна тем, у кого режима эпиков нет
+    вовсе, и тому, что кладут на неё руками.
+    """
+    target = ((cfg.get("inbox") or {}).get("target") or "subtasks").strip()
+    flow = epic_flow(cfg)
+    if target == "subtasks" and flow:
+        return subtask_profile(cfg, flow)
+    return board_profiles(cfg)[0]
+
+
 def find_work_card(kaiten: Kaiten, cfg: dict, inbox_card_id: int) -> dict | None:
-    """Уже поставленная задача по этой карточке инбокса: ищем метку в описании."""
-    for candidate in kaiten.cards_on_board(cfg["kaiten"]["board_id"], with_description=True):
-        found = INBOX_ORIGIN_RE.search(strip_html(candidate.get("description")))
-        if found and int(found.group(1)) == inbox_card_id:
-            return candidate
+    """
+    Уже поставленная задача по этой карточке инбокса: ищем метку в описании.
+
+    Смотрим обе доски — и ту, куда ставим сейчас, и свою: задачи, поставленные
+    до переезда на доску команды, никуда не делись, и ставить их второй раз нельзя.
+    """
+    boards = {handoff_profile(cfg)["board_id"], cfg["kaiten"]["board_id"]}
+    for board_id in boards:
+        for candidate in kaiten.cards_on_board(board_id, with_description=True):
+            found = INBOX_ORIGIN_RE.search(strip_html(candidate.get("description")))
+            if found and int(found.group(1)) == inbox_card_id:
+                return candidate
     return None
 
 
@@ -4383,31 +4484,41 @@ def hand_off_to_factory(kaiten: Kaiten, cfg: dict, card: dict, comments: list,
             note = link_as_child(kaiten, card["id"], existing["id"])
             return f"Задача по этой карточке уже стоит: {kaiten.card_url(existing)}{note}"
 
-        board = cfg["kaiten"]
+        profile = handoff_profile(cfg)
         body = {
-            "board_id": board["board_id"],
-            "column_id": board["columns"]["queue"],
+            "board_id": profile["board_id"],
+            "column_id": role_column(profile, "queue"),
             "title": (card.get("title") or "").strip() or f"Задача из инбокса #{card['id']}",
             "description": work_card_description(card, comments, verdict, card_url),
         }
-        if board.get("lane_id"):
-            body["lane_id"] = board["lane_id"]
-        if board.get("card_type_id"):
-            body["type_id"] = board["card_type_id"]
+        if profile.get("lane_id"):
+            body["lane_id"] = profile["lane_id"]
+        if profile.get("card_type_id"):
+            body["type_id"] = profile["card_type_id"]
 
         if dry_run:
-            log("  [dry-run] задачу в «Очередь» не ставлю")
-            return "Поставил бы задачу на «Доску для клода» (dry-run)."
+            log(f"  [dry-run] задачу в «Очередь» доски «{profile['key']}» не ставлю")
+            return f"Поставил бы задачу на доску «{profile['key']}» (dry-run)."
 
         created = kaiten.create_card(body)
         if not created:
             raise FactoryError("Kaiten не вернул созданную карточку")
-        log(f"  задача поставлена: #{created['id']} в «Очередь»")
+        # Тег обязателен: на доске команды без него исполнитель пройдёт мимо задачи,
+        # которую сам же и завёл. Поэтому и не глотаем ошибку молча — без тега
+        # карточка повиснет в чужом бэклоге ничьей.
+        try:
+            kaiten.add_tag(created["id"], bot_tag(cfg))
+        except Exception as e:  # noqa: BLE001 — задача уже поставлена, снимать её поздно
+            log(f"  !! тег на задачу не встал: {e}")
+            kaiten.comment(created["id"],
+                           f"{TRIAGE_MARK} Тег `{bot_tag(cfg)}` поставить не смог — "
+                           f"повесь руками, иначе я эту задачу не увижу.")
+        log(f"  задача поставлена: #{created['id']} в «Очередь» ({profile['key']})")
         note = link_as_child(kaiten, card["id"], created["id"])
         return f"{HANDOFF_LINE} #{created['id']} — {kaiten.card_url(created)}{note}"
     except Exception as e:  # noqa: BLE001 — постановка не важнее уже сделанной разведки
         log(f"  !! не смог поставить задачу: {e}")
-        return f"⚠️ Не смог поставить задачу на «Доску для клода»: {str(e)[:200]}"
+        return f"⚠️ Не смог поставить задачу на доску: {str(e)[:200]}"
 
 
 def report_to_inbox(kaiten: Kaiten, card: dict, pr_url: str) -> None:
@@ -4457,8 +4568,8 @@ def comment_triage(verdict: dict, meta: dict, round_number: int, handoff: str = 
 
     if status == "ready":
         text += f"\n\n{handoff}" if handoff else (
-            "\n\nЕсли согласен — переноси карточку в «Очередь» на «Доске для клода», "
-            "фабрика возьмёт её сама.")
+            "\n\nЕсли согласен — заведи задачу и повесь на неё мой тег, "
+            "я возьму её сам.")
     elif status == "needs_info":
         text += "\n\nОтветь комментарием здесь — я вернусь и пересмотрю."
 
@@ -4719,11 +4830,16 @@ EPIC_PHASE_LABELS = {
 
 
 def epic_flow(cfg: dict) -> dict | None:
-    """Настройки режима эпиков. Нет секции — режима нет, как с инбоксом и долгом."""
+    """
+    Настройки режима эпиков. Нет секции — режима нет, как с инбоксом и долгом.
+
+    Тег подставляем здесь, один раз: он тот же, что и на обычных карточках, — у
+    разработчика не бывает отдельного имени для эпиков.
+    """
     flow = cfg.get("epic_flow") or {}
     if not (flow.get("boards") and flow.get("subtasks", {}).get("board_id")):
         return None
-    return flow
+    return {**flow, "tag": flow.get("tag") or bot_tag(cfg)}
 
 
 def column_order(kaiten: Kaiten, board_id: int) -> list[int]:
@@ -4907,7 +5023,8 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
 
 def subtask_profile(cfg: dict, flow: dict) -> dict:
     subtasks = flow["subtasks"]
-    return make_profile("сабтаски", subtasks, subtasks.get("repo"), attach_to_debt=False)
+    return make_profile("сабтаски", subtasks, subtasks.get("repo"), attach_to_debt=False,
+                        tag=bot_tag(cfg))
 
 
 def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
@@ -4919,7 +5036,7 @@ def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:
     эпик берётся, только пока он в окне «готов к разработке» — «в разработке».
     Дальше его ведёт человек, и трогать там нечего.
     """
-    tag = flow.get("tag") or "claude:epic"
+    tag = flow.get("tag") or BOT_TAG
     found, outside = [], 0
     for board_id in flow["boards"]:
         window = epic_window(kaiten, flow, int(board_id))
@@ -5082,11 +5199,16 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
             log(f"  !! не создалась сабтаска «{item['title'][:40]}»")
             continue
         kaiten.add_child(epic["id"], card["id"])
-        # тег эпика наследуется: иначе эпик помечен «ночью», а код по нему пишется в полдень
+        # Тег «это моё» — на каждую сабтаску: доска сабтасок общая, и без него
+        # исполнитель пройдёт мимо собственной работы. Заодно команде сразу видно,
+        # чьи это карточки в их бэклоге.
+        kaiten.add_tag(card["id"], bot_tag(cfg))
+        # Ночной тег наследуется от эпика: иначе эпик помечен «ночью», а код по нему
+        # пишется в полдень — шумные сабтаски ровно за этим и откладывали
         night_tag, _, _ = night_config(cfg)
         if has_tag(epic, night_tag):
             kaiten.add_tag(card["id"], night_tag)
-            log("    тег ночной задачи унаследован от эпика")
+            log("    ночной тег унаследован от эпика")
         created.append((card, item))
         log(f"  + #{card['id']} «{item['title'][:50]}» ({item.get('kind')})")
 
@@ -5536,7 +5658,7 @@ def drop_work_tag(kaiten: Kaiten, flow: dict, card: dict) -> str:
 
     Ошибку не поднимаем: эпик уже уехал, и не снявшийся тег этого не отменяет.
     """
-    name = flow.get("tag") or "claude:epic"
+    name = flow.get("tag") or BOT_TAG
     found = tag_id(card, name)
     if not found:
         return ""

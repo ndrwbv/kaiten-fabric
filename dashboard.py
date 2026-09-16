@@ -790,6 +790,145 @@ def since(days: int) -> str:
     return datetime.fromtimestamp(edge, timezone.utc).isoformat()
 
 
+def money(value) -> str:
+    return f"${float(value):.0f}" if value else "без потолка"
+
+
+def rules(cfg: dict) -> list[dict]:
+    """
+    Правила, по которым работает разработчик, — собранные из живого конфига.
+
+    Не документация: документация врёт молча. Здесь каждое число и каждый тег взяты
+    из того же `config.json`, по которому фабрика прямо сейчас и работает, так что
+    поменял потолок расхода — поменялась и страница.
+    """
+    name, tag = factory.bot_name(cfg), factory.bot_tag(cfg)
+    night_tag, night_from, night_to = factory.night_config(cfg)
+    flow = factory.epic_flow(cfg)
+    inbox = cfg.get("inbox") or {}
+    agent = cfg.get("agent") or {}
+    reviewer = cfg.get("reviewer") or {}
+    triager = cfg.get("triager") or {}
+    profiles = []
+    try:
+        profiles = factory.board_profiles(cfg)
+    except Exception:  # noqa: BLE001 — правила показываем даже с кривым конфигом
+        pass
+
+    blocks = [{
+        "title": "Кто это",
+        "lines": [
+            f"Зовут **{name}**. Работает как разработчик в команде: берёт задачу, "
+            f"пишет код, открывает черновой PR и отвечает в комментариях карточки.",
+            f"Тег `{tag}` — единственный признак «это моё». Повесил — взял, "
+            f"снял — забрал обратно.",
+            "В Kaiten пишет под общим токеном, поэтому свои реплики помечает значками: "
+            "🤖 исполнитель, 🔍 ревьювер, 🧭 разведка инбокса, 🧩 эпики. "
+            "Комментарий без значка — слова человека.",
+        ],
+    }]
+
+    taking = []
+    for profile in profiles:
+        if profile.get("own_only"):
+            taking.append(f"Доска «{profile['key']}» — общая: берёт только карточки "
+                          f"с тегом `{tag}`, остальное там чужое.")
+        else:
+            taking.append(f"Доска «{profile['key']}» — своя: берёт всё, что лежит "
+                          f"в «Очереди».")
+    taking += [
+        f"За один прогон берёт не больше {cfg.get('max_cards_per_run', 2)} карточек.",
+        "Карточку из «Вопрос от агента» возьмёт, только когда человек ответил "
+        "последним — и пока на ней висит блокер, не возьмёт вовсе.",
+        "Карточку, которую человек увёл в свою колонку, назад не тащит никогда.",
+    ]
+    blocks.append({"title": "Что берёт в работу", "lines": taking})
+
+    if cfg.get("night") is not None:
+        blocks.append({"title": "Ночные задачи", "lines": [
+            f"Тег `{night_tag}` — задача берётся только с {night_from}:00 "
+            f"до {night_to}:00. Для тяжёлого и шумного: долгие тесты, массовые правки.",
+            "Это мягкий стоп: карточка ничем не помечается и просто ждёт своего часа.",
+            f"Сабтаски наследуют `{night_tag}` от эпика — иначе эпик помечен ночью, "
+            f"а код по нему пишется в полдень.",
+        ]})
+
+    if flow:
+        epic_agent = flow.get("agent") or {}
+        wait = flow.get("answer_wait_hours") or 0
+        blocks.append({"title": "Эпики", "lines": [
+            f"Выключателя два, и нужны оба: тег `{flow['tag']}` значит «это моё», "
+            f"колонка разработки — «сейчас мой ход». Эпик правее фабрика не трогает.",
+            "Путь: приёмочные критерии чек-листом → апрув человека → спека файлом "
+            "в репозиторий → ревью спеки → сабтаски.",
+            "Апрув — это снятие блокера руками. Ответа комментарием недостаточно: "
+            "и агент, и человек пишут под одним токеном.",
+            f"Сабтаски создаются на доске «Таски» с тегом `{flow['tag']}`, "
+            f"не больше {flow.get('max_subtasks', 2)} за раз — дальше каждая идёт "
+            f"обычным потоком.",
+            (f"Вопрос ждёт ответа {wait} ч, потом агент решает сам и перечисляет, "
+             f"что додумал." if wait else "Вопрос ждёт ответа сколько угодно."),
+            "За прогон эпик двигается ровно на одну фазу. Закрывая эпик, "
+            f"{name.split()[0]} снимает свой тег — значит, с ним закончил.",
+        ]})
+
+    if inbox.get("board_id"):
+        try:
+            target = factory.handoff_profile(cfg)["key"]
+        except Exception:  # noqa: BLE001
+            target = "рабочую"
+        blocks.append({"title": "Разведка инбокса", "lines": [
+            f"В инбокс заходит всегда — не больше "
+            f"{inbox.get('max_cards_per_run', 3)} новых карточек за прогон — и пишет "
+            f"в каждой, о чём задача, где это в коде и хватает ли данных.",
+            (f"Хватает — берёт задачу себе: заводит её в «Очереди» доски «{target}» "
+             f"с тегом `{tag}` и связывает с карточкой инбокса."
+             if inbox.get("create_cards", True)
+             else "Задачи на доску сам не ставит — только отвечает в карточке."),
+            "Не хватает — задаёт вопросы в карточке и ждёт; на одну карточку "
+            f"не больше {inbox.get('max_rounds', 2)} заходов, чтобы не ходить по кругу.",
+            "Сами карточки инбокса не двигает и не правит: там живые коллеги, "
+            "и это их доска.",
+        ]})
+
+    blocks.append({"title": "Ревью и мерж", "lines": [
+        f"Каждый PR сначала смотрит ревьювер-агент — до "
+        f"{reviewer.get('max_rounds', 3)} кругов правок."
+        + (" Замечания уходят прямо в PR." if reviewer.get("post_to_pr") else ""),
+        "После ревью PR ждёт человека. PR всегда черновой."
+        if (cfg.get("pr") or {}).get("draft") else "После ревью PR ждёт человека.",
+        "Смерженного PR мало: карточку закрывает и правка, уехавшая в main чужим "
+        "PR — например, в сборном релизе.",
+    ]})
+
+    blocks.append({"title": "Чей сейчас ход", "lines": [
+        "На своей доске это видно по колонке. На общей доске колонок меньше, "
+        "и «дальше человек» выражается блокером с 🤖 в причине.",
+        "Свой блокер фабрика не снимает — это делает человек, и снятие и есть «продолжай».",
+    ]})
+
+    blocks.append({"title": "Сколько ему позволено", "lines": [
+        f"Потолок на одного агента: работа {money(agent.get('max_budget_usd'))}, "
+        f"ревью {money(reviewer.get('max_budget_usd'))}, "
+        f"разведка {money(triager.get('max_budget_usd'))}"
+        + (f", эпики {money((flow.get('agent') or {}).get('max_budget_usd'))}" if flow else "")
+        + f". На весь прогон — {money(cfg.get('max_spend_per_run'))}.",
+        f"Упёрся в потолок на полушаге — коммитит сделанное и продолжает следующим "
+        f"прогоном. Второй раз подряд — отдаёт человеку: дальше сам не вытянет.",
+        f"Модель {agent.get('model', '—')}, усилие {agent.get('effort', '—')}. "
+        f"Правки в репозитории делает только внутри своего git-worktree.",
+    ]})
+
+    blocks.append({"title": "Как его остановить", "lines": [
+        "Фраза в карточке — и к ней не подойдёт ни один агент: "
+        + ", ".join(f"«{phrase}»" for phrase in
+                    (cfg.get("stop_phrases") or factory.STOP_PHRASES)[:4]) + ".",
+        f"Снять тег `{tag}` — заберёшь карточку обратно себе.",
+        "Кнопка «Стоп» в шапке гасит текущий прогон целиком — и обёртку, и агента.",
+    ]})
+    return blocks
+
+
 def run_lock() -> dict:
     """Кто держит замок прогона. Тот же замок, что ставит и снимает `run.sh`."""
     if not LOCK.is_dir():
@@ -940,6 +1079,9 @@ def overview(cfg: dict, outside: Outside, days: int, force: bool = False) -> dic
             "cards": len({run["card_id"] for run in epic_runs}),
         },
         "top_cost": sorted(window_cards, key=lambda c: c["cost"], reverse=True)[:5],
+        "rules": rules(cfg),
+        "bot": {"name": factory.bot_name(cfg), "tag": factory.bot_tag(cfg),
+                "night_tag": factory.night_config(cfg)[0]},
         "labels": {"kind": KIND_LABELS, "status": STATUS_LABELS,
                    "group": GROUP_LABELS, "outcome": OUTCOMES, "round": ROUND_LABELS},
         "caps": {
