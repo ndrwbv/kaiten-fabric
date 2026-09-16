@@ -970,6 +970,23 @@ class Time:
         self._request("PUT", f"{self.api}/posts/{post_id}/patch", {"message": text},
                       config=self._auth())
 
+    def react(self, post_id: str, user_id: str, emoji: str = "eyes") -> None:
+        """
+        Поставить эмодзи на чужое сообщение.
+
+        Нужно, потому что ответ на вопрос из треда приходит кругом позже: карточка
+        уезжает в «Правки», агент идёт смотреть код, человек всё это время не знает,
+        услышали его или нет. Глазок закрывает эту паузу сразу.
+
+        Повторную реакцию Mattermost не считает ошибкой — она и так уже стоит.
+        """
+        if self.dry_run:
+            log(f"  [dry-run] Time -> :{emoji}: на {post_id}")
+            return
+        self._request("POST", f"{self.api}/reactions",
+                      {"user_id": user_id, "post_id": post_id, "emoji_name": emoji},
+                      config=self._auth())
+
     def thread(self, root_id: str) -> list:
         """Сообщения треда по времени. Ответ Mattermost — словарь постов плюс порядок."""
         data = self._request("GET", f"{self.api}/posts/{root_id}/thread",
@@ -1549,6 +1566,15 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             save_time_state(state)
             continue
         only_asked = all(kind == "question" for _, _, kind in work)
+
+        # Глазок на сообщении — самое быстрое «взял». Ставим до всей остальной
+        # работы: и Kaiten, и ответ в тред ещё могут не получиться, а человеку уже
+        # видно, что его вопрос не потерялся. Не вышло — это не повод не работать.
+        for post, _, _ in work:
+            try:
+                client.react(post.get("id", ""), bot_id)
+            except FactoryError as e:
+                log(f"  !! глазок в треде по #{card_key} не поставился: {e}")
 
         for post, text, kind in work:
             user = names.get(post.get("user_id"), {})

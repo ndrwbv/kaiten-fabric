@@ -172,6 +172,11 @@ acked = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")
 check("в тред подтвердили", "взял в правки" in acked["message"].lower(), acked["message"])
 check("дочитано до последнего", json.loads(state_file.read_text())
       ["threads"]["555"]["last_post_id"] == "reply")
+eyed = [g for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")]
+check("на сообщение поставлен глазок", len(eyed) == 1, str(eyed))
+check("глазок — на том самом сообщении, от имени бота",
+      json.loads(eyed[-1][2]) == {"user_id": BOT_ID, "post_id": "reply",
+                                  "emoji_name": "eyes"}, eyed[-1][2])
 
 print("=== 6. второй прогон — то же сообщение второй раз не переносится ===")
 kaiten2 = FakeKaiten()
