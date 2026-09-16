@@ -49,6 +49,10 @@ class Fake(BaseHTTPRequestHandler):
             }})
         return self._reply({})
 
+    def do_DELETE(self):
+        GOT.append(("DELETE", self.path, None, self.headers.get("Authorization")))
+        return self._reply({"status": "OK"})
+
     def do_PUT(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         GOT.append(("PUT", self.path, raw, self.headers.get("Authorization")))
@@ -147,7 +151,8 @@ f.notify_pr(cfg, "kiosk", card, "https://kaiten/card/555",
             {"summary": "Поправил шапку."}, False, updated=True, env=env)
 body = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")][-1][2])
 check("ушло в тред", body.get("root_id") == "new-post", str(body))
-check("сказано, что поправил", "Поправил" in body["message"])
+check("сказано, что поправил", body["message"].startswith("Чекай, поправил:"),
+      body["message"])
 
 print("=== 5. ответ человека в треде → комментарий в карточку и «Правки» ===")
 class Args: dry_run = False; prompt_only = True
@@ -157,6 +162,7 @@ profiles = [f.make_profile("работа", {"board_id": 1000, "columns": {
     "agent_review": 105, "fixes": 106, "review": 107, "done": 108}})]
 f.load_env = lambda: env
 f.blocked_by = lambda k, c: None
+GOT.clear()
 f.follow_time_threads(kaiten, cfg, Args(), profiles)
 check("комментарий записан", len(kaiten.comments_written) == 1, str(kaiten.comments_written))
 text = kaiten.comments_written[0][1]
@@ -168,8 +174,6 @@ check("обращение к боту в карточку не тащим", "@fa
 check("карточка уехала в «Правки»", kaiten.moves == [(555, 106)], str(kaiten.moves))
 check("системное сообщение не перенесено", "system_join" not in text)
 check("своё сообщение не перенесено", "PR: ..." not in text)
-acked = json.loads([g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")][-1][2])
-check("в тред подтвердили", "взял в правки" in acked["message"].lower(), acked["message"])
 check("дочитано до последнего", json.loads(state_file.read_text())
       ["threads"]["555"]["last_post_id"] == "reply")
 eyed = [g for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")]
@@ -177,6 +181,10 @@ check("на сообщение поставлен глазок", len(eyed) == 1,
 check("глазок — на том самом сообщении, от имени бота",
       json.loads(eyed[-1][2]) == {"user_id": BOT_ID, "post_id": "reply",
                                   "emoji_name": "eyes"}, eyed[-1][2])
+check("и ни слова в тред: глазок — весь ответ",
+      [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
+check("глазок записан в состояние — его потом снимать",
+      json.loads(state_file.read_text())["threads"]["555"]["eyed"] == ["reply"])
 
 print("=== 6. второй прогон — то же сообщение второй раз не переносится ===")
 kaiten2 = FakeKaiten()
@@ -252,8 +260,11 @@ check("тред больше не отслеживаем",
       "555" not in json.loads(f.TIME_STATE_FILE.read_text())["threads"])
 
 print("=== 12. вопросы агента уезжают в тред ===")
+# глазок на сообщении, с которого начался круг: круг кончится вопросами, и снять
+# его придётся — ход опять человека
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+    "eyed": ["reply"],
     "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
 GOT.clear()
 asking = FakeKaiten()
@@ -264,6 +275,9 @@ posted = [json.loads(g[2])["message"] for g in GOT
 in_thread = [m for m in posted if m.startswith("Есть следующие вопросы:")]
 check("вопросы написаны в тред", len(in_thread) == 1, str(posted))
 check("оба вопроса, списком", in_thread[0].count("\n- ") == 2, in_thread[0])
+check("круг кончился вопросами — глазок снят",
+      [g for g in GOT if g[0] == "DELETE"] != [] and
+      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["eyed"] == [], str(GOT))
 check("в треде без эмодзи", not any(m in in_thread[0] for m in ("❓", "⚠️", "🛑", "💬")),
       in_thread[0])
 check("один вопрос — одной строкой",
@@ -419,12 +433,10 @@ check("вопрос перенесён в карточку", len(asked.comments_
 check("и помечен вопросом, а не постановкой", "Вопрос из треда" in text, text)
 check("агенту сказано отвечать словами", "ответь на него своими словами" in text, text)
 check("карточку всё же взяли в работу", asked.moves == [(555, 106)], str(asked.moves))
-replies = [json.loads(g[2])["message"] for g in GOT
-           if g[0] == "POST" and g[1].endswith("/posts")]
-check("в треде обещали ответить, а не поправить",
-      any("схожу посмотрю и отвечу" in r for r in replies), str(replies))
-check("и не сказали «взял в правки»",
-      not any("взял в правки" in r for r in replies), str(replies))
+check("в треде не обещали, а повесили глазок",
+      [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == []
+      and [g for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")] != [],
+      str(GOT))
 check("в состоянии помечено, что круг отвечает на вопрос",
       json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["answering"] is True)
 
@@ -442,6 +454,11 @@ check("это ответ, без слова «поправил»",
 saved = json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]
 check("пометка снята", saved["answering"] is False, str(saved))
 check("а круг правки записан", saved["fixed"] is True, str(saved))
+dropped = [g for g in GOT if g[0] == "DELETE"]
+check("глазок снят — дальше говорит сам ответ", len(dropped) == 1, str(dropped))
+check("снят свой и с того самого сообщения",
+      dropped[0][1].endswith(f"/users/{BOT_ID}/posts/reply/reactions/eyes"), dropped[0][1])
+check("и в состоянии его больше нет", saved["eyed"] == [], str(saved))
 
 print("=== 21. вторая пачка вопросов — это круг после правки ===")
 check("в первый раз — просто вопросы",
@@ -478,6 +495,8 @@ said = [json.loads(g[2])["message"] for g in GOT
         if g[0] == "POST" and g[1].endswith("/posts")]
 check("и в треде сказали почему",
       any("не в моих колонках" in m for m in said), str(said))
+check("глазок не вешали: он значил бы «делаю»",
+      [g for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")] == [], str(GOT))
 
 print("=== 23. «проверок не запускал» вопросом не считается ===")
 report = ("🤖 **Готово, нужен ревью.**\n\nPR: https://pr/1\n\n"

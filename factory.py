@@ -909,10 +909,18 @@ class Time:
         self.token = token
         self.webhook_url = webhook_url
         self.dry_run = dry_run
+        self._my_id: str | None = None
 
     @property
     def can_read(self) -> bool:
         return bool(self.token)
+
+    @property
+    def my_id(self) -> str:
+        """Свой id — он нужен реакциям. Спрашиваем один раз на клиента."""
+        if self._my_id is None:
+            self._my_id = (self.me() or {}).get("id") or ""
+        return self._my_id
 
     def _request(self, method: str, url: str, body=None, config: str = ""):
         """
@@ -974,9 +982,9 @@ class Time:
         """
         Поставить эмодзи на чужое сообщение.
 
-        Нужно, потому что ответ на вопрос из треда приходит кругом позже: карточка
-        уезжает в «Правки», агент идёт смотреть код, человек всё это время не знает,
-        услышали его или нет. Глазок закрывает эту паузу сразу.
+        Нужно, потому что работа по сообщению из треда занимает круг: карточка уезжает
+        в «Правки», агент идёт смотреть код, человек всё это время не знает, услышали
+        его или нет. Глазок закрывает эту паузу сразу и ничего не обещает сверх «взял».
 
         Повторную реакцию Mattermost не считает ошибкой — она и так уже стоит.
         """
@@ -985,6 +993,15 @@ class Time:
             return
         self._request("POST", f"{self.api}/reactions",
                       {"user_id": user_id, "post_id": post_id, "emoji_name": emoji},
+                      config=self._auth())
+
+    def unreact(self, post_id: str, user_id: str, emoji: str = "eyes") -> None:
+        """Снять своё эмодзи. Глазок живёт ровно пока идёт работа, а не вечно."""
+        if self.dry_run:
+            log(f"  [dry-run] Time -> снять :{emoji}: с {post_id}")
+            return
+        self._request("DELETE",
+                      f"{self.api}/users/{user_id}/posts/{post_id}/reactions/{emoji}",
                       config=self._auth())
 
     def thread(self, root_id: str) -> list:
@@ -999,7 +1016,9 @@ class Time:
                              config=self._auth()) or {}
 
     def me(self) -> dict:
-        return self._request("GET", f"{self.api}/users/me", config=self._auth()) or {}
+        data = self._request("GET", f"{self.api}/users/me", config=self._auth()) or {}
+        self._my_id = data.get("id") or ""
+        return data
 
     def my_channels(self) -> list[dict]:
         """
@@ -1236,6 +1255,30 @@ def time_pr_message(card_url: str, pr_url: str, summary: str) -> str:
     return f"{head}\n[Карточка]({card_url})"
 
 
+def drop_eyes(client: Time, info: dict) -> None:
+    """
+    Снять глазки с сообщений, по которым фабрика работала.
+
+    Глазок значит «взял и делаю»; круг кончился — дальше за фабрику говорит сам
+    отчёт, и висеть глазку незачем. Не снялся — работа от этого не отменяется,
+    поэтому только в лог.
+    """
+    eyed = info.get("eyed") or []
+    if not eyed:
+        return
+    try:
+        who = client.my_id
+    except FactoryError as e:
+        log(f"  !! не узнал себя — глазки не снял: {e}")
+        return
+    for post_id in eyed:
+        try:
+            client.unreact(post_id, who)
+        except FactoryError as e:
+            log(f"  !! глазок с {post_id} не снялся: {e}")
+    info["eyed"] = []
+
+
 def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
               pr_url: str, verdict: dict, dry_run: bool,
               updated: bool = False, env: dict | None = None) -> None:
@@ -1266,8 +1309,11 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
                 # о правке. «Поправил: смотрел на iPad» было бы ответом не на то.
                 text = summary or "Посмотрел, ответ — в карточке."
             else:
-                text = f"Поправил: {summary or 'без описания'}"
+                text = f"Чекай, поправил: {summary or 'без описания'}"
             client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
+            # Отчёт ушёл — значит глазкам конец: они висели вместо слов, пока шла
+            # работа, а теперь за неё говорит сам отчёт
+            drop_eyes(client, known)
             # Круг закончился — вопрос отвечен, а следующая пачка вопросов по этому
             # треду будет уже «после правки», и сказать об этом придётся вслух.
             known["answering"] = False
@@ -1461,6 +1507,9 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             if text and info.get("asked") != asked:
                 try:
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
+                    # Круг кончился вопросами — ход опять человека, и глазок на его
+                    # сообщении врал бы, что фабрика всё ещё что-то делает
+                    drop_eyes(client, info)
                     info["asked"] = asked
                     save_time_state(state)
                     log(f"  #{card_key}: вопросы в тред ({len(asks)})")
@@ -1567,14 +1616,39 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             continue
         only_asked = all(kind == "question" for _, _, kind in work)
 
-        # Глазок на сообщении — самое быстрое «взял». Ставим до всей остальной
-        # работы: и Kaiten, и ответ в тред ещё могут не получиться, а человеку уже
-        # видно, что его вопрос не потерялся. Не вышло — это не повод не работать.
-        for post, _, _ in work:
-            try:
-                client.react(post.get("id", ""), bot_id)
-            except FactoryError as e:
-                log(f"  !! глазок в треде по #{card_key} не поставился: {e}")
+        moved += 1
+        stuck = blocked_by(kaiten, card["id"])
+        target = role_column(profile, "fixes") if profile else None
+        # карточку в «Вопросе» двигать не надо: она и так ждёт ответа человека, и
+        # перенесённый комментарий делает её пригодной к работе следующим же прогоном
+        stay = ([role_column(profile, role) for role in ACTIVE_ROLES]
+                + [role_column(profile, "question")]) if profile else []
+        # блокер и «увели из потока» — единственные два случая, когда сообщение
+        # из треда в работу не уходит
+        astray = outside_flow(profile, card)
+
+        # По итогам круга отчитаться надо ответом, а не словом «поправил». Ставим
+        # до развилки: круг случится и у заблокированной карточки — когда человек
+        # снимет блокер, — и у той, что уже стоит в рабочей колонке.
+        info["answering"] = only_asked
+
+        # Взял в работу — говорит глазок, а не сообщение. «Записал в карточку, дальше
+        # по обычному кругу» человеку не даёт ничего: он и так написал, чтобы это
+        # сделали, — зато засоряет тред, в котором дальше пойдёт разговор по делу.
+        # Ставим до Kaiten: и комментарий, и перенос ещё могут не получиться, а знать,
+        # что его услышали, человеку надо в любом случае. Снимется глазок тогда же,
+        # когда придёт настоящий ответ, — кругом позже.
+        if not stuck and not astray and time_wants(conf, "fix_taken"):
+            eyed = info.setdefault("eyed", [])
+            for post, _, _ in work:
+                post_id = post.get("id") or ""
+                try:
+                    client.react(post_id, bot_id)
+                except FactoryError as e:
+                    log(f"  !! глазок в треде по #{card_key} не встал: {e}")
+                    continue
+                if post_id not in eyed:
+                    eyed.append(post_id)
 
         for post, text, kind in work:
             user = names.get(post.get("user_id"), {})
@@ -1586,41 +1660,27 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             f"{'сообщение' if len(work) == 1 else 'сообщений'}"
             + (" (это вопрос)" if only_asked else ""))
 
-        moved += 1
-        stuck = blocked_by(kaiten, card["id"])
-        target = role_column(profile, "fixes") if profile else None
-        # карточку в «Вопросе» двигать не надо: она и так ждёт ответа человека, и
-        # перенесённый комментарий делает её пригодной к работе следующим же прогоном
-        stay = ([role_column(profile, role) for role in ACTIVE_ROLES]
-                + [role_column(profile, "question")]) if profile else []
-
-        # По итогам круга отчитаться надо ответом, а не словом «поправил». Ставим
-        # до развилки: круг случится и у заблокированной карточки — когда человек
-        # снимет блокер, — и у той, что уже стоит в рабочей колонке.
-        info["answering"] = only_asked
-
+        # Словами в тред уходит только отказ: глазок значил бы «делаю», а фабрика
+        # как раз не делает, и молчание тут человек прочитал бы как «делает».
         if stuck:
             # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
             log(f"  #{card_key} заблокирована ({stuck}) — комментарий записал, "
                 f"карточку не двигаю")
             reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
                      "его снимает человек.")
-        elif outside_flow(profile, card):
+        elif astray:
             # карточку увели в «Тестинг» или «Ролаут» — тащить её оттуда назад
             # в работу нельзя, даже если в треде попросили правку
             log(f"  #{card_key} стоит вне колонок фабрики — комментарий записал, "
                 f"карточку не двигаю")
             reply = ("Записал в карточку. Двигать не стал: она уже не в моих "
                      "колонках — верни её в работу, если правку надо сделать.")
-        elif not target or card.get("column_id") in stay:
-            reply = ("Вопрос записал, отвечу на следующем круге." if only_asked
-                     else "Записал в карточку, дальше по обычному кругу.")
         else:
-            kaiten.move(card["id"], target)
-            reply = ("Понял вопрос, схожу посмотрю и отвечу." if only_asked
-                     else "Записал в карточку и взял в правки.")
+            reply = ""
+            if target and card.get("column_id") not in stay:
+                kaiten.move(card["id"], target)
 
-        if time_wants(conf, "fix_taken"):
+        if reply and time_wants(conf, "fix_taken"):
             try:
                 client.post(info.get("channel_id", ""), reply, root_id=root_id)
             except FactoryError as e:
