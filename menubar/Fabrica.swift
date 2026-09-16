@@ -138,19 +138,11 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         return json
     }
 
-    /// Адрес витрины она сама и кладёт в настройки при запуске. Не запускалась
-    /// ни разу — показываем адрес по умолчанию: пункт меню её же и поднимет.
-    private var dashboardURL: String {
-        let stored = (readSettings()["dashboard"] as? [String: Any])?["url"] as? String
-        return stored ?? "http://127.0.0.1:8777/"
-    }
-
-    /// То же, но коротко — как это пишут в адресной строке.
-    private var dashboardHost: String {
-        dashboardURL
-            .replacingOccurrences(of: "http://", with: "")
-            .replacingOccurrences(of: "https://", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    /// Порт дашборда он сам и кладёт в настройки при старте. Нужен, чтобы не поднять
+    /// второй экземпляр рядом с уже работающим на своём порту.
+    private var dashboardPort: Int {
+        let stored = (readSettings()["dashboard"] as? [String: Any])?["port"] as? NSNumber
+        return stored?.intValue ?? 8777
     }
 
     /// Расписание приложение только читает. Пишет файл витрина — один писатель
@@ -678,11 +670,11 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Витрина — второе окно в фабрику и единственное место, где меняются
-        // настройки. Стоит рядом с кнопками и показывает адрес: пункт «Открыть
-        // витрину…» в хвосте меню человек глазами просто не находил.
+        // Дашборд — второе окно в фабрику и единственное место, где меняются
+        // настройки. Стоит рядом с кнопками: в хвосте меню, между логом
+        // и авторизацией, его глазами не находили.
         do {
-            let item = action("Витрина: \(dashboardHost)", #selector(openDashboard))
+            let item = action("Открыть дашборд", #selector(openDashboard))
             item.toolTip = "Статистика, правила и все настройки. Откроется в браузере"
             menu.addItem(item)
         }
@@ -896,7 +888,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     /// процесса. Повторный запуск безвреден: витрина увидит занятый порт, поймёт,
     /// что это она же, и просто откроет вкладку.
     @objc private func openDashboard() {
-        let command = "cd \(shellQuote(root.path)) && python3 dashboard.py"
+        let command = "cd \(shellQuote(root.path)) && python3 dashboard.py --port \(dashboardPort)"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-ilc", command]
