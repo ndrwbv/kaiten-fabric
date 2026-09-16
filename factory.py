@@ -1255,28 +1255,65 @@ def time_pr_message(card_url: str, pr_url: str, summary: str) -> str:
     return f"{head}\n[Карточка]({card_url})"
 
 
-def drop_eyes(client: Time, info: dict) -> None:
-    """
-    Снять глазки с сообщений, по которым фабрика работала.
+# Чем фабрика отвечает на сообщение в треде вместо слов: глазок — «взял и делаю»,
+# крест — «не могу, меня блочит». Крест без слов был бы загадкой, поэтому рядом
+# с ним всё-таки уходит причина; глазку слова не нужны.
+EYES = "eyes"
+CROSS = "x"
 
-    Глазок значит «взял и делаю»; круг кончился — дальше за фабрику говорит сам
-    отчёт, и висеть глазку незачем. Не снялся — работа от этого не отменяется,
+
+def thread_marks(info: dict) -> dict:
+    """Что фабрика наставила в треде: id сообщения -> эмодзи."""
+    marks = info.get("reacted")
+    if marks is None:
+        # состояние, записанное до появления креста: там лежал список одних глазков
+        return {post_id: EYES for post_id in (info.get("eyed") or [])}
+    return dict(marks)
+
+
+def mark_thread(client: Time, info: dict, user_id: str,
+                post_ids: list[str], emoji: str) -> None:
+    """
+    Поставить реакцию на сообщения, по которым фабрика ответила делом.
+
+    Что и куда поставили — помним в состоянии: снимать это потом, а искать свои
+    реакции по чужому треду дороже, чем записать пару id.
+    """
+    marks = thread_marks(info)
+    for post_id in post_ids:
+        try:
+            client.react(post_id, user_id, emoji)
+        except FactoryError as e:
+            log(f"  !! реакция :{emoji}: на {post_id} не встала: {e}")
+            continue
+        marks[post_id] = emoji
+    info["reacted"] = marks
+    info.pop("eyed", None)
+
+
+def drop_marks(client: Time, info: dict) -> None:
+    """
+    Снять реакции с сообщений, по которым фабрика работала.
+
+    Они значат «сейчас мой ход»; круг кончился — дальше за фабрику говорят её же
+    слова, и висеть им незачем. Не снялось — работа от этого не отменяется,
     поэтому только в лог.
     """
-    eyed = info.get("eyed") or []
-    if not eyed:
+    marks = thread_marks(info)
+    if not marks:
         return
     try:
         who = client.my_id
     except FactoryError as e:
-        log(f"  !! не узнал себя — глазки не снял: {e}")
+        log(f"  !! не узнал себя — реакции не снял: {e}")
         return
-    for post_id in eyed:
+    for post_id, emoji in marks.items():
         try:
-            client.unreact(post_id, who)
+            client.unreact(post_id, who, emoji)
         except FactoryError as e:
-            log(f"  !! глазок с {post_id} не снялся: {e}")
-    info["eyed"] = []
+            log(f"  !! реакция :{emoji}: с {post_id} не снялась: {e}")
+    info["reacted"] = {}
+    info.pop("eyed", None)
 
 
 def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
@@ -1311,9 +1348,9 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             else:
                 text = f"Чекай, поправил: {summary or 'без описания'}"
             client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
-            # Отчёт ушёл — значит глазкам конец: они висели вместо слов, пока шла
+            # Отчёт ушёл — значит реакциям конец: они висели вместо слов, пока шла
             # работа, а теперь за неё говорит сам отчёт
-            drop_eyes(client, known)
+            drop_marks(client, known)
             # Круг закончился — вопрос отвечен, а следующая пачка вопросов по этому
             # треду будет уже «после правки», и сказать об этом придётся вслух.
             known["answering"] = False
@@ -1509,7 +1546,7 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
                     # Круг кончился вопросами — ход опять человека, и глазок на его
                     # сообщении врал бы, что фабрика всё ещё что-то делает
-                    drop_eyes(client, info)
+                    drop_marks(client, info)
                     info["asked"] = asked
                     save_time_state(state)
                     log(f"  #{card_key}: вопросы в тред ({len(asks)})")
@@ -1632,24 +1669,36 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         # снимет блокер, — и у той, что уже стоит в рабочей колонке.
         info["answering"] = only_asked
 
-        # Взял в работу — говорит глазок, а не сообщение. «Записал в карточку, дальше
-        # по обычному кругу» человеку не даёт ничего: он и так написал, чтобы это
-        # сделали, — зато засоряет тред, в котором дальше пойдёт разговор по делу.
-        # Ставим до Kaiten: и комментарий, и перенос ещё могут не получиться, а знать,
-        # что его услышали, человеку надо в любом случае. Снимется глазок тогда же,
-        # когда придёт настоящий ответ, — кругом позже.
-        if not stuck and not astray and time_wants(conf, "fix_taken"):
-            eyed = info.setdefault("eyed", [])
-            for post, _, _ in work:
-                post_id = post.get("id") or ""
-                try:
-                    client.react(post_id, bot_id)
-                except FactoryError as e:
-                    log(f"  !! глазок в треде по #{card_key} не встал: {e}")
-                    continue
-                if post_id not in eyed:
-                    eyed.append(post_id)
+        # Чем отвечаем на сообщение. Глазок — «взял и делаю»: словами тут говорить
+        # нечего, человек и так написал, чтобы это сделали, а тред, в котором дальше
+        # пойдёт разговор по делу, от «записал в карточку» зарастает вдвое быстрее.
+        # Крест — «не могу»: молчание с ним человек прочитал бы как «делает», поэтому
+        # рядом уходит и причина.
+        if stuck:
+            # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
+            log(f"  #{card_key} заблокирована ({stuck}) — карточку не двигаю")
+            mark = CROSS
+            reply = ("Меня блочит блокер на карточке — сними, и поеду."
+                     if stuck == NO_REASON else f"Меня блочит: {stuck}")
+        elif astray:
+            # карточку увели в «Тестинг» или «Ролаут» — тащить её оттуда назад
+            # в работу нельзя, даже если в треде попросили правку
+            log(f"  #{card_key} стоит вне колонок фабрики — карточку не двигаю")
+            mark = CROSS
+            reply = ("Не поеду: карточка уже не в моих колонках — верни её в работу, "
+                     "если правку надо сделать.")
+        else:
+            mark, reply = EYES, ""
 
+        # Ставим до Kaiten: и комментарий, и перенос ещё могут не получиться, а знать,
+        # чем кончилось его сообщение, человеку надо в любом случае. Снимется реакция
+        # тогда же, когда придёт настоящий ответ, — кругом позже.
+        if time_wants(conf, "fix_taken"):
+            mark_thread(client, info, bot_id,
+                        [post.get("id") or "" for post, _, _ in work], mark)
+
+        # Комментарий пишем и в отказ: сообщение не должно потеряться из-за того,
+        # что кто-то повесил блокер, — человек снимет его, и правка поедет сама
         for post, text, kind in work:
             user = names.get(post.get("user_id"), {})
             author = (user.get("nickname") or user.get("username")
@@ -1660,25 +1709,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             f"{'сообщение' if len(work) == 1 else 'сообщений'}"
             + (" (это вопрос)" if only_asked else ""))
 
-        # Словами в тред уходит только отказ: глазок значил бы «делаю», а фабрика
-        # как раз не делает, и молчание тут человек прочитал бы как «делает».
-        if stuck:
-            # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
-            log(f"  #{card_key} заблокирована ({stuck}) — комментарий записал, "
-                f"карточку не двигаю")
-            reply = ("Записал в карточку. Двинуть не могу: на карточке блокер — "
-                     "его снимает человек.")
-        elif astray:
-            # карточку увели в «Тестинг» или «Ролаут» — тащить её оттуда назад
-            # в работу нельзя, даже если в треде попросили правку
-            log(f"  #{card_key} стоит вне колонок фабрики — комментарий записал, "
-                f"карточку не двигаю")
-            reply = ("Записал в карточку. Двигать не стал: она уже не в моих "
-                     "колонках — верни её в работу, если правку надо сделать.")
-        else:
-            reply = ""
-            if target and card.get("column_id") not in stay:
-                kaiten.move(card["id"], target)
+        if mark == EYES and target and card.get("column_id") not in stay:
+            kaiten.move(card["id"], target)
 
         if reply and time_wants(conf, "fix_taken"):
             try:
@@ -1788,10 +1820,14 @@ def ours(blocker: dict) -> bool:
     return str(blocker.get("reason") or "").startswith(BLOCK_MARK)
 
 
+# Блокер без текста: причину человек не написал, а сказать что-то надо
+NO_REASON = "заблокирована"
+
+
 def blocked_by(kaiten: Kaiten, card_id: int) -> str | None:
     """Причина, по которой карточку сейчас трогать нельзя. None — путь свободен."""
     for blocker in kaiten.blockers(card_id):
-        return str(blocker.get("reason") or "заблокирована")
+        return str(blocker.get("reason") or NO_REASON)
     return None
 
 

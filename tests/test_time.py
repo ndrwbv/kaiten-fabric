@@ -184,7 +184,7 @@ check("глазок — на том самом сообщении, от имен
 check("и ни слова в тред: глазок — весь ответ",
       [g for g in GOT if g[0] == "POST" and g[1].endswith("/posts")] == [], str(GOT))
 check("глазок записан в состояние — его потом снимать",
-      json.loads(state_file.read_text())["threads"]["555"]["eyed"] == ["reply"])
+      json.loads(state_file.read_text())["threads"]["555"]["reacted"] == {"reply": "eyes"})
 
 print("=== 6. второй прогон — то же сообщение второй раз не переносится ===")
 kaiten2 = FakeKaiten()
@@ -261,7 +261,8 @@ check("тред больше не отслеживаем",
 
 print("=== 12. вопросы агента уезжают в тред ===")
 # глазок на сообщении, с которого начался круг: круг кончится вопросами, и снять
-# его придётся — ход опять человека
+# его придётся — ход опять человека. Заодно тут старая форма записи (список вместо
+# «id -> эмодзи»): состояние на машине переживает обновление фабрики
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
     "eyed": ["reply"],
@@ -277,7 +278,8 @@ check("вопросы написаны в тред", len(in_thread) == 1, str(po
 check("оба вопроса, списком", in_thread[0].count("\n- ") == 2, in_thread[0])
 check("круг кончился вопросами — глазок снят",
       [g for g in GOT if g[0] == "DELETE"] != [] and
-      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["eyed"] == [], str(GOT))
+      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["reacted"] == {},
+      str(GOT))
 check("в треде без эмодзи", not any(m in in_thread[0] for m in ("❓", "⚠️", "🛑", "💬")),
       in_thread[0])
 check("один вопрос — одной строкой",
@@ -458,7 +460,7 @@ dropped = [g for g in GOT if g[0] == "DELETE"]
 check("глазок снят — дальше говорит сам ответ", len(dropped) == 1, str(dropped))
 check("снят свой и с того самого сообщения",
       dropped[0][1].endswith(f"/users/{BOT_ID}/posts/reply/reactions/eyes"), dropped[0][1])
-check("и в состоянии его больше нет", saved["eyed"] == [], str(saved))
+check("и в состоянии его больше нет", saved["reacted"] == {}, str(saved))
 
 print("=== 21. вторая пачка вопросов — это круг после правки ===")
 check("в первый раз — просто вопросы",
@@ -495,8 +497,9 @@ said = [json.loads(g[2])["message"] for g in GOT
         if g[0] == "POST" and g[1].endswith("/posts")]
 check("и в треде сказали почему",
       any("не в моих колонках" in m for m in said), str(said))
-check("глазок не вешали: он значил бы «делаю»",
-      [g for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")] == [], str(GOT))
+check("значок — крест, а не глазок: глазок значил бы «делаю»",
+      [json.loads(g[2])["emoji_name"] for g in GOT
+       if g[0] == "POST" and g[1].endswith("/reactions")] == ["x"], str(GOT))
 
 print("=== 23. «проверок не запускал» вопросом не считается ===")
 report = ("🤖 **Готово, нужен ревью.**\n\nPR: https://pr/1\n\n"
@@ -507,6 +510,42 @@ report = ("🤖 **Готово, нужен ревью.**\n\nPR: https://pr/1\n\n
 check("в тред уезжает только настоящий вопрос",
       f.open_questions([{"text": report}]) == ["На каком киоске видели съехавшую плашку?"],
       str(f.open_questions([{"text": report}])))
+
+print("=== 24. блокер — крест и «меня блочит», а не глазок ===")
+QUESTION[0] = "@fabrica поправь ещё заголовок, он тоже в нижнем регистре"
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+f.blocked_by = lambda k, c: "ждём макет от дизайна"
+blocked = FakeKaiten()
+f.follow_time_threads(blocked, cfg, Args(), profiles)
+check("сообщение всё равно записано в карточку", len(blocked.comments_written) == 1,
+      str(blocked.comments_written))
+check("но карточку не двигали", blocked.moves == [], str(blocked.moves))
+marks = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")]
+check("на сообщении крест", marks == [{"user_id": BOT_ID, "post_id": "reply",
+                                       "emoji_name": "x"}], str(marks))
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("и сказано, что именно блочит", said == ["Меня блочит: ждём макет от дизайна"],
+      str(said))
+check("крест запомнен — снимется, когда блокер уберут и правка поедет",
+      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["reacted"]
+      == {"reply": "x"}, f.TIME_STATE_FILE.read_text())
+
+# у блокера бывает пустая причина — «Меня блочит: заблокирована» звучало бы глупо
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+    "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+    "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}), encoding="utf-8")
+GOT.clear()
+f.blocked_by = lambda k, c: f.NO_REASON
+f.follow_time_threads(FakeKaiten(), cfg, Args(), profiles)
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("блокер без причины — говорим своими словами",
+      said == ["Меня блочит блокер на карточке — сними, и поеду."], str(said))
+f.blocked_by = lambda k, c: None
 
 srv.shutdown()
 print("\nвсё сошлось")
