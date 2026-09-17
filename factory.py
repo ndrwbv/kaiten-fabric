@@ -921,7 +921,7 @@ def thread_intent(text: str) -> str:
 
 
 def time_status_answer(profile: dict | None, card: dict, comments: list,
-                       asks: list) -> str:
+                       asks: list, blocker: str = "") -> str:
     """
     Ответ на «как дела» — из карточки, без запуска агента.
 
@@ -929,7 +929,7 @@ def time_status_answer(profile: dict | None, card: dict, comments: list,
     и деньги. Всё, что нужно для ответа, и так лежит в Kaiten: колонка, сколько раз
     переделывали и заголовок последнего отчёта.
     """
-    role, _ = time_status(profile, card, asks)
+    role, _ = time_status(profile, card, asks, blocker)
     where = TIME_PLAIN_STATUSES.get(role, "не пойму, где карточка")
     lines = [f"Сейчас: {where}."]
 
@@ -1448,19 +1448,34 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         log(f"  !! в Time не написал: {e}")
 
 
-def time_status(profile: dict | None, card: dict, asks: list) -> tuple[str, str]:
+def time_status(profile: dict | None, card: dict, asks: list,
+                blocker: str = "") -> tuple[str, str]:
     """
     Роль колонки и фраза для канала. Роль нужна логике (конец потока, «Вопрос»),
     фраза — человеку. Обе пустые, если колонка не из потока фабрики.
+
+    На доске команды колонок меньше, чем ролей, и «Ревью» — это и вход ревьювера,
+    и «дальше человек». По одной колонке их не различить, а разница для канала
+    решающая: в первом случае туда идти рано, во втором — ждут именно человека.
+    Различает их свой блокер: фабрика вешает его ровно тогда, когда отдаёт ход.
     """
     if not profile:
         return "", ""
-    for role, label in TIME_STATUSES.items():
-        if card.get("column_id") == role_column(profile, role):
-            if asks and role in ("review", "question"):
-                label = TIME_STATUS_ASKED
-            return role, label
-    return "", ""
+    roles = [role for role in TIME_STATUSES
+             if card.get("column_id") == role_column(profile, role)]
+    if not roles:
+        return "", ""
+    if len(roles) > 1 and blocker.startswith(BLOCK_MARK):
+        handed = next((role for role in roles
+                       if role in HANDOFF_BLOCKERS
+                       and blocker.startswith(block_reason(HANDOFF_BLOCKERS[role]))), "")
+        if handed:
+            roles = [handed]
+    role = roles[0]
+    label = TIME_STATUSES[role]
+    if asks and role in ("review", "question"):
+        label = TIME_STATUS_ASKED
+    return role, label
 
 
 def with_status(base: str, status: str) -> str:
@@ -1597,7 +1612,10 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         # В канал — только вопросы: замечания ревьювера читает тот, кто открыл PR,
         # а человеку в треде от них нечего ответить
         asks = human_questions(comments)
-        role, status = time_status(profile, card, asks)
+        # Блокер тут не про «трогать нельзя», а про «чей ход»: на доске команды
+        # только по нему и видно, что колонка «Ревью» — это уже ревью человека
+        stuck = blocked_by(kaiten, card["id"])
+        role, status = time_status(profile, card, asks, stuck or "")
 
         # Вопросы агента — в тред: человеку сказали «позырьте», и он должен увидеть,
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
@@ -1637,7 +1655,7 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
             continue
 
         known[card_key] = {"card": card, "profile": profile,
-                           "comments": comments, "asks": asks}
+                           "comments": comments, "asks": asks, "stuck": stuck}
     return state, known
 
 
@@ -1702,6 +1720,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         root_id = info["root_id"]
         card, profile = seen["card"], seen["profile"]
         comments, asks = seen["comments"], seen["asks"]
+        # блокер уже спрошен снимком статуса — второй раз за тот же прогон не ходим
+        stuck = seen.get("stuck")
 
         try:
             posts = client.thread(root_id)
@@ -1767,7 +1787,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         if any(kind == "status" for _, _, kind in kinds):
             try:
                 client.post(info.get("channel_id", ""),
-                            time_status_answer(profile, card, comments, asks),
+                            time_status_answer(profile, card, comments, asks,
+                                               stuck or ""),
                             root_id=root_id)
                 log(f"  #{card_key}: ответил в тред, что с задачей")
             except FactoryError as e:
@@ -1783,7 +1804,6 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         only_asked = all(kind == "question" for _, _, kind in work)
 
         moved += 1
-        stuck = blocked_by(kaiten, card["id"])
         target = role_column(profile, "fixes") if profile else None
         # карточку в «Вопросе» двигать не надо: она и так ждёт ответа человека, и
         # перенесённый комментарий делает её пригодной к работе следующим же прогоном
@@ -2067,13 +2087,26 @@ def board_profiles(cfg: dict) -> list[dict]:
 
     Рабочая доска есть всегда. Доска сабтасок появляется, когда включён режим эпиков:
     у неё и колонки другие, и репозиторий может быть другой.
+
+    А может оказаться, что это одна и та же доска, — и это нормальный конец истории.
+    Своя «доска для клода» нужна, пока Стёпа только заводится: там он никому не мешает.
+    Когда он работает как разработчик в команде, у него и доска должна быть командная,
+    иначе рядом с доской команды живёт вторая вселенная, и по доске уже не видно,
+    кто чем занят.
+
+    Тогда профиль остаётся один и по правилам чужой доски: берём только карточки
+    с тегом. Двух профилей на одну доску быть не должно — доску обошли бы дважды,
+    и в первый же обход, по правилам своей, утащили бы в работу командный бэклог.
     """
     tag = bot_tag(cfg)
-    profiles = [make_profile("работа", cfg["kaiten"], tag=tag)]
     subtasks = ((cfg.get("epic_flow") or {}).get("subtasks") or {})
+    # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
+    # только раздует описание долга, поэтому туда её не привязываем
+    if subtasks.get("board_id") == cfg["kaiten"]["board_id"]:
+        return [make_profile("работа", subtasks, subtasks.get("repo"),
+                             attach_to_debt=False, own_only=True, tag=tag)]
+    profiles = [make_profile("работа", cfg["kaiten"], tag=tag)]
     if subtasks.get("board_id"):
-        # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
-        # только раздует описание долга, поэтому туда её не привязываем
         profiles.append(make_profile("сабтаски", subtasks, subtasks.get("repo"),
                                      attach_to_debt=False, own_only=True, tag=tag))
     return profiles
@@ -4514,7 +4547,10 @@ def handoff_profile(cfg: dict) -> dict:
     target = ((cfg.get("inbox") or {}).get("target") or "subtasks").strip()
     flow = epic_flow(cfg)
     if target == "subtasks" and flow:
-        return subtask_profile(cfg, flow)
+        # доска сабтасок может быть и рабочей: тогда берём рабочий профиль, чтобы
+        # в логах и на витрине одна доска не называлась двумя именами
+        board = flow["subtasks"]["board_id"]
+        return profile_for_board(board_profiles(cfg), board) or subtask_profile(cfg, flow)
     return board_profiles(cfg)[0]
 
 
@@ -5106,9 +5142,11 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
 
 
 def subtask_profile(cfg: dict, flow: dict) -> dict:
+    # own_only — как в board_profiles: доска командная, и правила у неё одни, с какой
+    # бы стороны за профилем ни пришли. Разные правила на одну доску — готовая ловушка
     subtasks = flow["subtasks"]
     return make_profile("сабтаски", subtasks, subtasks.get("repo"), attach_to_debt=False,
-                        tag=bot_tag(cfg))
+                        own_only=True, tag=bot_tag(cfg))
 
 
 def pick_epics(kaiten: Kaiten, cfg: dict, flow: dict) -> list[dict]:

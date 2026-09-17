@@ -662,5 +662,29 @@ check("сеть подвела — тред на месте",
 check("а 404 — карточки правда нет",
       "555" not in with_broken_card(f.NotFoundError("HTTP 404")))
 
+print("=== 33. на доске команды «Ревью» — две роли, различает их блокер ===")
+# Своей доски у Стёпы больше нет, он работает там же, где команда, а там колонок
+# меньше, чем ролей: «Ревью» — это и вход ревьювера, и «дальше человек». По колонке
+# их не различить, а для канала разница решающая: «пока не смотрите» против
+# «позырьте». Различает их свой блокер — фабрика вешает его, когда отдаёт ход.
+shared = f.make_profile("работа", {"board_id": 2000, "columns": {
+    "queue": 201, "in_progress": 202, "question": 202, "failed": 202,
+    "agent_review": 205, "fixes": 202, "review": 205, "done": 208}}, own_only=True)
+in_review = {"id": 556, "board_id": 2000, "column_id": 205}
+
+check("без блокера — ревьювер ещё смотрит",
+      f.time_status(shared, in_review, []) == ("agent_review", f.TIME_STATUSES["agent_review"]),
+      str(f.time_status(shared, in_review, [])))
+handed = f.block_reason(f.BLOCK_HUMAN_REVIEW)
+check("со своим блокером — ход человека",
+      f.time_status(shared, in_review, [], handed) == ("review", f.TIME_STATUSES["review"]),
+      str(f.time_status(shared, in_review, [], handed)))
+check("и на «как дела» он отвечает тем же",
+      "жду вашего ревью" in f.time_status_answer(shared, in_review, [], [], handed))
+check("чужой блокер роль не меняет: это не наш способ сказать «твой ход»",
+      f.time_status(shared, in_review, [], "ждём макет от дизайна")[0] == "agent_review")
+check("на доске со своей колонкой под каждую роль ничего не поменялось",
+      f.time_status(profiles[0], {"id": 556, "column_id": 107}, []) [0] == "review")
+
 srv.shutdown()
 print("\nвсё сошлось")
