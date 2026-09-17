@@ -322,7 +322,11 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 self.runner = nil
                 self.pollTimer?.invalidate()
                 self.pollTimer = nil
-                if proc.terminationStatus == 75 {
+                if proc.terminationStatus == 69 {
+                    // Фабрика не увидела доску: обычно мак только что проснулся,
+                    // а сеть ещё нет. Следующий круг таймера застанет её поднятой
+                    self.lastError = "Kaiten не отвечает — прогон пропущен"
+                } else if proc.terminationStatus == 75 {
                     // run.sh увидел чужой замок и вышел. Молчать нельзя: человек нажал
                     // кнопку и ждёт хоть какой-то реакции
                     self.lastError = "прогон уже идёт — этот запуск пропущен"

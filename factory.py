@@ -328,6 +328,22 @@ class FactoryError(RuntimeError):
     """Ошибка обёртки — карточка уедет в 'Упало'."""
 
 
+class NetworkError(FactoryError):
+    """
+    curl не дошёл до сервера: нет сети, не разрезолвился домен, вышло время.
+
+    Наследуется от FactoryError намеренно: все существующие ловушки продолжают
+    работать. Но от ответа сервера это отличается принципиально — из молчания сети
+    не следует ничего о том, что на той стороне. Семнадцатого сентября мак проснулся
+    раньше вайфая, `GET /cards/{id}` упал по таймауту, это прочиталось как «карточку
+    удалили», и треды в Time выкинулись из состояния безвозвратно.
+    """
+
+
+class NotFoundError(FactoryError):
+    """Сервер ответил 404: объекта правда нет — вот на это опираться уже можно."""
+
+
 class AgentAuthError(FactoryError):
     """
     claude не смог авторизоваться: беда окружения, как и ScoutSetupError, и точно
@@ -582,15 +598,22 @@ class Kaiten:
         if body is not None:
             cmd += ["--data-raw", json.dumps(body, ensure_ascii=False)]
 
-        proc = subprocess.run(cmd, input=f'header = "Authorization: Bearer {self.token}"\n',
-                              capture_output=True, text=True, timeout=60)
+        try:
+            proc = subprocess.run(cmd, input=f'header = "Authorization: Bearer {self.token}"\n',
+                                  capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise NetworkError(f"Kaiten {method} {path} -> curl не уложился в минуту") from None
         if proc.returncode != 0:
-            raise FactoryError(f"Kaiten {method} {path} -> curl {proc.returncode}: "
+            # Сюда же приходит curl 28 после сна: пока мак спит, не тикает ни таймер
+            # curl, ни наш, и просыпаются оба сразу — отсюда в логе «timed out after
+            # 972323 milliseconds» при --max-time 30. Сервер тут ни при чём.
+            raise NetworkError(f"Kaiten {method} {path} -> curl {proc.returncode}: "
                                f"{proc.stderr.strip()[:300]}")
 
         raw, _, code = proc.stdout.rpartition("\n")
         if code.strip() and int(code) >= 400:
-            raise FactoryError(f"Kaiten {method} {path} -> HTTP {code}: {raw[:500]}")
+            kind = NotFoundError if int(code) == 404 else FactoryError
+            raise kind(f"Kaiten {method} {path} -> HTTP {code}: {raw[:500]}")
         return json.loads(raw) if raw.strip() else None
 
     def _write(self, method: str, path: str, body=None):
@@ -1557,10 +1580,16 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
 
         try:
             card = kaiten.card(int(card_key))
-        except FactoryError:
+        except NotFoundError:
             log(f"  #{card_key} больше нет — убираю тред из состояния")
             threads.pop(card_key, None)
             save_time_state(state)
+            continue
+        except FactoryError as e:
+            # Kaiten не ответил — это не «карточки нет». Тред остаётся на месте:
+            # потерять его насовсем значит навсегда заморозить строку статуса в
+            # канале и оборвать ответы людей, а пропустить один прогон — ничего.
+            log(f"  #{card_key}: Kaiten не ответил, тред оставляю как есть ({e})")
             continue
 
         profile = profile_for_board(profiles, card.get("board_id"))
@@ -6073,8 +6102,16 @@ def main() -> int:
     # добавил бы к нажатию кнопки в окне настроек двадцать секунд ожидания.
     snapshot = not (args.prompt_only or args.time_test or args.time_channels
                     or args.time_announce)
-    if snapshot:
-        refresh_flow(kaiten, cfg, profiles)
+    if snapshot and not refresh_flow(kaiten, cfg, profiles):
+        # Дальше идти некуда: весь прогон — это решения по тому, что сейчас на доске,
+        # а доски мы не видели. Семнадцатого сентября он всё-таки пошёл и по дороге
+        # решил, что двух карточек больше не существует. Следующий запуск через
+        # десять минут застанет сеть уже поднятой.
+        log("Kaiten не отвечает — прогон отменяю, попробую в следующий раз")
+        clear_phase()
+        # 69 (EX_UNAVAILABLE), а не 1: меню-бар показывает человеку внятную причину,
+        # а не «завершился с кодом 1». 75 тут занят чужим замком в run.sh.
+        return 69
     try:
         return route(kaiten, cfg, args, profiles)
     finally:
@@ -6086,11 +6123,20 @@ def main() -> int:
             refresh_time_status(kaiten, cfg, args, profiles)
 
 
-def refresh_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
+def refresh_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> bool:
+    """
+    Снимок витрины. Отдаёт False, только если до Kaiten не достучались вовсе, — по
+    этому входной снимок решает, стоит ли вообще начинать прогон. Любая другая
+    беда со снимком False не даёт: витрина не важнее сделанной работы.
+    """
     try:
         snapshot_flow(kaiten, cfg, profiles)
+    except NetworkError as e:
+        log(f"снимок состояния не собрался: {e}")
+        return False
     except Exception as e:  # noqa: BLE001 — витрина не важнее сделанной работы
         log(f"снимок состояния не собрался: {e}")
+    return True
 
 
 def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:

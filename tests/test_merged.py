@@ -317,4 +317,20 @@ check("fetch ровно один", len(fetches) == 1, str(GITTED))
 check("а в main смотрели по каждой",
       len([a for a in GITTED if a and a[0] == "log"]) == 2, str(GITTED))
 
+print("=== 18. без связи с Kaiten прогон не начинается ===")
+# Прогон весь состоит из решений по тому, что сейчас на доске. Не увидев доску,
+# он семнадцатого сентября всё равно пошёл — и решил, что двух карточек нет.
+class Silent:
+    def cards_in_column(self, *a, **kw):
+        raise f.NetworkError("Kaiten GET /cards -> curl 28: Resolving timed out")
+
+check("снимок без сети — стоп-сигнал", f.refresh_flow(Silent(), CFG, profiles) is False)
+
+
+class Broken:
+    """А вот беда самой витрины прогон ронять не должна: работа важнее картинки."""
+    def cards_in_column(self, *a, **kw): raise ValueError("витрина сломалась")
+
+check("а сломанная витрина — нет", f.refresh_flow(Broken(), CFG, profiles) is True)
+
 print("\nвсё сошлось")

@@ -643,5 +643,24 @@ cut = [{"text": part, "created": f"2026-09-16T06:0{i}:00Z"}
 check("вопрос найден в хвосте", f.human_questions(cut) == ["А какой бизнес?"],
       str(f.human_questions(cut)))
 
+print("=== 29. Kaiten молчит — тред остаётся, 404 — уходит ===")
+# Семнадцатого сентября мак проснулся раньше сети, `GET /cards/{id}` упал по
+# таймауту, и это прочиталось как «карточку удалили»: два треда выкинулись из
+# состояния, и строки статуса в канале замёрзли навсегда.
+def with_broken_card(err):
+    f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+        "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+        "base": "[PR](u) Убрал lowercase.\n[Карточка](k)"}}}), encoding="utf-8")
+    broken = FakeKaiten()
+    def boom(card_id): raise err
+    broken.card = boom
+    f.sync_time_status(broken, cfg, Args(), profiles)
+    return json.loads(f.TIME_STATE_FILE.read_text())["threads"]
+
+check("сеть подвела — тред на месте",
+      "555" in with_broken_card(f.NetworkError("curl 28: timed out")))
+check("а 404 — карточки правда нет",
+      "555" not in with_broken_card(f.NotFoundError("HTTP 404")))
+
 srv.shutdown()
 print("\nвсё сошлось")
