@@ -113,6 +113,14 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     // Расписание попало в занятое время — прогон не теряем, а делаем сразу после
     // текущего. Очередь, а не три флага: режимов стало три, и флаги начали путаться.
     private var pendingModes: [RunMode] = []
+    // Прогон, который не состоялся из-за молчания Kaiten, возвращаем сами: ждать
+    // следующего тика — это час, и всё из-за одного оборванного соединения. Питон
+    // к этому моменту уже повторил сам запрос и не дозвался, так что беда серьёзнее
+    // мигнувшего вайфая — отсюда паузы в минутах, а не в секундах, и их конечность.
+    private static let skipRetryMinutes = 5
+    private static let maxSkipRetries = 3
+    private var skipRetries = 0
+    private var skipRetryTimer: Timer?
     private var status = Status()
     private var lastError: String?
     private var mood: Mood?
@@ -304,6 +312,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             return
         }
         lastError = nil
+        // Отложенный повтор больше не нужен: прогон и так начинается. Иначе он
+        // выстрелил бы следом за удачным запуском и сделал бы круг по доске второй раз.
+        skipRetryTimer?.invalidate()
+        skipRetryTimer = nil
         // то, что сейчас и так делаем, из очереди убираем
         pendingModes.removeAll { $0 == mode || (mode == .full && $0 != .board) }
 
@@ -324,8 +336,9 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                 self.pollTimer = nil
                 if proc.terminationStatus == 69 {
                     // Фабрика не увидела доску: обычно мак только что проснулся,
-                    // а сеть ещё нет. Следующий круг таймера застанет её поднятой
-                    self.lastError = "Kaiten не отвечает — прогон пропущен"
+                    // а сеть ещё нет. Сама вернётся к этому прогону через несколько
+                    // минут — доска не должна простаивать час из-за молчания сети
+                    self.retryAfterSkip(mode)
                 } else if proc.terminationStatus == 75 {
                     // run.sh увидел чужой замок и вышел. Молчать нельзя: человек нажал
                     // кнопку и ждёт хоть какой-то реакции
@@ -334,6 +347,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                             && proc.terminationReason != .uncaughtSignal {
                     self.lastError = "run.sh завершился с кодом \(proc.terminationStatus)"
                 }
+                if proc.terminationStatus == 0 { self.skipRetries = 0 }
                 self.readStatusFile()
                 self.redraw()
                 if !self.pendingModes.isEmpty {
@@ -361,6 +375,28 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         RunLoop.main.add(poll, forMode: .common)
         pollTimer = poll
         redraw()
+    }
+
+    /// Kaiten промолчал — возвращаемся к этому же прогону через несколько минут.
+    ///
+    /// Повторов конечное число: если сеть лежит полчаса, толку от них нет, а человек
+    /// в трее видит только одно и то же слово «повторю». Исчерпав их, ждём расписание
+    /// молча — и любой состоявшийся прогон обнуляет счёт.
+    private func retryAfterSkip(_ mode: RunMode) {
+        guard skipRetries < Self.maxSkipRetries else {
+            lastError = "Kaiten не отвечает — жду следующего круга по расписанию"
+            skipRetries = 0
+            return
+        }
+        skipRetries += 1
+        lastError = "Kaiten не отвечает — повторю через \(Self.skipRetryMinutes) мин"
+        skipRetryTimer?.invalidate()
+        let timer = Timer(timeInterval: TimeInterval(Self.skipRetryMinutes * 60),
+                          repeats: false) { [weak self] _ in
+            self?.startRun(manual: false, mode: mode)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        skipRetryTimer = timer
     }
 
     /// Гасим весь хвост: сначала детей питона (это и есть claude), потом сам питон,

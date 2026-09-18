@@ -330,7 +330,8 @@ class FactoryError(RuntimeError):
 
 class NetworkError(FactoryError):
     """
-    curl не дошёл до сервера: нет сети, не разрезолвился домен, вышло время.
+    curl не дошёл до сервера: нет сети, не разрезолвился домен, вышло время. Сюда же
+    502/503/504 — за ними стоит шлюз, а не ответ Kaiten.
 
     Наследуется от FactoryError намеренно: все существующие ловушки продолжают
     работать. Но от ответа сервера это отличается принципиально — из молчания сети
@@ -574,6 +575,19 @@ def resolve_secret(name: str, env: dict | None = None) -> str:
 # Kaiten
 # --------------------------------------------------------------------------- #
 
+# Чтение из Kaiten повторяем: одиночный обрыв — штатное событие в корпоративной сети,
+# и целого прогона он стоить не должен. Восемнадцатого сентября /cards трижды за день
+# приезжал наполовину и упирался в --max-time 30, а минутой позже тот же запрос
+# отдавался за полторы секунды — каждый раз это отменяло прогон целиком. Паузы растут,
+# чтобы покрыть и главный случай: мак проснулся раньше вайфая.
+KAITEN_READ_RETRIES = 3
+KAITEN_RETRY_PAUSE = 6
+
+# Ответы шлюза, за которыми ответа Kaiten нет вовсе. Для нас это то же молчание сети:
+# о карточке из них не следует ничего, поэтому и повторяем их так же.
+KAITEN_TRANSIENT_HTTP = (502, 503, 504)
+
+
 class Kaiten:
     def __init__(self, domain: str, token: str, space_id: int, dry_run: bool = False):
         self.api = f"https://{domain}/api/latest"
@@ -588,6 +602,10 @@ class Kaiten:
         MITM-прокси, его корневой сертификат лежит в системном хранилище. curl туда
         смотрит, python — в свой bundled certifi, и падает на CERTIFICATE_VERIFY_FAILED.
         Токен уходит в curl через stdin (-K -), чтобы не светиться в `ps`.
+
+        Чтение повторяем, запись — никогда. Из оборванной записи не следует, что
+        Kaiten её не принял: соединение могло умереть уже после того, как комментарий
+        лёг в карточку, и второй заход положил бы туда второй такой же.
         """
         url = self.api + path
         if params:
@@ -598,6 +616,20 @@ class Kaiten:
         if body is not None:
             cmd += ["--data-raw", json.dumps(body, ensure_ascii=False)]
 
+        attempts = KAITEN_READ_RETRIES if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._curl(cmd, method, path)
+            except NetworkError as e:
+                if attempt >= attempts:
+                    raise
+                pause = KAITEN_RETRY_PAUSE * attempt
+                log(f"  сеть подвела на {method} {path} ({str(e).split(' -> ')[-1][:90]}), "
+                    f"повтор {attempt + 1} из {attempts} через {pause}с")
+                time.sleep(pause)
+
+    def _curl(self, cmd: list[str], method: str, path: str):
+        """Один заход: разобранный ответ, либо ошибка того или иного рода."""
         try:
             proc = subprocess.run(cmd, input=f'header = "Authorization: Bearer {self.token}"\n',
                                   capture_output=True, text=True, timeout=60)
@@ -612,6 +644,10 @@ class Kaiten:
 
         raw, _, code = proc.stdout.rpartition("\n")
         if code.strip() and int(code) >= 400:
+            if int(code) in KAITEN_TRANSIENT_HTTP:
+                # За таким ответом нет ответа самого Kaiten — это молчание шлюза,
+                # и знать по нему про карточку нечего, ровно как при обрыве.
+                raise NetworkError(f"Kaiten {method} {path} -> HTTP {code}")
             kind = NotFoundError if int(code) == 404 else FactoryError
             raise kind(f"Kaiten {method} {path} -> HTTP {code}: {raw[:500]}")
         return json.loads(raw) if raw.strip() else None
