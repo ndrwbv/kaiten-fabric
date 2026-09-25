@@ -230,23 +230,27 @@ def pull_requests(cfg: dict) -> dict[int, dict]:
     """
     PR фабрики по всем репозиториям конфига: `{id карточки: PR}`.
 
-    Один вызов `gh` на репозиторий: ветки фабрики все с общим префиксом, и поиск
-    по `head:` отдаёт их пачкой вместе с состоянием и датой мержа.
+    Один вызов `gh` на репозиторий и префикс: ветки фабрики все с общим префиксом,
+    и поиск по `head:` отдаёт их пачкой вместе с состоянием и датой мержа. Префиксов
+    больше одного, пока живы PR, открытые до переезда веток на `stepa/`.
     """
-    prefix = (cfg.get("pr") or {}).get("branch_prefix") or "ai/card-"
-    branch_re = re.compile(re.escape(prefix) + r"(\d+)")
+    prefixes = factory.branch_prefixes(cfg)
+    branch_re = re.compile("(?:" + "|".join(map(re.escape, prefixes)) + r")(\d+)")
     found: dict[int, dict] = {}
     for key, repo in (cfg.get("repos") or {}).items():
         path = Path(repo.get("path") or "")
         if not path.is_dir():
             continue
-        proc = subprocess.run(
-            ["gh", "pr", "list", "--search", f"head:{prefix}", "--state", "all",
-             "--limit", "200", "--json", PR_FIELDS],
-            cwd=path, capture_output=True, text=True, timeout=180)
-        if proc.returncode != 0:
-            raise RuntimeError(f"gh pr list ({key}): {proc.stderr.strip()[:200]}")
-        for pull in json.loads(proc.stdout or "[]"):
+        pulls = []
+        for prefix in prefixes:
+            proc = subprocess.run(
+                ["gh", "pr", "list", "--search", f"head:{prefix}", "--state", "all",
+                 "--limit", "200", "--json", PR_FIELDS],
+                cwd=path, capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                raise RuntimeError(f"gh pr list ({key}): {proc.stderr.strip()[:200]}")
+            pulls += json.loads(proc.stdout or "[]")
+        for pull in pulls:
             match = branch_re.match(pull.get("headRefName") or "")
             if not match:
                 continue

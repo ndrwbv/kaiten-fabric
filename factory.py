@@ -52,6 +52,13 @@ PROJECT_DIR = ROOT / "project"
 PROJECT_DOCS_PATH = PROJECT_DIR / "docs.md"
 PROJECT_CHECKLIST_PATH = PROJECT_DIR / "checklist.md"
 WORKTREES = ROOT / "worktrees"
+# Всё, что Стёпа заводит в чужом репозитории, живёт под `stepa/`: так его ветки
+# видно в списке сразу и не спутать с ветками людей и других агентов.
+BRANCH_PREFIX = "stepa/card-"
+# Префиксы до переезда на `stepa/`. По ним ещё живут открытые PR, и фабрика должна
+# их находить — для правок, мержа и витрины, — пока последний не закроется. Новые
+# ветки под ними не заводятся.
+LEGACY_BRANCH_PREFIXES = ("ai/card-",)
 LOGS = ROOT / "logs"
 STATE = ROOT / "state"
 STATUS_FILE = STATE / "status.json"
@@ -1241,9 +1248,7 @@ def time_announce(kaiten: Kaiten, cfg: dict, args, card_id: int) -> int:
     card = kaiten.card(card_id)
     repo_key, repo_cfg = resolve_repo(card, cfg)
     repo = Path(repo_cfg["path"]).expanduser()
-    branch = remote_branch_for_card(repo, repo_cfg["remote"],
-                                    (cfg.get("pr") or {}).get("branch_prefix", "ai/card-"),
-                                    card_id)
+    branch = remote_branch_for_card(repo, repo_cfg["remote"], branch_prefixes(cfg), card_id)
     if not branch:
         print(f"Ветки по #{card_id} в {repo_cfg['remote']} нет — объявлять нечего.")
         return 1
@@ -2457,11 +2462,24 @@ def epic_of_card(card: dict) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def remote_branch_for_card(repo: Path, remote: str, prefix: str, card_id: int) -> str | None:
+def branch_prefix(cfg: dict) -> str:
+    """Префикс, под которым заводятся новые ветки карточек."""
+    return (cfg.get("pr") or {}).get("branch_prefix") or BRANCH_PREFIX
+
+
+def branch_prefixes(cfg: dict) -> tuple[str, ...]:
+    """Все префиксы, под которыми может найтись ветка карточки: текущий первым."""
+    prefix = branch_prefix(cfg)
+    return (prefix, *(old for old in LEGACY_BRANCH_PREFIXES if old != prefix))
+
+
+def remote_branch_for_card(repo: Path, remote: str, prefixes: tuple[str, ...],
+                           card_id: int) -> str | None:
     """Ищет уже запушенную ветку карточки: имя могло смениться вместе с заголовком."""
     git(repo, "fetch", remote, "--prune", check=False)
-    output = git(repo, "ls-remote", "--heads", remote,
-                 f"{prefix}{card_id}", f"{prefix}{card_id}-*", check=False)
+    patterns = [name for prefix in prefixes
+                for name in (f"{prefix}{card_id}", f"{prefix}{card_id}-*")]
+    output = git(repo, "ls-remote", "--heads", remote, *patterns, check=False)
     names = [line.split("refs/heads/", 1)[1].strip()
              for line in output.splitlines() if "refs/heads/" in line]
     if not names:
@@ -3630,7 +3648,7 @@ def pr_link(comments: list) -> str:
     return ""
 
 
-def pr_status(repo: Path, prefix: str, card_id: int, pr_url: str) -> dict:
+def pr_status(repo: Path, prefixes: tuple[str, ...], card_id: int, pr_url: str) -> dict:
     """
     Что стало с PR карточки: `url`, `state` (`OPEN`, `MERGED`, `CLOSED`), `mergedAt`,
     `mergedBy`. Пустой словарь — PR не нашёлся, и это не поломка: карточку могли
@@ -3649,18 +3667,19 @@ def pr_status(repo: Path, prefix: str, card_id: int, pr_url: str) -> dict:
             return json.loads(proc.stdout)
         log(f"  !! {pr_url} не прочитался: {proc.stderr.strip()[:160]}")
 
-    head = f"{prefix}{card_id}"
-    proc = run_bounded(["gh", "pr", "list", "--search", f"head:{head}",
-                        "--state", "all", "--json", fields], repo, 120)
-    if proc.returncode != 0:
-        log(f"  !! PR по ветке {head} не искался: {proc.stderr.strip()[:160]}")
-        return {}
-    # `head:` в поиске GitHub совпадает по началу имени, поэтому `ai/card-123` поймал
-    # бы заодно и `ai/card-1234-…`: имя ветки проверяем сами
-    for pull in json.loads(proc.stdout or "[]"):
-        name = pull.get("headRefName") or ""
-        if name == head or name.startswith(f"{head}-"):
-            return pull
+    for prefix in prefixes:
+        head = f"{prefix}{card_id}"
+        proc = run_bounded(["gh", "pr", "list", "--search", f"head:{head}",
+                            "--state", "all", "--json", fields], repo, 120)
+        if proc.returncode != 0:
+            log(f"  !! PR по ветке {head} не искался: {proc.stderr.strip()[:160]}")
+            return {}
+        # `head:` в поиске GitHub совпадает по началу имени, поэтому `stepa/card-123`
+        # поймал бы заодно и `stepa/card-1234-…`: имя ветки проверяем сами
+        for pull in json.loads(proc.stdout or "[]"):
+            name = pull.get("headRefName") or ""
+            if name == head or name.startswith(f"{head}-"):
+                return pull
     return {}
 
 
@@ -3764,8 +3783,7 @@ def close_if_merged(kaiten: Kaiten, cfg: dict, profile: dict, card: dict,
 
     key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
-    prefix = (cfg.get("pr") or {}).get("branch_prefix", "ai/card-")
-    pull = pr_status(repo, prefix, card_id, pr_link(comments))
+    pull = pr_status(repo, branch_prefixes(cfg), card_id, pr_link(comments))
     state = (pull.get("state") or "").upper()
     where = (card.get("title") or "").strip()[:60]
 
@@ -4003,14 +4021,13 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
 
     log(f"#{card_id} «{title[:60]}» — ревью")
 
-    branch = remote_branch_for_card(repo, repo_cfg["remote"],
-                                    cfg["pr"]["branch_prefix"], card_id)
+    branch = remote_branch_for_card(repo, repo_cfg["remote"], branch_prefixes(cfg), card_id)
     if not branch:
         log("  запушенной ветки нет")
         if args.prompt_only:
             return
         kaiten.comment(card_id, f"{REVIEWER_MARK} **Ревьювить нечего:** запушенной ветки "
-                                f"`{cfg['pr']['branch_prefix']}{card_id}*` нет.")
+                                f"`{branch_prefix(cfg)}{card_id}*` нет.")
         hand_over(kaiten, profile, card_id, "failed", "запушенной ветки нет")
         log("  -> Упало (ветки нет)")
         return
@@ -4028,10 +4045,10 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
         if not args.prompt_only:
             write_status(card={"id": card_id, "title": title, "url": card_url},
                          phase=f"ревьювер, круг {round_number}")
-        make_worktree(repo, f"review/card-{card_id}", repo_cfg["base_branch"],
+        make_worktree(repo, f"stepa/review-{card_id}", repo_cfg["base_branch"],
                       repo_cfg["remote"], worktree, continue_from=branch)
 
-        # ветка в ревью-worktree своя (review/card-N), поэтому PR ищем по имени
+        # ветка в ревью-worktree своя (stepa/review-N), поэтому PR ищем по имени
         # ревьюемой ветки, а не по текущей: `gh pr view` без --head смотрит на текущую
         pr_url = run_bounded(
             ["gh", "pr", "list", "--head", branch, "--state", "all",
@@ -4186,7 +4203,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     # в имени ветки — номер и транслит заголовка, чтобы по списку веток было понятно,
     # о чём каждая. Номер идёт первым: по нему ветка ищется и им же ограничен пуш
     slug = slugify(title)
-    branch = f"{cfg['pr']['branch_prefix']}{card_id}" + (f"-{slug}" if slug else "")
+    branch = f"{branch_prefix(cfg)}{card_id}" + (f"-{slug}" if slug else "")
     continue_from = None
     # Прошлый заход оборвали на полушаге — берём его ветку, а не начинаем с нуля.
     # Иначе агент второй раз проходит тот же путь и второй раз упирается в потолок.
@@ -4194,7 +4211,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     if fixing or resuming:
         # правки идут в ту же ветку и тот же PR, иначе ревью пойдёт по кругу с нуля
         continue_from = remote_branch_for_card(repo, repo_cfg["remote"],
-                                               cfg["pr"]["branch_prefix"], card_id)
+                                               branch_prefixes(cfg), card_id)
         if continue_from:
             branch = continue_from
 
@@ -4207,7 +4224,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         epic_id = epic_of_card(card)
         if epic_id:
             spec_branch = remote_branch_for_card(repo, repo_cfg["remote"],
-                                                 cfg["pr"]["branch_prefix"], epic_id)
+                                                 branch_prefixes(cfg), epic_id)
             if spec_branch and spec_branch.endswith("-spec"):
                 branch = continue_from = spec_branch
                 log(f"  пишу в ветку спеки эпика #{epic_id}: {branch}")
@@ -4281,7 +4298,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
                 git(worktree, "commit", "-m",
                     f"#{card_id} промежуточный результат: {cut}", check=False)
                 commits = git(worktree, "log", f"{base_ref}..HEAD", "--oneline")
-            if commits and not args.dry_run and branch.startswith(cfg["pr"]["branch_prefix"]):
+            if commits and not args.dry_run and branch.startswith(branch_prefixes(cfg)):
                 git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
 
             # Второй обрыв подряд — дальше пробовать бессмысленно: задача не влезает
@@ -4334,7 +4351,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             log(f"  -> Вопрос от агента (status={status}, коммиты не пушим)")
             return
 
-        if not branch.startswith(cfg["pr"]["branch_prefix"]):
+        if not branch.startswith(branch_prefixes(cfg)):
             raise FactoryError(f"отказываюсь пушить ветку вне префикса: {branch}")
 
         write_status(phase="пушу ветку и открываю PR")
@@ -4525,16 +4542,19 @@ def ensure_scout_worktree(repo: Path, repo_cfg: dict, key: str) -> Path:
     Поэтому существующую копию просто подтягиваем к базовой ветке.
     """
     path = WORKTREES / f"scout-{key}"
+    branch = f"stepa/scout-{key}"
     remote, base = repo_cfg["remote"], repo_cfg["base_branch"]
     git(repo, "fetch", remote, base)
     if (path / ".git").exists():
-        git(path, "reset", "--hard", f"{remote}/{base}")
+        # checkout, а не reset: копия, заведённая до переезда на `stepa/`, стоит
+        # на старой ветке и так на неё и переезжает
+        git(path, "checkout", "-f", "-B", branch, f"{remote}/{base}")
         git(path, "clean", "-fd", check=False)
         return path
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
     git(repo, "worktree", "prune", check=False)
-    git(repo, "worktree", "add", "-B", f"scout/{key}", str(path), f"{remote}/{base}")
+    git(repo, "worktree", "add", "-B", branch, str(path), f"{remote}/{base}")
     return path
 
 
@@ -5412,9 +5432,8 @@ def epic_worktree(kaiten: Kaiten, cfg: dict, repo_cfg: dict, repo_key: str,
     if not writable:
         return ensure_scout_worktree(repo, repo_cfg, repo_key)
     worktree = WORKTREES / f"spec-{card_id}"
-    branch = f"{cfg['pr']['branch_prefix']}{card_id}-spec"
-    existing = remote_branch_for_card(repo, repo_cfg["remote"],
-                                      cfg["pr"]["branch_prefix"], card_id)
+    branch = f"{branch_prefix(cfg)}{card_id}-spec"
+    existing = remote_branch_for_card(repo, repo_cfg["remote"], branch_prefixes(cfg), card_id)
     continue_from = existing if existing and existing.endswith("-spec") else None
     make_worktree(repo, branch, repo_cfg["base_branch"], repo_cfg["remote"], worktree,
                   continue_from=continue_from)
@@ -5523,7 +5542,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             "{{COMMENTS}}": format_comments(comments),
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}" for i in criteria),
             "{{SPEC_DIR}}": flow.get("spec_dir") or "specs",
-            "{{BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{BRANCH}}": f"{branch_prefix(cfg)}{card_id}-spec",
             "{{SPEC_NOTE}}": SPEC_FIX_NOTE if fixing else "",
             "{{REVIEW_NOTES}}": (fetch_pr_notes(worktree, spec_pr_url(comments))
                                  if fixing else ""),
@@ -5595,7 +5614,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         prompt = epic_prompt(SPEC_REVIEW_TEMPLATE_PATH, card, card_url, repo_cfg, {
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
                                         for i in acceptance_items(card)),
-            "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{SPEC_BRANCH}}": f"{branch_prefix(cfg)}{card_id}-spec",
             "{{UNANSWERED}}": unanswered_note,
         })
         if show_prompt(prompt, args, "ревью спеки"):
@@ -5669,7 +5688,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         prompt = epic_prompt(DECOMPOSE_TEMPLATE_PATH, card, card_url, repo_cfg, {
             "{{ACCEPTANCE}}": "\n".join(f"- {i.get('text')}"
                                         for i in acceptance_items(card)),
-            "{{SPEC_BRANCH}}": f"{cfg['pr']['branch_prefix']}{card_id}-spec",
+            "{{SPEC_BRANCH}}": f"{branch_prefix(cfg)}{card_id}-spec",
             "{{MAX_SUBTASKS}}": str(flow.get("max_subtasks", 5)),
             "{{UNANSWERED}}": unanswered_note,
         })

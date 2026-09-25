@@ -20,11 +20,11 @@ COLUMNS = {"queue": 101, "in_progress": 102, "question": 103, "failed": 104,
            "agent_review": 105, "fixes": 106, "review": 107, "done": 108}
 CARD = 555
 PR = "https://github.com/o/r/pull/7"
-BRANCH = "ai/card-555-popravit-tekst"
+BRANCH = "stepa/card-555-popravit-tekst"
 
 CFG = {"default_repo": "kiosk",
        "repos": {"kiosk": {"path": "/nope", "remote": "origin", "base_branch": "main"}},
-       "pr": {"branch_prefix": "ai/card-"}}
+       "pr": {"branch_prefix": "stepa/card-"}}
 
 MERGED = {"url": PR, "state": "MERGED", "mergedAt": "2026-09-10T06:11:20Z",
           "mergedBy": {"login": "aboev"}, "headRefName": BRANCH}
@@ -178,16 +178,26 @@ ASKED.clear(); fake_gh([MERGED])
 kaiten = FakeKaiten(comments=[{"text": "🤖 **Взял в работу.**"}])
 f.close_merged(kaiten, CFG, Args(), profiles)
 check("искали по ветке карточки",
-      ASKED and ASKED[0][:5] == ["gh", "pr", "list", "--search", "head:ai/card-555"],
+      ASKED and ASKED[0][:5] == ["gh", "pr", "list", "--search", "head:stepa/card-555"],
       str(ASKED))
 check("нашли и закрыли", kaiten.moves == [(CARD, COLUMNS["done"])], str(kaiten.moves))
 
 print("=== 7. чужая ветка с похожим номером не считается ===")
 ASKED.clear()
-fake_gh([{**MERGED, "headRefName": "ai/card-5551-drugaya-zadacha"}])
+fake_gh([{**MERGED, "headRefName": "stepa/card-5551-drugaya-zadacha"}])
 kaiten = FakeKaiten(comments=[{"text": "🤖 **Взял в работу.**"}])
 f.close_merged(kaiten, CFG, Args(), profiles)
 check("карточку не тронули", kaiten.moves == [], str(kaiten.moves))
+
+print("=== 7а. ветка до переезда на stepa/ тоже находится ===")
+# PR, открытые под `ai/card-`, должны доехать до «Готово», а не висеть в ревью вечно
+ASKED.clear()
+fake_gh([], [{**MERGED, "headRefName": "ai/card-555-popravit-tekst"}])
+kaiten = FakeKaiten(comments=[{"text": "🤖 **Взял в работу.**"}])
+f.close_merged(kaiten, CFG, Args(), profiles)
+check("сначала новый префикс, потом старый",
+      [cmd[4] for cmd in ASKED] == ["head:stepa/card-555", "head:ai/card-555"], str(ASKED))
+check("нашли и закрыли", kaiten.moves == [(CARD, COLUMNS["done"])], str(kaiten.moves))
 
 print("=== 8. gh упал — карточка остаётся как была ===")
 ASKED.clear(); fake_gh(None, None)
