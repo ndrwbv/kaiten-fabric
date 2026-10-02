@@ -8,6 +8,8 @@ config.json
 # В репозитории лежат только *.example.md
 project/*.md
 !project/*.example.md
+# правила под каждый репозиторий: project/<ключ репозитория>/docs.md и checklist.md
+project/*/
 
 # Токены
 .env

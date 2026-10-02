@@ -910,6 +910,10 @@ def build_config(domain: str, space_id: int, work: dict, inbox: dict | None,
     })
     config["default_repo"] = repo_name
     config["repos"] = {repo_name: repo}
+    # Мастер ставит фабрику на одну доску. Несколько продуктов со своими досками и
+    # репозиториями собираются руками по примеру — см. AGENTS.md, «Несколько продуктов»
+    for key in ("//products", "products", "default_product"):
+        config.pop(key, None)
     if inbox:
         config["inbox"] = inbox
     else:
@@ -1015,7 +1019,9 @@ def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
                     "укажи epic_flow.ready_column_id явно")
                 problems += 1
             target = flow.get("review_column_id")
-            if target:
+            if flow.get("stay_on_close"):
+                ok("закрытый эпик остаётся в колонке разработки, фабрика снимает тег")
+            elif target:
                 ok(f"колонка ревью эпика → «{titles.get(int(target), target)}»")
             elif position + 1 < len(ids):
                 ok(f"колонка ревью эпика (вычислена) → «{titles[ids[position + 1]]}»")
@@ -1029,23 +1035,34 @@ def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
             bad(f"колонка разработки {development} не найдена ни на одной доске эпиков")
             problems += 1
 
+    if config.get("products"):
+        ok("сабтаски раскладываются по доскам продуктов")
+        return problems
     subtasks = flow.get("subtasks") or {}
     if not subtasks.get("board_id"):
         bad("режим эпиков: не указана доска сабтасок")
         return problems + 1
+    return problems + check_board_columns(kaiten, "сабтаски", subtasks)
+
+
+def check_board_columns(kaiten: Kaiten, label: str, block: dict) -> int:
+    """
+    Доска и её колонки по ролям. Роли можно делить колонки, но три из них — точки,
+    откуда фабрика берёт работу, — обязательны.
+    """
     try:
-        board = kaiten.board(int(subtasks["board_id"]))
+        board = kaiten.board(int(block["board_id"]))
     except SetupError as e:
-        bad(f"доска сабтасок недоступна: {e}")
-        return problems + 1
-    ok(f"сабтаски: «{board['title']}»")
+        bad(f"{label}: доска недоступна: {e}")
+        return 1
+    ok(f"{label}: «{board['title']}»")
+    problems = 0
     have = {int(c["id"]): c.get("path") for c in flat_columns(board)}
     for role, name, _, _ in COLUMN_ROLES:
-        column_id = (subtasks.get("columns") or {}).get(role)
+        column_id = (block.get("columns") or {}).get(role)
         if not column_id:
-            # роли можно делить колонки, но эти три — точки, откуда фабрика берёт работу
             if role in ("queue", "in_progress", "agent_review"):
-                bad(f"сабтаски: роль {role} ({name}) обязательна, но не указана")
+                bad(f"{label}: роль {role} ({name}) обязательна, но не указана")
                 problems += 1
             elif role == "done":
                 hint("    done: не указана — карточки со смерженным PR останутся в ревью")
@@ -1053,10 +1070,52 @@ def check_epic_flow(kaiten: Kaiten, config: dict) -> int:
                 hint(f"    {role}: не указана — фабрика обойдётся блокером")
             continue
         if int(column_id) not in have:
-            bad(f"сабтаски: роль {role} — колонки {column_id} на доске нет")
+            bad(f"{label}: роль {role} — колонки {column_id} на доске нет")
             problems += 1
         else:
             ok(f"{role:<13} → «{have[int(column_id)]}»")
+    return problems
+
+
+def check_products(kaiten: Kaiten, config: dict) -> int:
+    """
+    Продукты: доска с колонками, репозитории из `repos`, дорожки на доске эпиков.
+
+    Опечатка в ключе репозитория молча отправила бы задачу в репозиторий по умолчанию,
+    поэтому неизвестный ключ — ошибка, а не предупреждение.
+    """
+    problems = 0
+    known = config.get("repos") or {}
+    lanes = set()
+    for board_id in (config.get("epic_flow") or {}).get("boards") or []:
+        try:
+            lanes |= {int(lane["id"]) for lane in kaiten.board(int(board_id)).get("lanes") or []}
+        except SetupError:
+            pass
+    for key, product in config["products"].items():
+        if key.startswith("//"):
+            continue
+        title = product.get("title") or key
+        label = f"{title}{' (уходящая)' if product.get('retired') else ''}"
+        problems += check_board_columns(kaiten, label, product)
+        repos = product.get("repos") or []
+        unknown = [repo for repo in repos if repo not in known]
+        if not repos:
+            bad(f"{title}: не указано ни одного репозитория")
+            problems += 1
+        elif unknown:
+            bad(f"{title}: таких репозиториев нет в repos — {', '.join(unknown)}")
+            problems += 1
+        else:
+            ok(f"{'репозитории':<13} → {', '.join(repos)} (по умолчанию {repos[0]})")
+        for lane in product.get("epic_lanes") or []:
+            if lanes and int(lane) not in lanes:
+                bad(f"{title}: дорожки {lane} на доске эпиков нет")
+                problems += 1
+    default = config.get("default_product")
+    if default and default not in config["products"]:
+        bad(f"default_product «{default}» — такого продукта нет")
+        problems += 1
     return problems
 
 
@@ -1096,8 +1155,15 @@ def check() -> int:
         return problems + 1
     ok(f"{CONFIG_PATH.name} читается")
 
-    for name in PROJECT_FILES:
+    # с продуктами правила лежат по репозиториям: project/<ключ>/docs.md
+    rule_paths = ([f"{repo}/{name}" for repo in (config.get("repos") or {})
+                   for name in PROJECT_FILES]
+                  if config.get("products") else PROJECT_FILES)
+    for name in rule_paths:
         path = PROJECT_DIR / name
+        if config.get("products") and not path.exists() and (PROJECT_DIR / Path(name).name).exists():
+            hint(f"  project/{name} нет — возьмётся общий project/{Path(name).name}")
+            continue
         if not path.exists():
             warn(f"project/{name} нет — агент будет работать по общим соображениям")
         elif not path.read_text(encoding="utf-8").strip():
@@ -1120,25 +1186,10 @@ def check() -> int:
         bad(str(e))
         return problems + 1
 
-    try:
-        board = kaiten.board(int(config["kaiten"]["board_id"]))
-        ok(f"рабочая доска «{board['title']}»")
-        columns = flat_columns(board)
-        have = {int(c["id"]) for c in columns}
-        titles = {int(c["id"]): c.get("path") for c in columns}
-        for key, name, _, _ in COLUMN_ROLES:
-            column_id = config["kaiten"]["columns"].get(key)
-            if not column_id:
-                bad(f"колонка {key} ({name}) не указана в конфиге")
-                problems += 1
-            elif int(column_id) not in have:
-                bad(f"колонка {key} — id {column_id} на доске не найден")
-                problems += 1
-            else:
-                ok(f"{key:<13} → «{titles[int(column_id)]}»")
-    except SetupError as e:
-        bad(f"рабочая доска недоступна: {e}")
-        problems += 1
+    if config.get("products"):
+        problems += check_products(kaiten, config)
+    else:
+        problems += check_board_columns(kaiten, "рабочая доска", config["kaiten"])
 
     # долг спринта: секция переименована в sprint_debt, старое имя epic ещё работает
     for section, label in (("inbox", "инбокс"),

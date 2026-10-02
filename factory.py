@@ -282,6 +282,31 @@ TRIAGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+
+
+def with_products(schema: dict, cfg: dict, nested: str | None = None,
+                  required: bool = True) -> dict:
+    """
+    Схема ответа с полями `product` и `repo`, перечисленными из конфига.
+
+    Список — enum, а не свободная строка: агенту проще выбрать из готового, а нам не
+    надо гадать, что значит «сайт-фронт». Без продуктов схема остаётся как была.
+    `nested` — поле-список, в элементах которого живёт выбор (сабтаски эпика).
+    """
+    choices = destinations(cfg)
+    if not choices:
+        return schema
+    repos = list(dict.fromkeys(repo for key in choices for repo in product_repos(cfg, key)))
+    extra = {"product": {"type": "string", "enum": list(choices)},
+             "repo": {"type": "string", "enum": repos}}
+    result = json.loads(json.dumps(schema))
+    target = result["properties"][nested]["items"] if nested else result
+    target["properties"].update(extra)
+    if required:
+        target["required"] = list(dict.fromkeys(target.get("required", []) + list(extra)))
+    return result
+
+
 SEVERITY_ICON = {"blocker": "🛑", "major": "⚠️", "minor": "💬"}
 
 # что уходит в шапку комментария и в строку «последняя» в меню-баре
@@ -1246,7 +1271,9 @@ def time_announce(kaiten: Kaiten, cfg: dict, args, card_id: int) -> int:
         return 0
 
     card = kaiten.card(card_id)
-    repo_key, repo_cfg = resolve_repo(card, cfg)
+    # репозиторий — по доске карточки: у продукта он может быть не тот, что по умолчанию
+    profile = profile_for_board(board_profiles(cfg), card.get("board_id")) or {}
+    repo_key, repo_cfg = resolve_repo(card, cfg, profile.get("repo"))
     repo = Path(repo_cfg["path"]).expanduser()
     branch = remote_branch_for_card(repo, repo_cfg["remote"], branch_prefixes(cfg), card_id)
     if not branch:
@@ -2122,6 +2149,166 @@ def make_profile(key: str, board: dict, repo_key: str | None = None,
     }
 
 
+# --------------------------------------------------------------------------- #
+# продукты: доска + репозитории
+# --------------------------------------------------------------------------- #
+
+def products(cfg: dict) -> dict:
+    """
+    Продукты команды: у каждого своя спринт-доска и свои репозитории.
+
+    Нет секции — режим старый, одна рабочая доска и одна доска сабтасок. Секция
+    есть — доски берутся отсюда, а `kaiten.board_id` и `epic_flow.subtasks` больше
+    не читаются: команда, которая ведёт магазин, сайт и B2B-заказы, раскладывает эпик
+    на три доски, и доска сабтасок «одна на всё» перестаёт что-либо значить.
+    """
+    return cfg.get("products") or {}
+
+
+def destinations(cfg: dict) -> dict:
+    """
+    Продукты, куда можно ставить новую работу.
+
+    `retired` — доска, с которой команда уехала, но на ней ещё досиживают свои
+    карточки: их PR надо закрыть по мержу, а треды в Time — довести. Новой работы
+    туда не ставим, и агенту её в списке не показываем.
+    """
+    return {key: product for key, product in products(cfg).items()
+            if not product.get("retired")}
+
+
+def default_product(cfg: dict) -> str:
+    choices = destinations(cfg)
+    key = cfg.get("default_product")
+    return key if key in choices else next(iter(choices), "")
+
+
+def product_repos(cfg: dict, key: str) -> list[str]:
+    """Репозитории продукта по порядку; первый — тот, куда идёт работа по умолчанию."""
+    known = cfg.get("repos") or {}
+    return [repo for repo in (products(cfg).get(key) or {}).get("repos") or []
+            if repo in known]
+
+
+def product_for_lane(cfg: dict, lane_id: int | None) -> str:
+    """
+    Главный продукт эпика — по дорожке на доске эпиков.
+
+    Доска эпиков общая на всю компанию, и продукт команды там выражен дорожкой.
+    Эпик в чужой дорожке тоже может прийти с тегом —
+    тогда главным считаем продукт по умолчанию, а не отказываемся работать.
+    """
+    for key, product in destinations(cfg).items():
+        if lane_id and lane_id in (product.get("epic_lanes") or []):
+            return key
+    return default_product(cfg)
+
+
+def product_profile(cfg: dict, key: str) -> dict:
+    product = products(cfg)[key]
+    repos = product_repos(cfg, key)
+    profile = make_profile(product.get("title") or key, product,
+                           repos[0] if repos else None,
+                           attach_to_debt=False, own_only=True, tag=bot_tag(cfg))
+    return {**profile, "product": key, "repos": repos,
+            "retired": bool(product.get("retired"))}
+
+
+def profile_for_product(cfg: dict, key: str | None) -> dict:
+    """Профиль продукта; неизвестный продукт — продукт по умолчанию, а не падение."""
+    if key not in destinations(cfg):
+        key = default_product(cfg)
+    return product_profile(cfg, key)
+
+
+def pick_product_repo(cfg: dict, product: str, repo: str | None) -> tuple[str, str]:
+    """
+    Продукт и репозиторий, которые агент назвал, — после проверки, что они существуют.
+
+    Агент выбирает из списка, но список ему показан текстом: бывает, что он называет
+    репозиторий соседнего продукта или выдумывает ключ. Чужой репозиторий берём
+    вместе с его продуктом — задача должна лечь на ту доску, где живёт её код.
+    """
+    choices = destinations(cfg)
+    if product not in choices:
+        owner = next((key for key in choices if repo in product_repos(cfg, key)), "")
+        product = owner or default_product(cfg)
+    repos = product_repos(cfg, product)
+    if repo not in repos:
+        owner = next((key for key in choices if repo in product_repos(cfg, key)), "")
+        if owner:
+            product, repos = owner, product_repos(cfg, owner)
+        else:
+            repo = repos[0] if repos else ""
+    return product, repo
+
+
+def repo_line(cfg: dict, product: str, repo: str) -> str:
+    """
+    Строка `repo: <ключ>` для описания карточки, если репозиторий не главный у продукта.
+
+    Исполнитель видит только карточку, а доска говорит лишь о продукте: у B2B-заказов
+    три репозитория, и без этой строки бек ушёл бы в микрофронты.
+    """
+    repos = product_repos(cfg, product)
+    return f"repo: {repo}" if repo and repos and repo != repos[0] else ""
+
+
+def scout_dirs(cfg: dict, keep: str | None = None) -> list[tuple[str, Path]]:
+    """
+    Копии всех репозиторий продуктов на чтение — для разведки и фаз эпика.
+
+    Копия та же, что у разведчика: постоянная, подтягивается к базовой ветке.
+    `keep` — репозиторий, в котором агент и так стоит, второй раз его не открываем.
+    Репозиторий, которого нет на диске, пропускаем с записью в лог: без него агент
+    обеднеет, но работать сможет, а падать из-за этого всей фазе незачем.
+    """
+    seen, found = set(), []
+    for key in destinations(cfg):
+        for repo_key in product_repos(cfg, key):
+            if repo_key in seen or repo_key == keep:
+                continue
+            seen.add(repo_key)
+            repo_cfg = cfg["repos"][repo_key]
+            repo = Path(repo_cfg["path"]).expanduser()
+            if not (repo / ".git").exists():
+                log(f"  репозитория {repo_key} нет на диске ({repo}) — агент его не увидит")
+                continue
+            try:
+                found.append((repo_key, ensure_scout_worktree(repo, repo_cfg, repo_key)))
+            except FactoryError as e:
+                log(f"  копия {repo_key} не подтянулась ({e}) — агент её не увидит")
+    return found
+
+
+def repos_note(cfg: dict, here: str, dirs: list[tuple[str, Path]]) -> str:
+    """
+    Карта продуктов и репозиториев для промпта. Без продуктов — пусто.
+
+    Агенту нужно знать не только пути, но и что где живёт: по названию
+    `site` не догадаться, фронт это или бек, а `b2b-frontend` может оказаться
+    внутренней админкой, тогда как клиентская часть живёт внутри сайта.
+    """
+    choices = destinations(cfg)
+    if not choices:
+        return ""
+    paths = dict(dirs)
+    lines = ["## Продукты и репозитории", "",
+             "Команда ведёт несколько продуктов, у каждого своя доска и свои репозитории. "
+             f"Ты стоишь в рабочей копии `{here}`. Остальные открыты тебе на чтение "
+             "по абсолютным путям — ищи и читай в них так же, как в своей, но ничего "
+             "в них не меняй.", ""]
+    for key, product in choices.items():
+        lines.append(f"- **{product.get('title') or key}** (`{key}`)")
+        for repo_key in product_repos(cfg, key):
+            about = (cfg["repos"][repo_key].get("about") or "").strip()
+            where = ("ты здесь" if repo_key == here
+                     else f"`{paths[repo_key]}`" if repo_key in paths
+                     else "копии нет — не смотри")
+            lines.append(f"  - `{repo_key}` — {about + ' — ' if about else ''}{where}")
+    return "\n".join(lines)
+
+
 def board_profiles(cfg: dict) -> list[dict]:
     """
     Доски, по которым ходят исполнитель и ревьювер.
@@ -2139,6 +2326,9 @@ def board_profiles(cfg: dict) -> list[dict]:
     с тегом. Двух профилей на одну доску быть не должно — доску обошли бы дважды,
     и в первый же обход, по правилам своей, утащили бы в работу командный бэклог.
     """
+    if products(cfg):
+        # По доске на продукт, все командные: берём только карточки с тегом
+        return [product_profile(cfg, key) for key in products(cfg)]
     tag = bot_tag(cfg)
     subtasks = ((cfg.get("epic_flow") or {}).get("subtasks") or {})
     # сабтаска уже висит дочерней на эпике: второй родитель в виде долга спринта
@@ -2588,14 +2778,27 @@ def read_project_file(path: Path, fallback: str) -> str:
     return text.strip() or fallback
 
 
-def project_replacements() -> dict:
+def project_file(repo_key: str | None, name: str) -> Path:
+    """
+    Файл правил под репозиторий: `project/<ключ>/<имя>`, а нет его — общий `project/<имя>`.
+
+    Пока репозиторий был один, правила лежали прямо в `project/`. Когда их стало шесть,
+    общий файл перестал подходить: правила фронта в промпте агента, который пишет
+    бек на C#, — это не правила, а шум, и ревьювер начал бы требовать `*.spec.ts`
+    от проекта на xUnit. Общий файл остаётся для тех, у кого репозиторий один.
+    """
+    own = PROJECT_DIR / repo_key / name if repo_key else None
+    return own if own and own.is_file() else PROJECT_DIR / name
+
+
+def project_replacements(repo_key: str | None = None) -> dict:
     return {
         "{{PROJECT_DOCS}}": read_project_file(
-            PROJECT_DOCS_PATH,
+            project_file(repo_key, PROJECT_DOCS_PATH.name),
             "- `CLAUDE.md` в корне и ближайший `AGENTS.md` к пакету, который трогаешь.\n"
             "  (Список правил проекта не заполнен — смотри, что есть в репозитории.)"),
         "{{PROJECT_CHECKLIST}}": read_project_file(
-            PROJECT_CHECKLIST_PATH,
+            project_file(repo_key, PROJECT_CHECKLIST_PATH.name),
             "Отдельного списка правил у проекта нет. Опирайся на то, что написано в файлах\n"
             "правил выше, и на общие требования: тесты на изменённую логику, отсутствие\n"
             "заглушенных линтеров и отладочных логов, объём правки по задаче."),
@@ -2636,7 +2839,7 @@ def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_u
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
         "{{RETURN_NOTE}}": FIX_NOTE if fixing else (RETURN_NOTE if returning else ""),
-        **project_replacements(),
+        **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(template, replacements)
 
@@ -2829,8 +3032,15 @@ def run_streaming(cmd: list[str], cwd: Path | str, timeout: int,
 
 
 def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
-              schema: dict | None = None, verdict_key: str = "status") -> tuple[dict, dict]:
-    """Возвращает (verdict, meta). Кидает FactoryError, если claude не отработал."""
+              schema: dict | None = None, verdict_key: str = "status",
+              add_dirs: list[Path] | None = None) -> tuple[dict, dict]:
+    """
+    Возвращает (verdict, meta). Кидает FactoryError, если claude не отработал.
+
+    `add_dirs` — соседние репозитории, открытые агенту на чтение. Разведке и фазам
+    эпика мало одного: задача про B2B-заказ живёт и в его микрофронтах, и в сайте,
+    и в беке, и решить, куда её ставить, можно только посмотрев во все.
+    """
     schema = schema or VERDICT_SCHEMA
     cmd = [
         "claude", "-p", prompt,
@@ -2849,6 +3059,8 @@ def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
         cmd += ["--effort", agent_cfg["effort"]]
     if agent_cfg.get("max_budget_usd"):
         cmd += ["--max-budget-usd", str(agent_cfg["max_budget_usd"])]
+    for extra in add_dirs or []:
+        cmd += ["--add-dir", str(extra)]
 
     env = os.environ.copy()
     # claude отказывается стартовать внутри другой сессии Claude Code
@@ -3148,7 +3360,8 @@ def resolve_repo(card: dict, cfg: dict, default_key: str | None = None) -> tuple
                       strip_html(card.get("description")) or "", re.MULTILINE | re.IGNORECASE)
     if match and match.group(1) in cfg["repos"]:
         key = match.group(1)
-    return key, cfg["repos"][key]
+    # ключ едет вместе с настройками: по нему промпт берёт правила своего репозитория
+    return key, {**cfg["repos"][key], "key": key}
 
 
 # --------------------------------------------------------------------------- #
@@ -3879,7 +4092,7 @@ def build_review_prompt(card: dict, card_url: str, repo_cfg: dict, branch: str,
         "{{PR_URL}}": pr_url or "(PR не найден)",
         "{{ROUND}}": str(round_number),
         "{{MAX_ROUNDS}}": str(max_rounds),
-        **project_replacements(),
+        **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(template, replacements)
 
@@ -4142,8 +4355,14 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
 
 def link_review_cards(kaiten: Kaiten, cfg: dict, dry_run: bool) -> int:
     """Разовая операция: привязать всё, что уже висит в «На ревью», к долгу спринта."""
-    cards = kaiten.cards_in_column(cfg["kaiten"]["board_id"],
-                                   cfg["kaiten"]["columns"]["review"])  # только рабочая доска
+    if destinations(cfg):
+        cards = [card for profile in board_profiles(cfg)
+                 for card in kaiten.cards_in_column(profile["board_id"],
+                                                    role_column(profile, "review"))
+                 if not theirs(profile, card)]
+    else:
+        cards = kaiten.cards_in_column(cfg["kaiten"]["board_id"],
+                                       cfg["kaiten"]["columns"]["review"])  # только рабочая доска
     if not cards:
         log("в «На ревью» пусто")
         return 0
@@ -4589,7 +4808,7 @@ def work_card_description(card: dict, comments: list, verdict: dict, card_url: s
     return "\n\n".join(parts)
 
 
-def handoff_profile(cfg: dict) -> dict:
+def handoff_profile(cfg: dict, product: str | None = None) -> dict:
     """
     Куда разведка ставит разобранную задачу.
 
@@ -4599,7 +4818,12 @@ def handoff_profile(cfg: dict) -> dict:
 
     Своя доска остаётся запасным вариантом: она нужна тем, у кого режима эпиков нет
     вовсе, и тому, что кладут на неё руками.
+
+    С продуктами доску выбирает разведка: какой продукт она назвала, на ту доску
+    задача и ляжет.
     """
+    if destinations(cfg):
+        return profile_for_product(cfg, product)
     target = ((cfg.get("inbox") or {}).get("target") or "subtasks").strip()
     flow = epic_flow(cfg)
     if target == "subtasks" and flow:
@@ -4617,7 +4841,12 @@ def find_work_card(kaiten: Kaiten, cfg: dict, inbox_card_id: int) -> dict | None
     Смотрим обе доски — и ту, куда ставим сейчас, и свою: задачи, поставленные
     до переезда на доску команды, никуда не делись, и ставить их второй раз нельзя.
     """
-    boards = {handoff_profile(cfg)["board_id"], cfg["kaiten"]["board_id"]}
+    if destinations(cfg):
+        # продуктовые доски, включая ту, с которой команда уехала: задача, поставленная
+        # до переезда, никуда не делась, и ставить её второй раз нельзя
+        boards = {profile["board_id"] for profile in board_profiles(cfg)}
+    else:
+        boards = {handoff_profile(cfg)["board_id"], cfg["kaiten"]["board_id"]}
     for board_id in boards:
         for candidate in kaiten.cards_on_board(board_id, with_description=True):
             found = INBOX_ORIGIN_RE.search(strip_html(candidate.get("description")))
@@ -4660,12 +4889,20 @@ def hand_off_to_factory(kaiten: Kaiten, cfg: dict, card: dict, comments: list,
             note = link_as_child(kaiten, card["id"], existing["id"])
             return f"Задача по этой карточке уже стоит: {kaiten.card_url(existing)}{note}"
 
-        profile = handoff_profile(cfg)
+        description = work_card_description(card, comments, verdict, card_url)
+        product = ""
+        if destinations(cfg):
+            product, repo = pick_product_repo(cfg, verdict.get("product") or "",
+                                              verdict.get("repo"))
+            line = repo_line(cfg, product, repo)
+            if line:
+                description += f"\n\n{line}"
+        profile = handoff_profile(cfg, product)
         body = {
             "board_id": profile["board_id"],
             "column_id": role_column(profile, "queue"),
             "title": (card.get("title") or "").strip() or f"Задача из инбокса #{card['id']}",
-            "description": work_card_description(card, comments, verdict, card_url),
+            "description": description,
         }
         if profile.get("lane_id"):
             body["lane_id"] = profile["lane_id"]
@@ -4691,7 +4928,8 @@ def hand_off_to_factory(kaiten: Kaiten, cfg: dict, card: dict, comments: list,
                            f"повесь руками, иначе я эту задачу не увижу.")
         log(f"  задача поставлена: #{created['id']} в «Очередь» ({profile['key']})")
         note = link_as_child(kaiten, card["id"], created["id"])
-        return f"{HANDOFF_LINE} #{created['id']} — {kaiten.card_url(created)}{note}"
+        where = f" (доска «{profile['key']}»)" if destinations(cfg) else ""
+        return f"{HANDOFF_LINE} #{created['id']} — {kaiten.card_url(created)}{where}{note}"
     except Exception as e:  # noqa: BLE001 — постановка не важнее уже сделанной разведки
         log(f"  !! не смог поставить задачу: {e}")
         return f"⚠️ Не смог поставить задачу на доску: {str(e)[:200]}"
@@ -4714,9 +4952,20 @@ def report_to_inbox(kaiten: Kaiten, card: dict, pr_url: str) -> None:
         log(f"  !! не смог отчитаться в инбокс #{origin}: {e}")
 
 
+# Поля ответа разведки, когда у команды несколько продуктов. Вставляются в описание
+# формата ответа рядом с остальными полями.
+TRIAGE_PRODUCT_FIELDS = """- `product` — на доску какого продукта ставить задачу, из списка продуктов выше. Выбирай
+  по тому, где живёт код, который придётся менять, а не по словам в заголовке.
+- `repo` — в каком репозитории исполнитель будет писать код. Задача, которой нужны
+  два репозитория (фронт и бек), — всё равно один `repo`: тот, где основная работа,
+  а про вторую часть напиши в `plan`. Оба поля заполняй при любом вердикте."""
+
+
 def build_triage_prompt(card: dict, comments: list, card_url: str, repo_key: str,
-                        repo_cfg: dict, round_number: int) -> str:
+                        repo_cfg: dict, round_number: int, cfg: dict | None = None,
+                        extra_dirs: list[tuple[str, Path]] | None = None) -> str:
     template = TRIAGE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    many = bool(cfg and destinations(cfg))
     replacements = {
         "{{CARD_ID}}": str(card["id"]),
         "{{CARD_URL}}": card_url,
@@ -4728,7 +4977,9 @@ def build_triage_prompt(card: dict, comments: list, card_url: str, repo_key: str
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
         "{{ROUND_NOTE}}": TRIAGE_ROUND_NOTE if round_number > 1 else "",
-        **project_replacements(),
+        "{{REPOS}}": repos_note(cfg, repo_key, extra_dirs or []) if many else "",
+        "{{PRODUCT_FIELDS}}": TRIAGE_PRODUCT_FIELDS if many else "",
+        **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(template, replacements)
 
@@ -4784,7 +5035,8 @@ def comment_triage_stuck(fails: int, error: str) -> str:
 
 
 def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
-                scouts: dict[str, Path], round_number: int) -> None:
+                scouts: dict[str, Path], round_number: int,
+                neighbours: list[tuple[str, Path]] | None = None) -> None:
     card_id = card_stub["id"]
     # в выдаче по колонке нет чек-листов, поэтому берём карточку целиком
     card = kaiten.card(card_id)
@@ -4799,12 +5051,18 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
     if wait:
         log(f"#{card_id} откладываю: {wait}")
         return
-    repo_key, repo_cfg = resolve_repo(card, cfg)
+    many = bool(destinations(cfg))
+    repo_key, repo_cfg = resolve_repo(
+        card, cfg, (product_repos(cfg, default_product(cfg)) or [None])[0] if many else None)
 
     round_note = f", круг {round_number}" if round_number > 1 else ""
     log(f"#{card_id} «{title[:60]}» — разведка{round_note}")
 
-    prompt = build_triage_prompt(card, comments, card_url, repo_key, repo_cfg, round_number)
+    # Инбокс общий на все продукты, и чей он, разведка узнаёт только посмотрев в код
+    extra_dirs = [(key, path) for key, path in neighbours or [] if key != repo_key]
+
+    prompt = build_triage_prompt(card, comments, card_url, repo_key, repo_cfg, round_number,
+                                 cfg, extra_dirs)
     if args.prompt_only:
         print("\n" + "=" * 78)
         print(prompt)
@@ -4827,7 +5085,9 @@ def triage_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args,
     worktree = scouts[repo_key]
 
     write_status(phase="разведка инбокса")
-    verdict, meta = run_agent(prompt, worktree, cfg["triager"], schema=TRIAGE_SCHEMA)
+    verdict, meta = run_agent(prompt, worktree, cfg["triager"],
+                              schema=with_products(TRIAGE_SCHEMA, cfg, required=False),
+                              add_dirs=[path for _, path in extra_dirs])
     note_spend(meta)
 
     LOGS.mkdir(exist_ok=True)
@@ -4897,10 +5157,19 @@ def triage_inbox(kaiten: Kaiten, cfg: dict, args, only_card: int | None = None) 
         write_status(inbox_pending=pending)
 
     scouts: dict[str, Path] = {}
+    # Соседние репозитории — раз на прогон, а не на карточку: git fetch шести
+    # репозиториев на каждую карточку — лишняя минута, а копии от этого не свежее
+    neighbours: list[tuple[str, Path]] = []
+    if destinations(cfg) and targets:
+        if not args.prompt_only:
+            write_status(phase="готовлю копии для разведки")
+        neighbours = scout_dirs(cfg)
+        # своя копия разведки — та же, что у соседей: второй раз её не подтягиваем
+        scouts.update(neighbours)
     done = 0
     for card, round_number in targets:
         try:
-            triage_card(card, kaiten, cfg, args, scouts, round_number)
+            triage_card(card, kaiten, cfg, args, scouts, round_number, neighbours)
             forget_triage_fail(state, card["id"])
             done += 1
         except ScoutSetupError as e:
@@ -5013,7 +5282,9 @@ def epic_flow(cfg: dict) -> dict | None:
     разработчика не бывает отдельного имени для эпиков.
     """
     flow = cfg.get("epic_flow") or {}
-    if not (flow.get("boards") and flow.get("subtasks", {}).get("board_id")):
+    # сабтаскам нужна доска: либо одна на всё, либо по доске на продукт
+    if not (flow.get("boards") and (flow.get("subtasks", {}).get("board_id")
+                                    or destinations(cfg))):
         return None
     return {**flow, "tag": flow.get("tag") or bot_tag(cfg)}
 
@@ -5182,24 +5453,28 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
     if not own:
         return "decompose"
 
-    profile = subtask_profile(cfg, flow)
-    review_column = role_column(profile, "review")
-    done_column = role_column(profile, "done")
+    # Сабтаски одного эпика могут лежать на разных досках — по доске на продукт,
+    # — и колонки ревью и «Готово» у каждой доски свои
+    fallback = subtask_profile(cfg, flow)
+    profiles = board_profiles(cfg)
     finished = 0
     for child in own:
+        profile = profile_for_board(profiles, child.get("board_id")) or fallback
         column = child.get("column_id")
-        if column == done_column:
+        if column == role_column(profile, "done"):
             finished += 1
-        elif column == review_column and blocked_by(kaiten, child["id"]):
+        elif column == role_column(profile, "review") and blocked_by(kaiten, child["id"]):
             # в колонке ревью с блокером — агентское ревью пройдено, дальше человек
             finished += 1
     log(f"  сабтасок {len(own)}, отревьюено {finished}")
     return "closing" if finished == len(own) else "working"
 
 
-def subtask_profile(cfg: dict, flow: dict) -> dict:
+def subtask_profile(cfg: dict, flow: dict, product: str | None = None) -> dict:
     # own_only — как в board_profiles: доска командная, и правила у неё одни, с какой
     # бы стороны за профилем ни пришли. Разные правила на одну доску — готовая ловушка
+    if destinations(cfg):
+        return profile_for_product(cfg, product)
     subtasks = flow["subtasks"]
     return make_profile("сабтаски", subtasks, subtasks.get("repo"), attach_to_debt=False,
                         own_only=True, tag=bot_tag(cfg))
@@ -5260,6 +5535,31 @@ MOCK_BACKEND_NOTE = ("⚠️ **Нельзя раскатывать и включ
                      "Фронт работает на моке.")
 
 
+# Фазы эпика, в которых работает агент: только им нужны соседние репозитории.
+# Остальные — проверки по Kaiten, и тянуть ради них все репозитории незачем.
+# `spec_settle` агента не зовёт, а сразу передаёт эпик в декомпозицию — та и подтянет.
+EPIC_AGENT_PHASES = ("acceptance", "spec", "spec_fix", "spec_review", "decompose")
+
+# Врезка в промпт декомпозиции, когда у команды несколько продуктов. Схема ответа
+# и так требует `product` и `repo`; здесь — как их выбирать.
+DECOMPOSE_PRODUCTS_NOTE = """
+## Куда ставить сабтаски
+
+У каждой сабтаски два обязательных поля: `product` — на чью доску она ляжет, и `repo` —
+в каком репозитории исполнитель будет писать код. Выбирай из списка продуктов выше,
+по тому, **где живёт код**, а не по тому, про какой продукт эпик: правка B2B-чекаута
+на сайте — это продукт B2B, если код лежит в его репозитории, и продукт сайта, если
+в репозитории сайта.
+
+Правило «один репозиторий — одна сабтаска» здесь работает так же: эпик, задевший два
+продукта, — это две сабтаски, по одной на репозиторий, и каждая мержится сама.
+
+Ветка со спекой есть только в репозитории, где ты сейчас стоишь. Сабтаска в другом
+репозитории спеки под рукой не имеет — переложи в её описание всё, что ей нужно из спеки,
+и ссылку на PR спеки словами «подробности в спеке».
+"""
+
+
 def epic_prompt(path: Path, card: dict, card_url: str, repo_cfg: dict,
                 extra: dict | None = None) -> str:
     replacements = {
@@ -5269,8 +5569,10 @@ def epic_prompt(path: Path, card: dict, card_url: str, repo_cfg: dict,
         "{{DESCRIPTION}}": strip_html(card.get("description")) or "(описания нет)",
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
+        "{{REPOS}}": "",
+        "{{PRODUCT_RULES}}": "",
         **(extra or {}),
-        **project_replacements(),
+        **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(path.read_text(encoding="utf-8"), replacements)
 
@@ -5343,8 +5645,10 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
 
     Бек не блокирует фронт: фронт делается сразу, на моке, а блокер вешается только
     на раскатку. Иначе половина работы простаивала бы, ожидая чужую команду.
+
+    С продуктами сабтаска ложится на доску того продукта, который назвал агент, —
+    эпик про B2B-заказ, задевший сайт, становится двумя карточками на двух досках.
     """
-    profile = subtask_profile(cfg, flow)
     limit = flow.get("max_subtasks", 5)
     if len(items) > limit:
         log(f"  сабтасок {len(items)}, беру первые {limit} — остальное человеку")
@@ -5359,18 +5663,28 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
 
     created, backend = [], [i for i in items if i.get("kind") == "backend"]
     for item in items:
+        if destinations(cfg):
+            product, repo = pick_product_repo(cfg, item.get("product") or "",
+                                              item.get("repo"))
+            item = {**item, "product": product, "repo": repo}
+        profile = subtask_profile(cfg, flow, item.get("product"))
+        description = subtask_description(epic, epic_url, item, spec_note)
+        line = repo_line(cfg, item.get("product") or "", item.get("repo") or "")
+        if line:
+            description += f"\n\n{line}"
         body = {
             "board_id": profile["board_id"],
             "column_id": role_column(profile, "queue"),
             "title": item["title"].strip(),
-            "description": subtask_description(epic, epic_url, item, spec_note),
+            "description": description,
         }
         if profile.get("lane_id"):
             body["lane_id"] = profile["lane_id"]
         if profile.get("card_type_id"):
             body["type_id"] = profile["card_type_id"]
+        where = (f", {profile['key']} / {item.get('repo')}" if item.get("product") else "")
         if args.dry_run:
-            log(f"  [dry-run] сабтаска «{item['title'][:50]}» ({item.get('kind')})")
+            log(f"  [dry-run] сабтаска «{item['title'][:50]}» ({item.get('kind')}{where})")
             continue
         card = kaiten.create_card(body)
         if not card:
@@ -5388,16 +5702,23 @@ def create_subtasks(kaiten: Kaiten, cfg: dict, flow: dict, epic: dict, epic_url:
             kaiten.add_tag(card["id"], night_tag)
             log("    ночной тег унаследован от эпика")
         created.append((card, item))
-        log(f"  + #{card['id']} «{item['title'][:50]}» ({item.get('kind')})")
+        log(f"  + #{card['id']} «{item['title'][:50]}» ({item.get('kind')}{where})")
 
     # блокер раскатки — на фронт, который сделан на моке
+    backend_card = next((c for c, i in created if i.get("kind") == "backend"), None)
     for card, item in created:
         if item.get("mocks_backend"):
-            detail = (f"бек #{created[0][0]['id']}" if backend and created
+            detail = (f"бек #{backend_card['id']}" if backend and backend_card
                       else "бек ещё не готов")
             hold(kaiten, card["id"], BLOCK_ROLLOUT, detail)
 
-    lines = "\n".join(f"- #{c['id']} {i['title']} ({i.get('kind')})" for c, i in created)
+    def place(item: dict) -> str:
+        if not item.get("product"):
+            return item.get("kind") or ""
+        title = (destinations(cfg).get(item["product"]) or {}).get("title") or item["product"]
+        return f"{title}, {item.get('repo')}"
+
+    lines = "\n".join(f"- #{c['id']} {i['title']} ({place(i)})" for c, i in created)
     text = (f"{EPIC_MARK} **{SUBTASKS_LINE}**\n\n{lines or '(в dry-run не создавал)'}\n\n"
             f"{verdict.get('summary', '')}")
     if any(i.get("mocks_backend") for _, i in created):
@@ -5503,7 +5824,18 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
     card_id = card["id"]
     card_url = kaiten.card_url(card)
     title = (card.get("title") or "").strip()
-    repo_key, repo_cfg = resolve_repo(card, cfg, (flow.get("subtasks") or {}).get("repo"))
+    # Спека живёт в репозитории главного продукта — его даёт дорожка эпика. Остальные
+    # репозитории агент видит на чтение: эпик про B2B-заказ задевает и сайт, и бек,
+    # и разложить его по доскам можно, только заглянув во все.
+    if destinations(cfg):
+        product = product_for_lane(cfg, card.get("lane_id"))
+        main_repo = (product_repos(cfg, product) or [None])[0]
+    else:
+        main_repo = (flow.get("subtasks") or {}).get("repo")
+    repo_key, repo_cfg = resolve_repo(card, cfg, main_repo)
+    extra_dirs = (scout_dirs(cfg, keep=repo_key)
+                  if destinations(cfg) and phase in EPIC_AGENT_PHASES else [])
+    repos_block = {"{{REPOS}}": repos_note(cfg, repo_key, extra_dirs)}
     agent_cfg = {**cfg["triager"], **(flow.get("agent") or {})}
     unanswered_note = (UNANSWERED_NOTE.format(
         questions="\n".join(f"- {q}" for q in unanswered)) if unanswered else "")
@@ -5513,11 +5845,12 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
         worktree = epic_worktree(kaiten, cfg, repo_cfg, repo_key, card_id, writable=False)
         prompt = epic_prompt(ACCEPTANCE_TEMPLATE_PATH, card, card_url, repo_cfg,
                              {"{{COMMENTS}}": format_comments(comments),
-                              "{{UNANSWERED}}": unanswered_note})
+                              "{{UNANSWERED}}": unanswered_note, **repos_block})
         if show_prompt(prompt, args, "приёмочных критериев"):
             return
         note_phase(args, "эпик: пишу приёмочные критерии")
-        verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=ACCEPTANCE_SCHEMA)
+        verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=ACCEPTANCE_SCHEMA,
+                                  add_dirs=[path for _, path in extra_dirs])
         note_spend(meta)
         log_phase(card_id, "acceptance", verdict, meta)
 
@@ -5547,11 +5880,13 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             "{{REVIEW_NOTES}}": (fetch_pr_notes(worktree, spec_pr_url(comments))
                                  if fixing else ""),
             "{{UNANSWERED}}": unanswered_note,
+            **repos_block,
         })
         if show_prompt(prompt, args, "правки спеки" if fixing else "спеки"):
             return
         note_phase(args, "эпик: правлю спеку" if fixing else "эпик: пишу спеку")
-        verdict, meta = run_agent(prompt, worktree, cfg["agent"], schema=SPEC_SCHEMA)
+        verdict, meta = run_agent(prompt, worktree, cfg["agent"], schema=SPEC_SCHEMA,
+                                  add_dirs=[path for _, path in extra_dirs])
         note_spend(meta)
         log_phase(card_id, "spec", verdict, meta)
 
@@ -5616,12 +5951,14 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
                                         for i in acceptance_items(card)),
             "{{SPEC_BRANCH}}": f"{branch_prefix(cfg)}{card_id}-spec",
             "{{UNANSWERED}}": unanswered_note,
+            **repos_block,
         })
         if show_prompt(prompt, args, "ревью спеки"):
             return
         note_phase(args, "эпик: ревьювер смотрит спеку")
         review, meta = run_agent(prompt, worktree, cfg["reviewer"],
-                                 schema=SPEC_REVIEW_SCHEMA, verdict_key="verdict")
+                                 schema=SPEC_REVIEW_SCHEMA, verdict_key="verdict",
+                                 add_dirs=[path for _, path in extra_dirs])
         note_spend(meta)
         log_phase(card_id, "spec-review", review, meta)
 
@@ -5691,11 +6028,15 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             "{{SPEC_BRANCH}}": f"{branch_prefix(cfg)}{card_id}-spec",
             "{{MAX_SUBTASKS}}": str(flow.get("max_subtasks", 5)),
             "{{UNANSWERED}}": unanswered_note,
+            "{{PRODUCT_RULES}}": DECOMPOSE_PRODUCTS_NOTE if destinations(cfg) else "",
+            **repos_block,
         })
         if show_prompt(prompt, args, "декомпозиции"):
             return
         note_phase(args, "эпик: раскладываю на сабтаски")
-        verdict, meta = run_agent(prompt, worktree, agent_cfg, schema=DECOMPOSE_SCHEMA)
+        verdict, meta = run_agent(prompt, worktree, agent_cfg,
+                                  schema=with_products(DECOMPOSE_SCHEMA, cfg, "subtasks"),
+                                  add_dirs=[path for _, path in extra_dirs])
         note_spend(meta)
         log_phase(card_id, "decompose", verdict, meta)
 
@@ -5846,6 +6187,14 @@ def close_epic(kaiten: Kaiten, flow: dict, card: dict) -> str:
     разработки». Если её выставили в конфиге — уважаем конфиг.
     """
     card_id = card["id"]
+    if flow.get("stay_on_close"):
+        # На доске эпиков бывает, что справа от разработки ревью нет вовсе: там сразу
+        # «Rollout». Отревьюенные агентом сабтаски — это ещё не раскатка, их PR ждут
+        # человека, — поэтому эпик остаётся на месте, а фабрика просто отпускает его,
+        # сняв тег. Дальше по колонкам его двигает человек.
+        log("  все сабтаски отревьюены — эпик оставляю в колонке, снимаю тег")
+        return (f"{EPIC_MARK} **Все сабтаски отревьюены.** Эпик оставил в колонке: "
+                f"дальше его ведёшь ты." + drop_work_tag(kaiten, flow, card))
     order = column_order(kaiten, card["board_id"])
     target = flow.get("review_column_id")
     if not target:
