@@ -325,12 +325,22 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         // -ilc: интерактивный логин-шелл. Только он даёт то же окружение, что и терминал:
         // nvm-версию node и NPM_TOKEN из .zshrc, без которых агент не соберёт фронт.
         process.arguments = ["-ilc", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // Вывод сохраняем, а не выбрасываем: только в нём написано, почему прогон упал.
+        // Сюда же попадает и то, что run.sh говорит до питона, мимо logs/run.log.
+        // Именно в файл, а не в трубу: труба умирает вместе с приложением, и
+        // пересборка посреди прогона убила бы его на первой же строке лога.
+        let outputURL = root.appendingPathComponent("state/last-run.out")
+        try? FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        let output = (try? FileHandle(forWritingTo: outputURL)) ?? FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = output
 
         process.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
                 guard let self else { return }
+                try? output.close()
                 self.runner = nil
                 self.pollTimer?.invalidate()
                 self.pollTimer = nil
@@ -345,7 +355,8 @@ final class Fabrica: NSObject, NSApplicationDelegate {
                     self.lastError = "прогон уже идёт — этот запуск пропущен"
                 } else if proc.terminationStatus != 0
                             && proc.terminationReason != .uncaughtSignal {
-                    self.lastError = "run.sh завершился с кодом \(proc.terminationStatus)"
+                    self.lastError = self.failureReason(code: proc.terminationStatus,
+                                                         output: Self.tail(of: outputURL))
                 }
                 if proc.terminationStatus == 0 { self.skipRetries = 0 }
                 self.readStatusFile()
@@ -375,6 +386,52 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         RunLoop.main.add(poll, forMode: .common)
         pollTimer = poll
         redraw()
+    }
+
+    /// Последние килобайты файла. Хватает с запасом на трейсбек питона, а обрезанная
+    /// первая строка ничему не мешает: причину ищем с конца.
+    private static func tail(of url: URL) -> Data {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > 8_192 ? size - 8_192 : 0)
+        return (try? handle.readToEnd()) ?? Data()
+    }
+
+    /// Почему прогон упал — словами из его же вывода, а не кодом выхода.
+    private func failureReason(code: Int32, output: Data) -> String {
+        let lines = String(decoding: output, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map { line -> String in
+                var text = line.trimmingCharacters(in: .whitespaces)
+                // «[13:16:53] » — время из log() питона, в меню оно лишнее
+                if let stamp = text.range(of: #"^\[\d\d:\d\d:\d\d\]\s*"#,
+                                          options: .regularExpression) {
+                    text.removeSubrange(stamp)
+                }
+                return text
+            }
+            .filter { !$0.isEmpty }
+
+        // Питон упал непойманным исключением: суть — в последней строке трейсбека
+        if lines.contains("Traceback (most recent call last):"), let last = lines.last {
+            return last
+        }
+        if let fatal = lines.last(where: { $0.hasPrefix("фатально: ") }) {
+            return String(fatal.dropFirst("фатально: ".count))
+        }
+        // Больше 128 — питона убили сигналом, и его последняя строка — это не
+        // причина, а то, на чём он остановился
+        if code > 128 {
+            let signal: String
+            switch code - 128 {
+            case 9: signal = "убит (SIGKILL) — похоже, кончилась память"
+            case 15: signal = "остановлен (SIGTERM)"
+            default: signal = "убит сигналом \(code - 128)"
+            }
+            return "прогон \(signal)" + (lines.last.map { ", на шаге «\($0)»" } ?? "")
+        }
+        return lines.last ?? "прогон упал молча, код \(code) — подробности в logs/run.log"
     }
 
     /// Kaiten промолчал — возвращаемся к этому же прогону через несколько минут.
@@ -608,7 +665,10 @@ final class Fabrica: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         if let error = lastError {
-            menu.addItem(disabled("   ⚠️ \(truncate(error, 50))"))
+            // Причина бывает длинной — целиком она в подсказке, а по клику открывается лог
+            let item = action("   ⚠️ \(truncate(error, 50))", #selector(openLog))
+            item.toolTip = error + "\n\nНажми — откроется logs/run.log"
+            menu.addItem(item)
         }
         // Протухшая авторизация — единственная поломка, которая валит фабрику целиком:
         // ни одна карточка не поедет, пока человек не войдёт заново. Раньше это было
