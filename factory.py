@@ -702,12 +702,19 @@ class Kaiten:
         """
         return self._request("GET", f"/boards/{board_id}")
 
-    def cards_on_board(self, board_id: int, with_description: bool = False) -> list:
-        """Все живые карточки доски. API отдаёт максимум 100 за раз."""
+    def cards_on_board(self, board_id: int, with_description: bool = False,
+                       lane_id: int | None = None) -> list:
+        """
+        Все живые карточки доски, а с `lane_id` — одной её дорожки: доска эпиков
+        общая на всю компанию, и тянуть её целиком ради своей дорожки незачем.
+        API отдаёт максимум 100 за раз.
+        """
         found, offset = [], 0
         while True:
             params = {"board_id": board_id, "archived": "false", "condition": 1,
                       "limit": 100, "offset": offset}
+            if lane_id:
+                params["lane_id"] = lane_id
             if with_description:
                 params["additional_card_fields"] = "description"
             page = self._request("GET", "/cards", params=params) or []
@@ -3523,6 +3530,192 @@ def attach_to_debt_card(kaiten: Kaiten, cfg: dict, card_id: int, dry_run: bool) 
     except Exception as e:  # noqa: BLE001 — привязка не важнее уже созданного PR
         log(f"  !! не смог привязать к карточке долга: {e}")
         return f"\n\n⚠️ Не смог привязать к карточке долга спринта: {str(e)[:200]}"
+
+
+# --------------------------------------------------------------------------- #
+# техдолг спринта: задачи спринта без эпика
+# --------------------------------------------------------------------------- #
+
+def sprint_bounds(anchor: date, days: int, today: date | None = None) -> tuple[date, date]:
+    """
+    Первый и последний рабочий день спринта, в который попадает сегодняшний день.
+
+    Выходные в хвосте не считаем: спринт с понедельника 05.10 команда называет
+    «05.10–16.10», а не «05.10–18.10», и эпик с другими датами фабрика бы не узнала.
+    """
+    today = today or date.today()
+    start = anchor + timedelta(days=((today - anchor).days // days) * days)
+    end = start + timedelta(days=days - 1)
+    while end.weekday() >= 5 and end > start:
+        end -= timedelta(days=1)
+    return start, end
+
+
+def short_dates(start: date, end: date) -> str:
+    return f"{start:%d.%m}–{end:%d.%m}"
+
+
+def tech_debt_sections(cfg: dict) -> list[tuple[str, dict, dict]]:
+    """
+    Продукты, у которых задачи спринта без эпика собираются в «Техдолг спринта».
+
+    Секция живёт в продукте, а не наверху: у каждого продукта своя спринт-доска
+    и своя дорожка на доске эпиков. Уходящую доску не обходим — её спринт кончился.
+    """
+    return [(key, product, product["sprint_tech_debt"])
+            for key, product in destinations(cfg).items()
+            if product.get("sprint_tech_debt")]
+
+
+def done_before(card: dict, start: date) -> bool:
+    """
+    Карточка закрыта до начала спринта — она из прошлого, и в нынешний техдолг
+    ей не место. «Готово» на спринт-доске копится, пока его не заархивируют руками.
+    """
+    if card.get("state") != 3:
+        return False
+    stamp = parse_stamp(card.get("last_moved_to_done_at") or card.get("completed_at"))
+    return bool(stamp) and stamp.astimezone().date() < start
+
+
+def epic_parent(kaiten: Kaiten, card: dict, epic_boards: set, cache: dict) -> int | None:
+    """
+    Родитель-эпик карточки, если он есть.
+
+    Родитель бывает и не эпиком: задача из инбокса висит на своей карточке инбокса,
+    и к эпику она от этого не привязана. Эпик узнаём по доске родителя; родителей
+    на спринт-доске немного, поэтому по каждому ходим раз за прогон.
+    """
+    for parent_id in card.get("parents_ids") or []:
+        if parent_id not in cache:
+            try:
+                cache[parent_id] = kaiten.card(parent_id).get("board_id")
+            except NotFoundError:
+                cache[parent_id] = None
+        if cache[parent_id] in epic_boards:
+            return parent_id
+    return None
+
+
+def previous_debt_card(kaiten: Kaiten, debt: dict) -> dict | None:
+    """Самый свежий «Техдолг спринта» в дорожке — образец для нового."""
+    head = normalize_title(debt["title_prefix"])
+    found = [card for card in kaiten.cards_on_board(debt["board_id"], lane_id=debt["lane_id"])
+             if re.match(rf"{re.escape(head)}\b", normalize_title(card.get("title", "")))]
+    if not found:
+        return None
+    latest = max(found, key=lambda card: card.get("created") or "")
+    return kaiten.card(latest["id"])
+
+
+def debt_properties(props: dict, old: str, new: str) -> dict:
+    """
+    Поля прошлого техдолга с датами нового спринта.
+
+    Обязательные поля эпика без них Kaiten не примет, а придумывать их фабрике не
+    из чего — поэтому копируем у прошлого. Пользователи в выдаче списка приходят
+    объектами, а принимаются номерами.
+    """
+    result = {}
+    for key, value in (props or {}).items():
+        if isinstance(value, str) and old:
+            value = value.replace(old, new)
+        elif isinstance(value, list):
+            value = [item["id"] if isinstance(item, dict) and "id" in item else item
+                     for item in value]
+        result[key] = value
+    return result
+
+
+def ensure_tech_debt(kaiten: Kaiten, product: dict, debt: dict, dry_run: bool) -> dict:
+    """
+    «Техдолг спринта <даты>» в дорожке продукта: найденный или только что созданный.
+
+    Найденный не двигаем и не правим — это эпик команды, его ведут люди. Новый
+    заводим по образцу прошлого: те же поля и описание, только даты свои.
+    """
+    start, end = sprint_bounds(date.fromisoformat(debt["sprint_anchor"]), debt["sprint_days"])
+    label = short_dates(start, end)
+    for card in kaiten.cards_on_board(debt["board_id"], lane_id=debt["lane_id"]):
+        if is_debt_card(card.get("title", ""), label, debt["title_prefix"]):
+            return card
+
+    title = f"{debt['title_prefix']}{label}"
+    template = previous_debt_card(kaiten, debt)
+    old = ""
+    if template:
+        match = re.search(r"\d\d\.\d\d\s*[—–-]\s*\d\d\.\d\d", template.get("title") or "")
+        old = match.group(0) if match else ""
+        log(f"  техдолга на {label} нет — завожу «{title}» по образцу #{template['id']}")
+    else:
+        log(f"  техдолга на {label} нет — завожу «{title}»")
+    description = (template or {}).get("description") or (
+        f"Задачи спринта {label} на доске «{product.get('title') or ''}», у которых нет "
+        "своего продуктового эпика: баги, мелкие доработки, инфраструктура.")
+    body = {
+        "board_id": debt["board_id"],
+        "column_id": debt["column_id"],
+        "lane_id": debt["lane_id"],
+        "type_id": debt.get("card_type_id") or (template or {}).get("type_id"),
+        "title": title,
+        "description": description.replace(old, label) if old else description,
+        "properties": debt_properties((template or {}).get("properties"), old, label),
+    }
+    if dry_run:
+        log("  [dry-run] карточку не создаю")
+        return {"id": 0, "title": title}
+    created = kaiten.create_card({k: v for k, v in body.items() if v})
+    log(f"  создан #{created['id']}")
+    return created
+
+
+def link_sprint_orphans(kaiten: Kaiten, cfg: dict, args) -> int:
+    """
+    Вешает задачи спринта без эпика на «Техдолг спринта».
+
+    Каждая задача спринта должна быть к чему-то привязана, иначе в планировании её
+    не видно. Задачи без продуктового эпика — баги, фиксы, мелочь из инбокса —
+    собираются в техдолг текущего спринта. Агента тут нет: это обход доски и пара
+    запросов, поэтому он ходит вместе с разведкой инбокса раз в несколько минут.
+    """
+    linked = 0
+    for key, product, debt in tech_debt_sections(cfg):
+        start, _ = sprint_bounds(date.fromisoformat(debt["sprint_anchor"]),
+                                 debt["sprint_days"])
+        epic_boards = {debt["board_id"], *((epic_flow(cfg) or {}).get("boards") or [])}
+        cache: dict = {}
+        orphans = []
+        for card in kaiten.cards_on_board(product["board_id"], with_description=True):
+            if done_before(card, start) or epic_parent(kaiten, card, epic_boards, cache):
+                continue
+            if hands_off(card, kaiten.comments(card["id"]), cfg):
+                log(f"  #{card['id']} просили не трогать — в техдолг не вешаю")
+                continue
+            orphans.append(card)
+        where = product.get("title") or key
+        if not orphans:
+            log(f"в спринте «{where}» все задачи при эпиках")
+            continue
+        log(f"в спринте «{where}» без эпика: {len(orphans)}")
+        parent = ensure_tech_debt(kaiten, product, debt, args.dry_run)
+        for card in orphans:
+            if args.dry_run:
+                log(f"  [dry-run] #{card['id']} «{card['title'][:60]}» → «{parent['title']}»")
+                continue
+            kaiten.add_child(parent["id"], card["id"])
+            log(f"  #{card['id']} «{card['title'][:60]}» → #{parent['id']} «{parent['title']}»")
+            linked += 1
+    return linked
+
+
+def sweep_sprint_orphans(kaiten: Kaiten, cfg: dict, args) -> None:
+    """Обход техдолга, который не роняет прогон: он про порядок, а не про работу."""
+    if args.prompt_only or not tech_debt_sections(cfg):
+        return
+    try:
+        link_sprint_orphans(kaiten, cfg, args)
+    except Exception as e:  # noqa: BLE001 — привязка к эпику не важнее разведки
+        log(f"привязка к техдолгу спринта не задалась: {e}")
 
 
 PR_TEMPLATE_PATHS = [
@@ -6471,6 +6664,8 @@ def main() -> int:
                         help="только разведка инбокса: посмотреть новые карточки и выйти")
     parser.add_argument("--no-triage", action="store_true",
                         help="пропустить разведку инбокса")
+    parser.add_argument("--only-debt", action="store_true",
+                        help="только привязать задачи спринта без эпика к техдолгу и выйти")
     parser.add_argument("--triage-card", type=int,
                         help="разведать конкретную карточку инбокса по id")
     parser.add_argument("--only-epics", action="store_true",
@@ -6587,8 +6782,17 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
 
     if args.triage_card:
         return triage_inbox(kaiten, cfg, args, only_card=args.triage_card)
+    if args.only_debt:
+        sweep_sprint_orphans(kaiten, cfg, args)
+        return 0
     if args.only_triage:
-        return triage_inbox(kaiten, cfg, args)
+        # Техдолг ходит вместе с инбоксом: оба дешёвые и про то, чтобы ни одна задача
+        # не висела ничьей. После разведки — она могла только что поставить задачу
+        # в спринт, и та сразу ляжет в техдолг, а не через круг
+        try:
+            return triage_inbox(kaiten, cfg, args)
+        finally:
+            sweep_sprint_orphans(kaiten, cfg, args)
     if args.epic_card:
         return run_epics(kaiten, cfg, args, only_card=args.epic_card)
     if args.only_epics:
@@ -6630,6 +6834,7 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
             raise
         except Exception as e:  # noqa: BLE001 — чужая доска не должна ронять основной поток
             log(f"разведка инбокса не задалась: {e}")
+        sweep_sprint_orphans(kaiten, cfg, args)
 
     # Эпики следующими: почти всегда это дешёвая проверка — висит ли наш блокер, все ли
     # сабтаски отревьюены. Агент запускается, только когда фаза действительно сменилась.

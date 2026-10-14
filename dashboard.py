@@ -1471,8 +1471,10 @@ def start_run(mode: str, card: int = 0, epic: bool = False, dry: bool = False) -
     command = f"cd {shell_quote(str(factory.ROOT))} && ./run.sh " + " ".join(flags)
     # -ilc: интерактивный логин-шелл. Только он даёт агенту то же окружение, что
     # и терминал — версию node из nvm и NPM_TOKEN из ~/.zshrc
+    # Кнопка — явная просьба, поэтому проходит и сквозь паузу из меню-бара
     subprocess.Popen(["/bin/zsh", "-ilc", command],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env={**os.environ, "FABRICA_MANUAL": "1"},
                      start_new_session=True)
     what = f"#{card}" if card else mode
     return {"ok": True, "text": f"прогон пошёл: {what}" + (" (сухой)" if dry else "")}

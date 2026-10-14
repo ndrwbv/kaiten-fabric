@@ -127,6 +127,15 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     /// Адрес доски — из config.json, чтобы приложение не знало про конкретную команду.
     private var boardURL: String?
 
+    /// Пауза — файлом, а не флагом в памяти: пауза должна держаться
+    /// и после перезапуска приложения, и для ночного LaunchAgent,
+    /// который зовёт run.sh мимо приложения. run.sh этот файл и проверяет.
+    private var pauseFile: URL { root.appendingPathComponent("state/paused") }
+    private var paused: Bool { FileManager.default.fileExists(atPath: pauseFile.path) }
+    private var pausedSince: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: pauseFile.path))?[.creationDate] as? Date
+    }
+
     // MARK: - настройки
 
     /// Настройки живут в `state/settings.json` — одном файле на приложение и на витрину.
@@ -305,6 +314,9 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     private func startRun(manual: Bool, mode: RunMode = .board) {
+        // На паузе расписание молчит, а кнопки работают: нажатие — это явная просьба,
+        // и отказывать в ней ради паузы, которую ставил тот же человек, незачем
+        guard manual || !paused else { return }
         guard runner == nil else {
             if manual { NSSound.beep() }
             // по расписанию — не теряем: запустим сразу после текущего прогона
@@ -325,6 +337,12 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         // -ilc: интерактивный логин-шелл. Только он даёт то же окружение, что и терминал:
         // nvm-версию node и NPM_TOKEN из .zshrc, без которых агент не соберёт фронт.
         process.arguments = ["-ilc", script]
+        // Ручной запуск проходит сквозь паузу — run.sh узнаёт его по этой переменной
+        if manual {
+            var env = ProcessInfo.processInfo.environment
+            env["FABRICA_MANUAL"] = "1"
+            process.environment = env
+        }
         // Вывод сохраняем, а не выбрасываем: только в нём написано, почему прогон упал.
         // Сюда же попадает и то, что run.sh говорит до питона, мимо logs/run.log.
         // Именно в файл, а не в трубу: труба умирает вместе с приложением, и
@@ -467,6 +485,31 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         runner = nil
         pollTimer?.invalidate()
         pollTimer = nil
+    }
+
+    /// Пауза целиком: текущий прогон, очередь отложенных и расписание.
+    private func pause() {
+        try? FileManager.default.createDirectory(
+            at: pauseFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: pauseFile.path,
+            contents: Data("остановлен из меню-бара — удали файл, чтобы запустить\n".utf8))
+        pendingModes.removeAll()
+        skipRetryTimer?.invalidate()
+        skipRetryTimer = nil
+        skipRetries = 0
+        lastError = nil
+        // Прогон мог запустить не меню-бар, а витрина или ночной агент — тогда своего
+        // процесса у приложения нет, и гасим его по pid из статуса
+        if runner == nil, runIsAlive, let pid = status.pid {
+            shell("pkill -TERM -P \(pid) 2>/dev/null; kill -TERM \(pid) 2>/dev/null")
+        }
+        stopRun()
+    }
+
+    private func resume() {
+        try? FileManager.default.removeItem(at: pauseFile)
+        lastError = nil
     }
 
     // MARK: - чтение состояния
@@ -616,6 +659,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     private func currentMood() -> Mood {
+        if paused && !runIsAlive { return .sleeping }
         if runLooksStuck { return .alert }
         if runIsAlive { return .working }
         if lastError != nil { return .alert }
@@ -639,6 +683,7 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         paintIcon()
         statusItem.button?.toolTip = runIsAlive
             ? "Фабрика работает: \(status.phase ?? "")"
+            : paused ? "На паузе — расписание не ходит"
             : (status.waiting.first.map { "#\($0.id): \($0.reason)" }
                ?? "Фабрика")
 
@@ -751,6 +796,19 @@ final class Fabrica: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        // Пауза — первой среди кнопок: её ищут, когда что-то пошло не так, и искать
+        // глазами в хвосте меню в этот момент некогда
+        if paused {
+            let item = action("▶︎ Снять с паузы", #selector(resumeClicked))
+            item.toolTip = "Расписание снова пойдёт со следующего тика"
+            menu.addItem(item)
+        } else {
+            let item = action("⏸ Поставить на паузу", #selector(pauseClicked))
+            item.toolTip = "Гасит текущий прогон и останавливает расписание, пока не "
+                + "снимешь паузу. Переживает перезапуск приложения; кнопки "
+                + "«…сейчас» на паузе работают"
+            menu.addItem(item)
+        }
         if running {
             menu.addItem(action("Остановить прогон", #selector(stopClicked)))
         }
@@ -863,6 +921,9 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     }
 
     private func headline() -> String {
+        if paused && !runIsAlive {
+            return "На паузе" + (pausedSince.map { " с \(clock($0))" } ?? "")
+        }
         if runIsAlive {
             let phase = status.phase ?? "запускаюсь"
             let age = elapsed().map { ", \($0)" } ?? ""
@@ -897,6 +958,8 @@ final class Fabrica: NSObject, NSApplicationDelegate {
     @objc private func inboxClicked() { startRun(manual: true, mode: .inbox) }
     @objc private func epicsClicked() { startRun(manual: true, mode: .epics) }
     @objc private func stopClicked() { stopRun(); redraw() }
+    @objc private func pauseClicked() { pause(); redraw() }
+    @objc private func resumeClicked() { resume(); redraw() }
     @objc private func quitClicked() { NSApp.terminate(nil) }
 
     @objc private func openCardClicked(_ sender: NSMenuItem) {

@@ -1077,6 +1077,29 @@ def check_board_columns(kaiten: Kaiten, label: str, block: dict) -> int:
     return problems
 
 
+def check_tech_debt(kaiten: Kaiten, title: str, debt: dict | None) -> int:
+    """Техдолг спринта продукта: доска эпиков, дорожка и колонка, куда заводится новый."""
+    if not debt:
+        return 0
+    try:
+        board = kaiten.board(int(debt["board_id"]))
+    except (SetupError, KeyError, TypeError, ValueError) as e:
+        bad(f"{title}: доска техдолга недоступна: {e}")
+        return 1
+    lanes = {int(lane["id"]) for lane in board.get("lanes") or []}
+    columns = {int(column["id"]) for column in flat_columns(board)}
+    problems = 0
+    if int(debt.get("lane_id") or 0) not in lanes:
+        bad(f"{title}: техдолг — дорожки {debt.get('lane_id')} на «{board['title']}» нет")
+        problems += 1
+    if int(debt.get("column_id") or 0) not in columns:
+        bad(f"{title}: техдолг — колонки {debt.get('column_id')} на «{board['title']}» нет")
+        problems += 1
+    if not problems:
+        ok(f"{'техдолг':<13} → «{debt.get('title_prefix', '').strip()} …» на «{board['title']}»")
+    return problems
+
+
 def check_products(kaiten: Kaiten, config: dict) -> int:
     """
     Продукты: доска с колонками, репозитории из `repos`, дорожки на доске эпиков.
@@ -1112,6 +1135,7 @@ def check_products(kaiten: Kaiten, config: dict) -> int:
             if lanes and int(lane) not in lanes:
                 bad(f"{title}: дорожки {lane} на доске эпиков нет")
                 problems += 1
+        problems += check_tech_debt(kaiten, title, product.get("sprint_tech_debt"))
     default = config.get("default_product")
     if default and default not in config["products"]:
         bad(f"default_product «{default}» — такого продукта нет")
