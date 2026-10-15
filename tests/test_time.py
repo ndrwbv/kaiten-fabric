@@ -686,5 +686,117 @@ check("чужой блокер роль не меняет: это не наш с
 check("на доске со своей колонкой под каждую роль ничего не поменялось",
       f.time_status(profiles[0], {"id": 556, "column_id": 107}, []) [0] == "review")
 
+print("=== 34. просьба в треде — это и есть ход человека: свой блокер снимается ===")
+# Пятнадцатого октября на «@стёпа поправь замечания из пр» бот ответил «Меня блочит:
+# 🤖 ревью агента пройдено, нужен человек» — тому самому человеку, которого ждал.
+class Handed(FakeKaiten):
+    held = [{"id": 77, "reason": handed}]
+    def __init__(self): super().__init__(); self.unblocked = []
+    def card(self, card_id): return {"id": card_id, "title": "Поправить текст",
+                                     "board_id": 2000, "column_id": 205}
+    def blockers(self, card_id): return list(self.held)
+    def unblock(self, card_id, blocker_id): self.unblocked.append((card_id, blocker_id))
+
+def thread_once(kaiten, stuck):
+    f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+        "channel_id": "chan-1", "root_id": "root", "last_post_id": None,
+        "base": "[PR](u) Убрал lowercase.\n[Карточка](k)", "status": ""}}}),
+        encoding="utf-8")
+    GOT.clear()
+    f.blocked_by = lambda k, c: stuck
+    f.follow_time_threads(kaiten, cfg, Args(), [shared])
+    f.blocked_by = lambda k, c: None
+    marks = [json.loads(g[2])["emoji_name"] for g in GOT
+             if g[0] == "POST" and g[1].endswith("/reactions")]
+    said = [json.loads(g[2])["message"] for g in GOT
+            if g[0] == "POST" and g[1].endswith("/posts")]
+    return marks, said
+
+QUESTION[0] = "@fabrica поправь замечания из пр"
+mine = Handed()
+marks, said = thread_once(mine, handed)
+check("свой блокер передачи снят", mine.unblocked == [(555, 77)], str(mine.unblocked))
+check("и карточка уехала в «Правки», хотя «Ревью» — колонка ревьювера",
+      mine.moves == [(555, 202)], str(mine.moves))
+check("на сообщении глазок, а не крест", marks == ["eyes"], str(marks))
+check("и никакого «меня блочит»", said == [], str(said))
+check("просьба записана в карточку до снятия блокера",
+      len(mine.comments_written) == 1, str(mine.comments_written))
+
+mixed = Handed()
+mixed.held = [{"id": 77, "reason": handed}, {"id": 78, "reason": "ждём макет от дизайна"}]
+marks, said = thread_once(mixed, handed)
+check("рядом чужой блокер — не снимаем ничего", mixed.unblocked == [], str(mixed.unblocked))
+check("и не двигаем", mixed.moves == [], str(mixed.moves))
+check("а честно отвечаем крестом", marks == ["x"], str(marks))
+
+gate = Handed()
+gate.held = [{"id": 79, "reason": f.block_reason(f.BLOCK_ROLLOUT)}]
+marks, _ = thread_once(gate, gate.held[0]["reason"])
+check("блокер раскатки сообщением не снимается: правкой он не лечится",
+      gate.unblocked == [] and marks == ["x"], f"{gate.unblocked} {marks}")
+
+print("=== 35. круг из треда на доске команды — правка PR, а не задача с нуля ===")
+# «Правки» там — та же колонка, что «В работе» и «Вопрос»: без этого просьба
+# читалась бы ответом на вопрос, и ветка пошла бы от main мимо открытого PR
+report = {"text": "🤖 PR открыт: https://github.com/acme/shop/pull/12"}
+asked = {"text": f.from_thread_comment("Андрей", "поправь замечания из пр")}
+on_shared = {"id": 555, "column_id": 202}
+check("последнее слово из треда и PR есть — это правки",
+      f.fix_round(None, shared, on_shared, [report, asked]))
+check("PR ещё нет — это по-прежнему ответ, а не правки",
+      not f.fix_round(None, shared, on_shared, [asked]))
+check("в промпте — заметка про просьбу человека, а не про 🔍",
+      f.fix_note([report, asked], []).startswith(f.HUMAN_FIX_NOTE))
+check("после ревьювера — прежняя заметка",
+      f.fix_note([asked, {"text": "🔍 Ревью: поправь"}], []).startswith(f.FIX_NOTE))
+
+print("=== 36. замечания людей из PR доезжают до исполнителя ===")
+import subprocess
+reply = {"data": {"repository": {"pullRequest": {
+    "commits": {"nodes": [{"commit": {"committedDate": "2026-10-15T09:00:00Z"}}]},
+    "reviews": {"nodes": [
+        {"author": {"login": "dev"}, "body": "Фикс рабочий, но см. замечания",
+         "submittedAt": "2026-10-15T10:00:00Z"},
+        {"author": {"login": "dev"}, "body": "старое, до прошлого круга",
+         "submittedAt": "2026-10-15T08:00:00Z"},
+        {"author": {"login": "dev"}, "body": "", "submittedAt": "2026-10-15T10:00:00Z"}]},
+    "comments": {"nodes": [
+        {"author": {"login": "bot"}, "body": "🔍 **Ревью, круг 1/3**",
+         "createdAt": "2026-10-15T09:30:00Z"}]},
+    "reviewThreads": {"nodes": [
+        {"isResolved": False, "path": "a.ts", "line": 11, "originalLine": 11,
+         "comments": {"nodes": [{"author": {"login": "dev"}, "body": "order 43 занят",
+                                 "createdAt": "2026-10-15T10:00:00Z"}]}},
+        {"isResolved": True, "path": "b.ts", "line": 3, "originalLine": 3,
+         "comments": {"nodes": [{"author": {"login": "dev"}, "body": "решено",
+                                 "createdAt": "2026-10-15T10:00:00Z"}]}},
+        {"isResolved": False, "path": "c.ts", "line": None, "originalLine": 7,
+         "comments": {"nodes": [{"author": {"login": "dev"}, "body": "переименуй",
+                                 "createdAt": "2026-10-15T10:00:00Z"},
+                                {"author": {"login": "dev2"}, "body": "плюсую",
+                                 "createdAt": "2026-10-15T10:05:00Z"}]}}]}}}}}
+calls = []
+real_run = f.run_bounded
+f.run_bounded = lambda cmd, cwd, timeout, env=None: (
+    calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ""))
+said = f.pr_feedback(Path("."), "https://github.com/acme/shop/pull/12")
+f.run_bounded = real_run
+check("номер PR уходит числом", "number=12" in calls[0] and "-F" in calls[0], str(calls))
+check("ревью после коммита — в списке", "- **dev** (ревью): Фикс рабочий, но см. замечания" in said,
+      str(said))
+check("ревью до коммита прошлый круг уже закрыл", not any("старое" in s for s in said))
+check("пустое тело ревью не шумит", not any(s.endswith("(ревью): ") for s in said))
+check("своя выжимка ревьювера не повторяется", not any("🔍" in s for s in said))
+check("инлайн-замечание — с файлом и строкой", "- **dev**, `a.ts:11`: order 43 занят" in said)
+check("решённый тред не тащим", not any("решено" in s for s in said))
+check("ответы в треде — под замечанием, строка из originalLine",
+      "- **dev**, `c.ts:7`: переименуй\n  - **dev2**: плюсую" in said, str(said))
+f.run_bounded = lambda cmd, cwd, timeout, env=None: subprocess.CompletedProcess(cmd, 1, "", "боль")
+check("GitHub не ответил — пусто, а не падение",
+      f.pr_feedback(Path("."), "https://github.com/acme/shop/pull/12") == [])
+f.run_bounded = real_run
+check("не ссылка на PR — в GitHub не ходим", f.pr_feedback(Path("."), "") == [])
+
 srv.shutdown()
 print("\nвсё сошлось")

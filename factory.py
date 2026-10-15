@@ -1884,8 +1884,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         # перенесённый комментарий делает её пригодной к работе следующим же прогоном
         stay = ([role_column(profile, role) for role in ACTIVE_ROLES]
                 + [role_column(profile, "question")]) if profile else []
-        # блокер и «увели из потока» — единственные два случая, когда сообщение
-        # из треда в работу не уходит
+        # блокер (кроме своего блокера передачи) и «увели из потока» — единственные
+        # два случая, когда сообщение из треда в работу не уходит
         astray = outside_flow(profile, card)
 
         # По итогам круга отчитаться надо ответом, а не словом «поправил». Ставим
@@ -1898,8 +1898,13 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         # пойдёт разговор по делу, от «записал в карточку» зарастает вдвое быстрее.
         # Крест — «не могу»: молчание с ним человек прочитал бы как «делает», поэтому
         # рядом уходит и причина.
-        if stuck:
-            # свой блокер фабрика не снимает никогда: он и есть «сейчас ход человека»
+        # Свой блокер передачи — «сейчас ход человека», и человек его сделал: сообщение
+        # в треде снимает такой блокер. Иначе ему отвечали «меня блочит: нужен человек».
+        release = (handed_over(kaiten.blockers(card["id"]))
+                   if stuck and stuck.startswith(BLOCK_MARK) and not astray else [])
+        if release:
+            mark, reply = EYES, ""
+        elif stuck:
             log(f"  #{card_key} заблокирована ({stuck}) — карточку не двигаю")
             mark = CROSS
             reply = ("Меня блочит блокер на карточке — сними, и поеду."
@@ -1933,7 +1938,17 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             f"{'сообщение' if len(work) == 1 else 'сообщений'}"
             + (" (это вопрос)" if only_asked else ""))
 
-        if mark == EYES and target and card.get("column_id") not in stay:
+        # Снимаем после комментария: без него следующий прогон взял бы карточку
+        # и не узнал, о чём просили
+        for blocker in release:
+            kaiten.unblock(card["id"], blocker["id"])
+        if release:
+            log(f"  #{card_key}: в треде ответили — снял свой блокер ({stuck})")
+        # На доске команды «Ревью» — та же колонка, что вход ревьювера, и «стоять на
+        # месте» после снятия блокера значило бы отдать правку человека ревьюверу.
+        # Поэтому снятый блокер везёт карточку в «Правки» из любой своей колонки.
+        if (mark == EYES and target and card.get("column_id") != target
+                and (release or card.get("column_id") not in stay)):
             kaiten.move(card["id"], target)
 
         if reply and time_wants(conf, "fix_taken"):
@@ -2027,8 +2042,9 @@ NIGHT_WAITING = {"count": 0}
 
 # Свои блокеры узнаём по префиксу: на карточке может висеть и человеческий блокер,
 # и его снимать нельзя. Свои фабрика тоже не снимает — их снимает человек, и именно
-# это снятие означает «продолжай». Другого признака апрува у нас нет: и агент,
-# и человек пишут под одним токеном, по автору их не различить.
+# это снятие означает «продолжай». В Kaiten другого признака апрува у нас нет: и агент,
+# и человек пишут под одним токеном, по автору их не различить. Единственное
+# исключение — просьба в треде Time, см. `handed_over`: там автор виден.
 BLOCK_MARK = "🤖"
 
 BLOCK_QUESTION = "не хватило данных, ответь в комментариях"
@@ -2131,6 +2147,25 @@ HANDOFF_BLOCKERS = {
     "failed": BLOCK_FAILED,
     "review": BLOCK_HUMAN_REVIEW,
 }
+
+
+def handed_over(blockers: list) -> list:
+    """
+    Блокеры, которые снимает просьба человека в треде Time. Пусто — снимать нечего.
+
+    Блокер передачи значит «ход человека», и сообщение `@бот поправь` в треде — это
+    и есть его ход: автор там виден, а не спрятан за общим токеном, как в Kaiten.
+    Без этого фабрика отвечала «Меня блочит: ревью агента пройдено, нужен человек»
+    тому самому человеку, которого ждала.
+
+    Только если **все** блокеры на карточке — наши блокеры передачи. Чужой блокер
+    («ждём макет») не наш, апрув приёмочных критериев комментарием не даётся
+    по договорённости, а «нельзя раскатывать до бека» правкой не лечится.
+    """
+    kinds = tuple(block_reason(kind) for kind in HANDOFF_BLOCKERS.values())
+    if blockers and all(str(b.get("reason") or "").startswith(kinds) for b in blockers):
+        return blockers
+    return []
 
 
 def make_profile(key: str, board: dict, repo_key: str | None = None,
@@ -2750,6 +2785,34 @@ FIX_NOTE = """
 > Коммить обычным порядком, одним коммитом поверх прошлых.
 """
 
+HUMAN_FIX_NOTE = """
+> 💬 **Это круг правок по просьбе человека.** Твои прошлые коммиты уже в ветке и в открытом
+> PR — ветка отведена от них, а не от `main`. Не переделывай задачу заново.
+>
+> Что сделать — в последнем комментарии выше, помеченном 💬: человек написал это в рабочем
+> чате. Если он ссылается на замечания в PR — они ниже, в «Замечаниях людей в PR».
+> Замечания ревьювера с 🔍 выше разобраны прошлыми кругами, к ним не возвращайся.
+> Правь ровно то, о чём просят, попутных изменений не вноси.
+>
+> Если с замечанием ты не согласен — не игнорируй его молча: сделай остальное, а по этому
+> напиши в `risks`, почему считаешь текущий код верным. Это уйдёт человеку.
+>
+> В `summary` — **что ты исправил в этом круге**, а не о чём была задача: строка уйдёт
+> в рабочий чат как «Поправил: …».
+>
+> Коммить обычным порядком, одним коммитом поверх прошлых.
+"""
+
+
+def fix_note(comments: list, feedback: list[str]) -> str:
+    """Чей это круг правок — ревьювера или человека из треда — и что люди сказали в PR."""
+    last = strip_html(comments[-1].get("text", "")) if comments else ""
+    note = HUMAN_FIX_NOTE if last.startswith(FROM_TIME_MARK) else FIX_NOTE
+    if feedback:
+        note += ("\n**Замечания людей в PR** (новее последнего коммита ветки):\n\n"
+                 + "\n".join(feedback) + "\n")
+    return note
+
 
 def format_comments(comments: list) -> str:
     lines = []
@@ -2833,7 +2896,8 @@ def apply_template(template: str, replacements: dict) -> str:
 
 
 def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_url: str,
-                 returning: bool = False, fixing: bool = False) -> str:
+                 returning: bool = False, fixing: bool = False,
+                 feedback: list[str] | None = None) -> str:
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     replacements = {
         "{{CARD_ID}}": str(card["id"]),
@@ -2845,7 +2909,8 @@ def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_u
         "{{BRANCH}}": branch,
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
-        "{{RETURN_NOTE}}": FIX_NOTE if fixing else (RETURN_NOTE if returning else ""),
+        "{{RETURN_NOTE}}": (fix_note(comments, feedback or []) if fixing
+                            else RETURN_NOTE if returning else ""),
         **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(template, replacements)
@@ -4089,6 +4154,95 @@ def pr_status(repo: Path, prefixes: tuple[str, ...], card_id: int, pr_url: str) 
     return {}
 
 
+PR_PARTS_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+
+PR_FEEDBACK_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) { nodes { commit { committedDate } } }
+      reviews(last: 50) { nodes { author { login } body submittedAt } }
+      comments(last: 50) { nodes { author { login } body createdAt } }
+      reviewThreads(last: 100) {
+        nodes {
+          isResolved
+          path
+          line
+          originalLine
+          comments(first: 30) { nodes { author { login } body createdAt } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def pr_feedback(repo: Path, pr_url: str) -> list[str]:
+    """
+    Что люди написали в PR после последнего коммита ветки — строками для промпта.
+
+    Человек ревьюит в GitHub, а просит в треде одной фразой: «поправь замечания из PR».
+    Исполнитель видит только карточку, и без этого списка ему не на что опереться.
+
+    «После последнего коммита» — граница того, что уже разобрано: ревью, оставленное
+    до прошлого круга, тот круг и закрыл. Инлайн-тред берём, только если он не решён
+    и в нём писали после коммита. Свои реплики (🔍, 🤖 — выжимка ревьювера, отчёты)
+    отсекаются по метке: под каким логином их пишет фабрика, не важно.
+    Пусто — и когда замечаний нет, и когда GitHub не ответил: круг правок от этого
+    не встаёт, просто идёт по карточке.
+    """
+    parts = PR_PARTS_RE.match(pr_url or "")
+    if not parts:
+        return []
+    owner, name, number = parts.groups()
+    proc = run_bounded(["gh", "api", "graphql", "-f", f"query={PR_FEEDBACK_QUERY}",
+                        "-f", f"owner={owner}", "-f", f"name={name}",
+                        "-F", f"number={number}"], repo, 120)
+    if proc.returncode != 0:
+        log(f"  !! замечания из {pr_url} не прочитались: {proc.stderr.strip()[:160]}")
+        return []
+    try:
+        pull = json.loads(proc.stdout)["data"]["repository"]["pullRequest"] or {}
+    except (ValueError, KeyError, TypeError):
+        log(f"  !! замечания из {pr_url} не разобрались")
+        return []
+
+    commits = (pull.get("commits") or {}).get("nodes") or []
+    since = parse_stamp(((commits[-1] if commits else {}).get("commit") or {})
+                        .get("committedDate"))
+
+    def fresh(stamp) -> bool:
+        moment = parse_stamp(stamp)
+        return not since or not moment or moment > since
+
+    def human(body: str) -> bool:
+        return bool(body) and not body.startswith(AGENT_MARKS)
+
+    def who(node: dict) -> str:
+        return (node.get("author") or {}).get("login") or "?"
+
+    found = []
+    for review in (pull.get("reviews") or {}).get("nodes") or []:
+        body = (review.get("body") or "").strip()
+        if human(body) and fresh(review.get("submittedAt")):
+            found.append(f"- **{who(review)}** (ревью): {body}")
+    for comment in (pull.get("comments") or {}).get("nodes") or []:
+        body = (comment.get("body") or "").strip()
+        if human(body) and fresh(comment.get("createdAt")):
+            found.append(f"- **{who(comment)}**: {body}")
+    for thread in (pull.get("reviewThreads") or {}).get("nodes") or []:
+        said = [c for c in (thread.get("comments") or {}).get("nodes") or []
+                if human((c.get("body") or "").strip())]
+        if thread.get("isResolved") or not said or not fresh(said[-1].get("createdAt")):
+            continue
+        where = f"`{thread.get('path')}:{thread.get('line') or thread.get('originalLine')}`"
+        lines = [f"- **{who(said[0])}**, {where}: {said[0]['body'].strip()}"]
+        lines += [f"  - **{who(c)}**: {c['body'].strip()}" for c in said[1:]]
+        found.append("\n".join(lines))
+    return found
+
+
 def shipped_commit(repo: Path, repo_cfg: dict, card_id: int) -> dict:
     """
     Коммит карточки в базовой ветке: `sha` и `subject`. Пусто — не нашли.
@@ -4569,13 +4723,22 @@ def link_review_cards(kaiten: Kaiten, cfg: dict, dry_run: bool) -> int:
 def fix_round(kaiten: Kaiten, profile: dict, card: dict, comments: list) -> bool:
     """
     Правки после ревью: карточка либо лежит в своей колонке «Правки», либо (когда
-    такой колонки на доске нет) стоит в рабочей, а последнее слово за ревьювером.
+    такой колонки на доске нет) стоит в рабочей, а последнее слово за ревьювером —
+    или за человеком из треда Time, если PR уже есть.
+
+    Второй случай — то, что делает тред на доске команды: «Правки» там — та же
+    колонка, что «В работе» и «Вопрос», и без него просьба «поправь замечания из PR»
+    читалась бы ответом на вопрос, а круг начинался бы с `main`, мимо открытого PR.
     """
     fixes_column = role_column(profile, "fixes")
     if fixes_column and fixes_column != role_column(profile, "in_progress"):
         return card.get("column_id") == fixes_column
     texts = [strip_html(c.get("text", "")) for c in comments]
-    return bool(texts) and texts[-1].startswith(REVIEWER_MARK)
+    if not texts:
+        return False
+    if texts[-1].startswith(REVIEWER_MARK):
+        return True
+    return texts[-1].startswith(FROM_TIME_MARK) and bool(pr_link(comments))
 
 
 def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> None:
@@ -4654,8 +4817,11 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
     try:
         make_worktree(repo, branch, repo_cfg["base_branch"], repo_cfg["remote"], worktree,
                       continue_from=continue_from)
+        feedback = pr_feedback(repo, pr_link(comments)) if fixing else []
+        if feedback:
+            log(f"  в PR от людей замечаний: {len(feedback)}")
         prompt = build_prompt(card, comments, repo_cfg, branch, card_url,
-                              returning=returning, fixing=fixing)
+                              returning=returning, fixing=fixing, feedback=feedback)
 
         if args.prompt_only:
             print("\n" + "=" * 78)
