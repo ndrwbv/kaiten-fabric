@@ -18,6 +18,7 @@ GOT = []          # что фальшивый сервер получил
 # а бот в фальшивом Mattermost зовётся fabrica
 QUESTION = ["@fabrica регистр поехал и в шапке тоже, поправь и там"]
 BOT_ID = "bot-000"
+CHANNEL_POSTS = []  # что лежит в канале для опроса упоминаний
 
 
 class Fake(BaseHTTPRequestHandler):
@@ -35,6 +36,9 @@ class Fake(BaseHTTPRequestHandler):
         GOT.append(("GET", self.path, None, self.headers.get("Authorization")))
         if self.path.endswith("/users/me"):
             return self._reply({"id": BOT_ID, "username": "fabrica"})
+        if "/channels/" in self.path and "/posts?since=" in self.path:
+            return self._reply({"order": [p["id"] for p in CHANNEL_POSTS],
+                                "posts": {p["id"]: p for p in CHANNEL_POSTS}})
         if "/posts/" in self.path and "/thread" not in self.path:
             return self._reply({"id": "root", "message": "[PR](u) Убрал lowercase.\n[Карточка](k)"})
         if "/thread" in self.path:
@@ -876,6 +880,113 @@ described = f.work_card_description({"id": 900, "description": "сломалос
 check("в описании задачи из инбокса мест в коде нет", "src/a.ts" not in described, described)
 check("исполнитель получает их подсказкой из разведки",
       "src/a.ts:3" in f.scout_hints({"description": described}))
+
+print("=== 39. Стёпу тегнули в канале с карточкой — он её берёт ===")
+class Sprint(FakeKaiten):
+    """Доска команды: беклог, очередь, в работе, ревью, раскатка, готово."""
+    cards = {}
+    def __init__(self): super().__init__(); self.tags = []
+    def card(self, card_id):
+        if card_id not in self.cards:
+            raise f.NotFoundError("HTTP 404")
+        return {"id": card_id, "title": "Задача", "board_id": 2000, "tags": [],
+                **self.cards[card_id]}
+    def board(self, board_id):
+        return {"columns": [{"id": i, "title": str(i), "sort_order": n}
+                            for n, i in enumerate((200, 201, 202, 205, 207, 208))]}
+    def add_tag(self, card_id, name): self.tags.append((card_id, name))
+
+def mention(text, post_id="m1", root=""):
+    return {"id": post_id, "user_id": "u-1", "type": "", "message": text,
+            "create_at": 2_000_000_000_000, "root_id": root, "channel_id": "chan-1"}
+
+def poll(kaiten, *posts):
+    CHANNEL_POSTS[:] = list(posts)
+    GOT.clear()
+    f.follow_time_mentions(kaiten, cfg, Args(), [shared])
+    state = json.loads(f.TIME_STATE_FILE.read_text())
+    marks = [(json.loads(g[2])["post_id"], json.loads(g[2])["emoji_name"]) for g in GOT
+             if g[0] == "POST" and g[1].endswith("/reactions")]
+    said = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/posts")]
+    return state, marks, said
+
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {}}), encoding="utf-8")
+sprint = Sprint()
+state, marks, said = poll(sprint, mention("@fabrica сделай https://x.kaiten.ru/777"))
+check("первый опрос только ставит курсор — историю канала не разгребаем",
+      state["channels"]["chan-1"]["since"] > 0 and not marks and not said
+      and sprint.tags == [], str(state))
+state["channels"]["chan-1"]["since"] = 1
+f.TIME_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+
+Sprint.cards = {777: {"column_id": 200}, 778: {"column_id": 202},
+                779: {"column_id": 207}, 780: {"column_id": 201}}
+state, marks, said = poll(sprint, mention(
+    "@fabrica сделай, пожалуйста [вот](https://x.kaiten.ru/space/1/boards/card/777)"))
+check("карточку из беклога взял: тег и «Очередь»",
+      sprint.tags == [(777, "stepa")] and sprint.moves == [(777, 201)],
+      f"{sprint.tags} {sprint.moves}")
+check("просьба — комментарием в карточку, без ссылки и обращения",
+      sprint.comments_written and "сделай, пожалуйста вот" in sprint.comments_written[0][1]
+      and "kaiten.ru" not in sprint.comments_written[0][1], str(sprint.comments_written))
+check("на сообщении глазок, слов нет", marks == [("m1", "eyes")] and said == [],
+      f"{marks} {said}")
+info = state["threads"]["777"]
+check("тред запомнен чужим: корень — сообщение человека",
+      info["root_id"] == "m1" and info["own_root"] is False, str(info))
+check("курсор сдвинулся — второй раз то же сообщение не возьмём",
+      state["channels"]["chan-1"]["since"] == 2_000_000_000_000)
+
+state["channels"]["chan-1"]["since"] = 1
+f.TIME_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+queued = Sprint()
+state, marks, said = poll(queued, mention("@fabrica https://x.kaiten.ru/780", "m2"))
+check("из «Очереди» никуда не двигаем, только тег",
+      queued.tags == [(780, "stepa")] and queued.moves == [], f"{queued.tags} {queued.moves}")
+
+for card_id, why in ((778, "Её уже кто-то делает"), (779, "уже дальше разработки"),
+                     (999, "Не вижу такую карточку")):
+    state["channels"]["chan-1"]["since"] = 1
+    f.TIME_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    other = Sprint()
+    state, marks, said = poll(other, mention(f"@fabrica глянь https://x.kaiten.ru/{card_id}",
+                                             "m3", root="someone-root"))
+    check(f"#{card_id}: крест и одна фраза в тот же тред — «{why}»",
+          marks == [("m3", "x")] and len(said) == 1 and why in said[0]["message"]
+          and said[0]["root_id"] == "someone-root", f"{marks} {said}")
+    check(f"#{card_id}: карточку не трогали",
+          other.tags == [] and other.moves == [] and other.comments_written == [])
+
+state["channels"]["chan-1"]["since"] = 1
+f.TIME_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+state, marks, said = poll(Sprint(), mention("@fabrica сделай задачку", "m4"))
+check("без ссылки — просим ссылку", said and "ссылку на карточку" in said[0]["message"],
+      str(said))
+
+state["channels"]["chan-1"]["since"] = 1
+f.TIME_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+state, marks, said = poll(Sprint(), mention("@fabrica и ещё раз", "m5", root="m1"))
+check("сообщения из уже известного треда — не сюда, их читает тред",
+      marks == [] and said == [], f"{marks} {said}")
+
+print("=== 40. PR по карточке из канала — ответом в тот же тред ===")
+GOT.clear()
+f.load_env = lambda: env
+f.notify_pr(cfg, "kiosk", {"id": 777, "title": "Задача"}, "https://k/777",
+            "https://github.com/acme/shop/pull/7", {"summary": "Сделал задачу."}, False)
+said = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/posts")]
+check("PR ушёл ответом в тред человека, а не новым сообщением в канал",
+      len(said) == 1 and said[0].get("root_id") == "m1"
+      and "pull/7" in said[0]["message"], str(said))
+info = json.loads(f.TIME_STATE_FILE.read_text())["threads"]["777"]
+check("статус теперь живёт в этом ответе — корень чужой",
+      info["status_post"] == "new-post" and f.status_post(info) == "new-post", str(info))
+check("глазок снят — за работу говорит PR",
+      any(g[0] == "DELETE" and "reactions/eyes" in g[1] for g in GOT), str(GOT))
+check("свой тред по-прежнему держит статус в корне",
+      f.status_post({"root_id": "root"}) == "root")
+check("в чужом треде до PR статусу жить негде",
+      f.status_post({"root_id": "m1", "own_root": False}) == "")
 
 srv.shutdown()
 print("\nвсё сошлось")

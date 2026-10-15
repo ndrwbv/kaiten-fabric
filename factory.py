@@ -1154,6 +1154,16 @@ class Time:
         posts = list((data.get("posts") or {}).values())
         return sorted(posts, key=lambda post: post.get("create_at") or 0)
 
+    def channel_posts(self, channel_id: str, since_ms: int) -> list:
+        """
+        Сообщения канала новее `since_ms`, по времени. Mattermost отдаёт по `since`
+        и правленные старые — их отсекает сам разбор, по `create_at`.
+        """
+        data = self._request("GET", f"{self.api}/channels/{channel_id}/posts?since={since_ms}",
+                             config=self._auth()) or {}
+        posts = list((data.get("posts") or {}).values())
+        return sorted(posts, key=lambda post: post.get("create_at") or 0)
+
     def post_by_id(self, post_id: str) -> dict:
         return self._request("GET", f"{self.api}/posts/{post_id}",
                              config=self._auth()) or {}
@@ -1508,11 +1518,22 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             save_time_state(state)
             log("  написал в тред Time про правку")
             return
+        base = time_pr_message(card_url, pr_url, brief(verdict.get("summary") or ""))
+        if known.get("own_root") is False and known.get("root_id"):
+            # Карточку дали в канале — PR и есть ответ на ту просьбу, туда же он и
+            # уходит. Это сообщение несёт и статус: корень треда чужой.
+            post = client.post(known.get("channel_id", ""), base, root_id=known["root_id"])
+            drop_marks(client, known)
+            known.update(base=base, status="",
+                         status_post=(post or {}).get("id") or known.get("status_post", ""))
+            state.setdefault("threads", {})[str(card["id"])] = known
+            save_time_state(state)
+            log("  ответил в тред Time ссылкой на PR")
+            return
         channel = time_channel(conf, repo_key)
         if not channel and not client.webhook_url:
             log("Time: не задан канал (notify.time.channels) — не пишу")
             return
-        base = time_pr_message(card_url, pr_url, brief(verdict.get("summary") or ""))
         post = client.post(channel, base)
         if post and post.get("id"):
             state.setdefault("threads", {})[str(card["id"])] = {
@@ -1596,6 +1617,17 @@ def thread_asks(asks: list[str], again: bool = False) -> str:
             + "\n".join(f"- {ask}" for ask in clean))
 
 
+def status_post(info: dict) -> str:
+    """
+    Какое сообщение несёт строку статуса. В своём треде — корень. В чужом (Стёпу
+    позвали в канале) корень чужой, и статус живёт в первом своём ответе — том,
+    что с PR. Пока его нет, статусу жить негде: пусто.
+    """
+    if info.get("own_root") is False:
+        return info.get("status_post") or ""
+    return info.get("root_id") or ""
+
+
 def thread_base(client: Time, info: dict) -> str:
     """
     Текст сообщения без строки статуса.
@@ -1607,7 +1639,7 @@ def thread_base(client: Time, info: dict) -> str:
     """
     if info.get("base"):
         return info["base"]
-    post = client.post_by_id(info.get("root_id", ""))
+    post = client.post_by_id(status_post(info))
     lines = (post.get("message") or "").splitlines()
     if len(lines) > 1 and is_status_line(lines[-1]):
         lines = lines[:-1]
@@ -1717,10 +1749,11 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
                 except FactoryError as e:
                     log(f"  !! не смог написать вопросы в тред по #{card_key}: {e}")
 
-        if time_wants(conf, "status") and role and status != info.get("status"):
+        if (time_wants(conf, "status") and role and status != info.get("status")
+                and status_post(info)):
             try:
                 info["base"] = thread_base(client, info)
-                client.edit(root_id, with_status(info["base"], status))
+                client.edit(status_post(info), with_status(info["base"], status))
                 info["status"] = status
                 save_time_state(state)
                 log(f"  #{card_key}: статус в канале -> {status or 'снят'}")
@@ -1967,6 +2000,172 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
     if moved:
         log(f"из тредов Time пришло правок по {moved} карточкам")
     return 0
+
+
+# Ссылка на карточку в сообщении: и полная («…/boards/card/<id>»), и короткая
+# («…kaiten.ru/<id>»), какую Kaiten даёт кнопкой «скопировать ссылку».
+CARD_LINK_RE = re.compile(r"kaiten\.ru/(?:[\w/-]*?/)?card/(\d+)|kaiten\.ru/(\d+)\b")
+
+
+def card_from_text(text: str) -> int | None:
+    found = CARD_LINK_RE.search(text or "")
+    return int(found.group(1) or found.group(2)) if found else None
+
+
+def without_card_links(text: str) -> str:
+    """Текст просьбы без ссылок на Kaiten: карточка и так та самая, ссылка в ней — шум."""
+    text = re.sub(r"\[([^\]]*)\]\(\S*kaiten\.ru/[^)]*\)", r"\1", text or "")
+    return re.sub(r"<?\S*kaiten\.ru/\S*", "", text).strip()
+
+
+def take_from_channel(kaiten: Kaiten, cfg: dict, profiles: list[dict],
+                      card_id: int) -> tuple[str, dict | None, dict | None, bool]:
+    """
+    Берёт ли Стёпа карточку, которую ему дали в канале. Возвращает отказ одной фразой
+    (пусто — берёт), саму карточку, профиль её доски и надо ли ставить её в «Очередь».
+
+    Беру только задачи с досок продуктов: то, что лежит в очереди или левее неё.
+    Правее — в работе у человека, на ревью, в раскатке — карточка уже чья-то, и
+    утаскивать её назад значит отменить чужое решение. Отказ — фразой от первого
+    лица, коротко: человек прочтёт её в канале между делом.
+    """
+    try:
+        card = kaiten.card(card_id)
+    except NotFoundError:
+        return "Не вижу такую карточку.", None, None, False
+    profile = profile_for_board(profiles, card.get("board_id"))
+    if not profile:
+        return "Это не моя доска — беру задачи с досок продуктов.", card, None, False
+    if hands_off(card, kaiten.comments(card_id), cfg):
+        return "В карточке просили её не трогать.", card, profile, False
+    stuck = blocked_by(kaiten, card_id)
+    if stuck and not stuck.startswith(BLOCK_MARK):
+        return (f"Меня блочит: {stuck}" if stuck != NO_REASON
+                else "На карточке блокер — сними, и возьму."), card, profile, False
+    column = card.get("column_id")
+    queue = role_column(profile, "queue")
+    order = [c["id"] for c in flat_columns(kaiten.board(profile["board_id"]))]
+    waiting = column in order and queue in order and order.index(column) <= order.index(queue)
+    if mine(profile, card):
+        if column == role_column(profile, "done") or outside_flow(profile, card) and not waiting:
+            return "Она уже дальше разработки — верни в беклог, если надо переделать.", \
+                card, profile, False
+        # уже моя и в потоке — сообщение станет просьбой по ней, двигать некуда
+        return "", card, profile, waiting and column != queue
+    if waiting:
+        return "", card, profile, column != queue
+    if column in [role_column(profile, role) for role in ("in_progress", "agent_review")]:
+        return "Её уже кто-то делает — сними с себя и тегни меня снова.", card, profile, False
+    return ("Она уже дальше разработки — верни в беклог, если надо переделать.",
+            card, profile, False)
+
+
+def follow_time_mentions(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
+    """
+    Фаза каналов: Стёпу тегнули со ссылкой на карточку — он её берёт.
+
+    Вход тот же, что у тредов: сообщение не запускает агента напрямую, а ставит
+    карточку в поток — тег «моё», «Очередь», текст просьбы комментарием, — и дальше
+    её ведёт обычный прогон с кругами, ревью и бюджетом. Ответ — в тред того
+    сообщения: 👀 «взял», потом ссылка на PR; ❌ и одна фраза — почему не взял.
+
+    Каналы — те, куда фабрика пишет про PR (`notify.time.channels`): в чужие она
+    не пишет и читать их незачем. Курсор — время последнего прочитанного сообщения
+    по каналу; первый проход только ставит курсор, иначе Стёпа ответил бы на всю
+    историю канала разом. Сообщения из уже известных тредов здесь мимо — их читает
+    `follow_time_threads`.
+    """
+    conf = time_config(cfg)
+    if not conf or not conf.get("follow_mentions", True):
+        return 0
+    client = time_client(cfg, load_env(), args.dry_run)
+    if not client or not client.can_read:
+        return 0
+    channels = sorted({c for c in (conf.get("channels") or {}).values() if c})
+    if not channels:
+        return 0
+    try:
+        me = client.me()
+    except FactoryError as e:
+        log(f"Time: не смог узнать себя ({e}) — каналы не читаю")
+        return 0
+    bot_id = me.get("id") or ""
+    handle = f"@{me.get('username')}".lower() if me.get("username") else ""
+    if not handle:
+        return 0
+    allowed = [name.lstrip("@").lower() for name in (conf.get("allow_from") or [])]
+
+    state = load_time_state()
+    cursors = state.setdefault("channels", {})
+    threads = state.setdefault("threads", {})
+    taken = 0
+    now_ms = int(time.time() * 1000)
+    for channel in channels:
+        since = (cursors.get(channel) or {}).get("since")
+        if not since:
+            cursors[channel] = {"since": now_ms}
+            save_time_state(state)
+            log(f"Time: начинаю слушать канал {channel} с этого момента")
+            continue
+        try:
+            posts = client.channel_posts(channel, since)
+        except FactoryError as e:
+            log(f"  !! канал {channel} не прочитался: {e}")
+            continue
+        fresh = [post for post in posts if (post.get("create_at") or 0) > since]
+        if not fresh:
+            continue
+        known_roots = {info.get("root_id") for info in threads.values()}
+        asks = [post for post in fresh
+                if post.get("user_id") != bot_id and not (post.get("type") or "")
+                and handle in (post.get("message") or "").lower()
+                and (post.get("root_id") or post.get("id")) not in known_roots]
+        names = client.users([post.get("user_id") for post in asks]) if asks else {}
+        for post in asks:
+            user = names.get(post.get("user_id"), {})
+            if allowed and (user.get("username") or "").lower() not in allowed:
+                log(f"  в канале звал не тот, кому можно (allow_from)")
+                continue
+            root = post.get("root_id") or post.get("id")
+            card_id = card_from_text(post.get("message") or "")
+            if not card_id:
+                mark_thread(client, {}, bot_id, [post["id"]], CROSS)
+                client.post(channel, "Кинь ссылку на карточку — возьму.", root_id=root)
+                continue
+            if str(card_id) in threads:
+                # по карточке уже есть тред — разговор о ней живёт там
+                mark_thread(client, {}, bot_id, [post["id"]], EYES)
+                client.post(channel, "Она уже у меня — пишу в её тред.", root_id=root)
+                continue
+            refusal, card, profile, to_queue = take_from_channel(kaiten, cfg, profiles,
+                                                                 card_id)
+            if refusal:
+                log(f"  #{card_id} из канала не беру: {refusal}")
+                mark_thread(client, {}, bot_id, [post["id"]], CROSS)
+                client.post(channel, refusal, root_id=root)
+                continue
+
+            info = {"channel_id": channel, "root_id": root, "own_root": False,
+                    "last_post_id": post["id"], "base": "", "status": "",
+                    "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            mark_thread(client, info, bot_id, [post["id"]], EYES)
+            author = (user.get("nickname") or user.get("username")
+                      or user.get("first_name") or "кто-то в Time")
+            text = strip_mention(without_card_links(post.get("message") or ""), handle)
+            kaiten.comment(card_id, from_thread_comment(author, text or "возьми в работу"))
+            if not mine(profile, card):
+                kaiten.add_tag(card_id, profile.get("tag") or BOT_TAG)
+            if to_queue:
+                kaiten.move(card_id, role_column(profile, "queue"))
+            threads[str(card_id)] = info
+            save_time_state(state)
+            taken += 1
+            log(f"  #{card_id} взял из канала: тег, «Очередь»")
+        cursors[channel] = {"since": max(post.get("create_at") or 0 for post in fresh)}
+        save_time_state(state)
+    if taken:
+        log(f"из каналов Time взял карточек: {taken}")
+    return taken
 
 
 # --------------------------------------------------------------------------- #
@@ -7118,6 +7317,14 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
         sweep_sprint_orphans(kaiten, cfg, args)
         return 0
     if args.only_triage:
+        # Каналы Time — и здесь: инбокс ходит раз в десять минут, а не раз в час, и
+        # позвавший Стёпу человек узнает «взял» или «не возьму» сразу. Саму карточку
+        # возьмёт в работу прогон доски
+        if not args.no_time:
+            try:
+                follow_time_mentions(kaiten, cfg, args, profiles)
+            except Exception as e:  # noqa: BLE001 — мессенджер не должен ронять разведку
+                log(f"каналы в Time не задались: {e}")
         # Техдолг ходит вместе с инбоксом: оба дешёвые и про то, чтобы ни одна задача
         # не висела ничьей. После разведки — она могла только что поставить задачу
         # в спринт, и та сразу ляжет в техдолг, а не через круг
@@ -7138,7 +7345,9 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     if args.only_merged:
         return close_merged(kaiten, cfg, args, profiles)
     if args.only_time:
-        return follow_time_threads(kaiten, cfg, args, profiles)
+        follow_time_threads(kaiten, cfg, args, profiles)
+        follow_time_mentions(kaiten, cfg, args, profiles)
+        return 0
 
     # Мерж — первым: он дешёвый (один `gh` на карточку, агента нет) и убирает с доски
     # то, что уже влито. Перед тредами в Time намеренно: карточка уезжает в «Готово»,
@@ -7156,6 +7365,12 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
             follow_time_threads(kaiten, cfg, args, profiles)
         except Exception as e:  # noqa: BLE001 — мессенджер не должен ронять поток
             log(f"треды в Time не задались: {e}")
+        # Каналы — после тредов: взятая отсюда карточка встаёт в «Очередь», и работа
+        # этого же прогона её подхватит
+        try:
+            follow_time_mentions(kaiten, cfg, args, profiles)
+        except Exception as e:  # noqa: BLE001 — мессенджер не должен ронять поток
+            log(f"каналы в Time не задались: {e}")
 
     # Разведка идёт первой из агентов: она дешёвая и быстрая, а на другом конце сидит
     # человек, который только что закинул карточку в инбокс и ждёт, что ему ответят.
