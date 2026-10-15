@@ -765,13 +765,13 @@ reply = {"data": {"repository": {"pullRequest": {
         {"author": {"login": "bot"}, "body": "🔍 **Ревью, круг 1/3**",
          "createdAt": "2026-10-15T09:30:00Z"}]},
     "reviewThreads": {"nodes": [
-        {"isResolved": False, "path": "a.ts", "line": 11, "originalLine": 11,
+        {"id": "T-a", "isResolved": False, "path": "a.ts", "line": 11, "originalLine": 11,
          "comments": {"nodes": [{"author": {"login": "dev"}, "body": "order 43 занят",
                                  "createdAt": "2026-10-15T10:00:00Z"}]}},
-        {"isResolved": True, "path": "b.ts", "line": 3, "originalLine": 3,
+        {"id": "T-b", "isResolved": True, "path": "b.ts", "line": 3, "originalLine": 3,
          "comments": {"nodes": [{"author": {"login": "dev"}, "body": "решено",
                                  "createdAt": "2026-10-15T10:00:00Z"}]}},
-        {"isResolved": False, "path": "c.ts", "line": None, "originalLine": 7,
+        {"id": "T-c", "isResolved": False, "path": "c.ts", "line": None, "originalLine": 7,
          "comments": {"nodes": [{"author": {"login": "dev"}, "body": "переименуй",
                                  "createdAt": "2026-10-15T10:00:00Z"},
                                 {"author": {"login": "dev2"}, "body": "плюсую",
@@ -780,23 +780,102 @@ calls = []
 real_run = f.run_bounded
 f.run_bounded = lambda cmd, cwd, timeout, env=None: (
     calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ""))
-said = f.pr_feedback(Path("."), "https://github.com/acme/shop/pull/12")
+feedback = f.pr_feedback(Path("."), "https://github.com/acme/shop/pull/12")
+said = [item["text"] for item in feedback]
 f.run_bounded = real_run
 check("номер PR уходит числом", "number=12" in calls[0] and "-F" in calls[0], str(calls))
-check("ревью после коммита — в списке", "- **dev** (ревью): Фикс рабочий, но см. замечания" in said,
-      str(said))
+check("ревью после коммита — в списке, с номером для ответа",
+      "- `[1]` **dev** (ревью): Фикс рабочий, но см. замечания" in said, str(said))
 check("ревью до коммита прошлый круг уже закрыл", not any("старое" in s for s in said))
 check("пустое тело ревью не шумит", not any(s.endswith("(ревью): ") for s in said))
 check("своя выжимка ревьювера не повторяется", not any("🔍" in s for s in said))
-check("инлайн-замечание — с файлом и строкой", "- **dev**, `a.ts:11`: order 43 занят" in said)
+check("инлайн-замечание — с файлом и строкой", "- `[2]` **dev**, `a.ts:11`: order 43 занят" in said)
+check("у инлайн-замечания запомнен тред — ответ уйдёт туда",
+      [item["thread"] for item in feedback] == ["", "T-a", "T-c"], str(feedback))
 check("решённый тред не тащим", not any("решено" in s for s in said))
 check("ответы в треде — под замечанием, строка из originalLine",
-      "- **dev**, `c.ts:7`: переименуй\n  - **dev2**: плюсую" in said, str(said))
+      "- `[3]` **dev**, `c.ts:7`: переименуй\n  - **dev2**: плюсую" in said, str(said))
 f.run_bounded = lambda cmd, cwd, timeout, env=None: subprocess.CompletedProcess(cmd, 1, "", "боль")
 check("GitHub не ответил — пусто, а не падение",
       f.pr_feedback(Path("."), "https://github.com/acme/shop/pull/12") == [])
 f.run_bounded = real_run
 check("не ссылка на PR — в GitHub не ходим", f.pr_feedback(Path("."), "") == [])
+check("в промпте — номера и просьба ответить",
+      "`[2]`" in f.fix_note([report, asked], feedback) and "pr_replies" in
+      f.fix_note([report, asked], feedback))
+
+print("=== 37. ответы на замечания уходят в PR ===")
+calls = []
+f.run_bounded = lambda cmd, cwd, timeout, env=None: (
+    calls.append((cmd, env)) or subprocess.CompletedProcess(cmd, 0, "{}", ""))
+sent = f.post_pr_replies(Path("."), "https://github.com/acme/shop/pull/12", feedback, [
+    {"ref": "2", "text": "Поставил order 44."},
+    {"ref": "[3]", "text": "Переименовал."},
+    {"ref": "1", "text": "Спасибо, поправил всё ниже."},
+    {"ref": "9", "text": "такого замечания нет"},
+    {"ref": "2", "text": ""}], dry_run=False)
+f.run_bounded = real_run
+threads = [c for c, _ in calls if "graphql" in c]
+check("инлайн-замечания — ответом в свой тред",
+      [next(a for a in c if a.startswith("thread=")) for c in threads]
+      == ["thread=T-a", "thread=T-c"], str(threads))
+check("ответ помечен — следующим кругом его не примут за замечание",
+      all(next(a for a in c if a.startswith("body=")).startswith("body=" + f.AGENT_MARK)
+          for c in threads))
+loose = [c for c, _ in calls if c[:3] == ["gh", "pr", "comment"]]
+check("ревью без строки — одним общим комментарием", len(loose) == 1, str(calls))
+check("выдуманный номер и пустой ответ не уходят", sent == 3, str(sent))
+check("без своего токена — под тем, кто залогинен в gh", all(e is None for _, e in calls))
+calls.clear()
+f.run_bounded = lambda cmd, cwd, timeout, env=None: (
+    calls.append((cmd, env)) or subprocess.CompletedProcess(cmd, 0, "{}", ""))
+f.post_pr_replies(Path("."), "https://github.com/acme/shop/pull/12", feedback,
+                  [{"ref": "2", "text": "ок"}], dry_run=False, token="bot-token")
+f.run_bounded = real_run
+check("свой токен бота — только этим вызовам", calls[0][1]["GH_TOKEN"] == "bot-token")
+calls.clear()
+f.run_bounded = lambda *a, **k: calls.append(a) or subprocess.CompletedProcess([], 0, "", "")
+f.post_pr_replies(Path("."), "https://github.com/acme/shop/pull/12", feedback,
+                  [{"ref": "2", "text": "ок"}], dry_run=True)
+f.run_bounded = real_run
+check("сухой прогон в GitHub не пишет", calls == [])
+
+print("=== 38. Стёпа пишет людям суть, без файлов и расхода ===")
+verdict = {"summary": "Оплата больше не запускается дважды.", "risks": "Сценарий не прогонялся."}
+meta = {"cost_usd": 8.1, "duration_ms": 760000, "num_turns": 93}
+done = f.comment_success(verdict, meta, "https://github.com/acme/shop/pull/12", "stepa/card-1")
+check("в отчёте нет ветки и расхода", "Ветка" not in done and "$" not in done, done)
+check("но есть PR, суть и что проверить",
+      "PR: https://github.com/acme/shop/pull/12" in done and "Оплата" in done
+      and "**Проверь:**" in done, done)
+review = {"summary": "Годно.", "findings": [
+    {"severity": "minor", "where": "a.ts:11", "what": "order 43 занят",
+     "why": "сценарии встанут в произвольном порядке", "fix": "поставить 44"}]}
+pr_text = f.comment_review(review, meta, 1, 3, False)
+check("в ревью на PR — одна строка на замечание",
+      "order 43 занят → поставить 44" in pr_text, pr_text)
+check("без файла, причины и расхода",
+      "a.ts" not in pr_text and "причина" not in pr_text and "$" not in pr_text, pr_text)
+short = f.comment_review_short({**review, "findings": [{**review["findings"][0],
+                                                        "severity": "major"}]},
+                               meta, 1, 3, True, "https://github.com/acme/shop/pull/12",
+                               [{**review["findings"][0], "severity": "major"}])
+check("в карточке тоже без файла и расхода", "a.ts" not in short and "$" not in short, short)
+logs = Path(tempfile.mkdtemp())
+f.LOGS = logs
+(logs / "review-555-20261015-100000.json").write_text(json.dumps({"review": review}),
+                                                       encoding="utf-8")
+check("а исполнителю в круге правок — целиком, из лога ревью",
+      "`a.ts:11`" in f.review_details(555) and "причина" in f.review_details(555))
+(logs / "triage-900-20261015-100000.json").write_text(json.dumps({"verdict": {
+    "where": ["`src/a.ts:3` — считает шаги"]}}), encoding="utf-8")
+described = f.work_card_description({"id": 900, "description": "сломалось"}, [],
+                                    {"problem": "Шаги сбиваются.",
+                                     "where": ["`src/a.ts:3` — считает шаги"],
+                                     "plan": ["Зафиксировать шаги"]}, "https://k/900")
+check("в описании задачи из инбокса мест в коде нет", "src/a.ts" not in described, described)
+check("исполнитель получает их подсказкой из разведки",
+      "src/a.ts:3" in f.scout_hints({"description": described}))
 
 srv.shutdown()
 print("\nвсё сошлось")

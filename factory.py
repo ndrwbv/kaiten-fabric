@@ -235,6 +235,13 @@ VERDICT_SCHEMA = {
         # о проверках, чаще их и запускает. Оседает в logs/card-*.json
         "checks": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}},
+        # ответы на замечания людей из PR, по номеру замечания: уезжают в сам PR
+        "pr_replies": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"ref": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["ref", "text"],
+            "additionalProperties": False,
+        }},
     },
     "required": ["status", "summary"],
     "additionalProperties": False,
@@ -1301,9 +1308,8 @@ def time_announce(kaiten: Kaiten, cfg: dict, args, card_id: int) -> int:
     for comment in kaiten.comments(card_id):
         text = strip_html(comment.get("text", ""))
         if text.startswith(AGENT_MARK) and "PR:" in text:
-            after = text.split("Ветка:", 1)[-1]
-            after = after.split("\n", 1)[-1] if "\n" in after else ""
-            blocks = [block.strip() for block in after.split("\n\n") if block.strip()]
+            blocks = [block.strip() for block in text.split("\n\n")[1:]
+                      if block.strip() and not block.strip().startswith(("PR:", "Ветка:"))]
             summary = blocks[0] if blocks else ''
     notify_pr(cfg, repo_key, card, kaiten.card_url(card), pr_url,
               {"summary": summary}, args.dry_run)
@@ -2771,7 +2777,7 @@ FIX_NOTE = """
 > 🔍 **Это круг правок после ревью.** Твои прошлые коммиты уже в ветке и в открытом PR —
 > ветка отведена от них, а не от `main`. Не переделывай задачу заново.
 >
-> Замечания ревьювера — в комментариях выше, помечены значком 🔍, бери самое последнее.
+> Замечания ревьювера — коротко в комментарии 🔍 выше, подробно (с файлом и причиной) ниже.
 > Закрой их все: `🛑` и `⚠️` обязательно, `💬` — по возможности. Правь ровно то, на что
 > указано, попутных изменений не вноси.
 >
@@ -2804,13 +2810,25 @@ HUMAN_FIX_NOTE = """
 """
 
 
-def fix_note(comments: list, feedback: list[str]) -> str:
+PR_REPLIES_NOTE = """
+На каждое замечание из этого списка ответь в `pr_replies`: `ref` — номер из квадратных
+скобок, `text` — одна короткая фраза от первого лица, как ответил бы автор PR: что
+поправил («Переименовал в `initialShouldSkipCustomerPhone`») или почему оставил как есть.
+Ответ уйдёт в PR рядом с замечанием — без «агента», «круга» и пересказа замечания.
+"""
+
+
+def fix_note(comments: list, feedback: list[dict], details: str = "") -> str:
     """Чей это круг правок — ревьювера или человека из треда — и что люди сказали в PR."""
     last = strip_html(comments[-1].get("text", "")) if comments else ""
-    note = HUMAN_FIX_NOTE if last.startswith(FROM_TIME_MARK) else FIX_NOTE
+    human = last.startswith(FROM_TIME_MARK)
+    note = HUMAN_FIX_NOTE if human else FIX_NOTE
+    if details and not human:
+        note += "\n**Замечания ревьювера подробно:**\n\n" + details + "\n"
     if feedback:
         note += ("\n**Замечания людей в PR** (новее последнего коммита ветки):\n\n"
-                 + "\n".join(feedback) + "\n")
+                 + "\n".join(item["text"] for item in feedback) + "\n"
+                 + PR_REPLIES_NOTE)
     return note
 
 
@@ -2897,7 +2915,7 @@ def apply_template(template: str, replacements: dict) -> str:
 
 def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_url: str,
                  returning: bool = False, fixing: bool = False,
-                 feedback: list[str] | None = None) -> str:
+                 feedback: list[dict] | None = None) -> str:
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     replacements = {
         "{{CARD_ID}}": str(card["id"]),
@@ -2909,8 +2927,9 @@ def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_u
         "{{BRANCH}}": branch,
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
-        "{{RETURN_NOTE}}": (fix_note(comments, feedback or []) if fixing
-                            else RETURN_NOTE if returning else ""),
+        "{{RETURN_NOTE}}": (fix_note(comments, feedback or [], review_details(card["id"]))
+                            if fixing else RETURN_NOTE if returning else "")
+                           + scout_hints(card),
         **project_replacements(repo_cfg.get("key")),
     }
     return apply_template(template, replacements)
@@ -3392,12 +3411,16 @@ def format_list(title: str, items) -> str:
 
 
 def comment_success(verdict: dict, meta: dict, pr_url: str, branch: str) -> str:
-    text = f"🤖 **Готово, нужен ревью.**\n\nPR: {pr_url}\nВетка: `{branch}`"
+    """
+    Отчёт в карточку: ссылка, что сделано и что проверить. Больше ничего.
+
+    Ветка, время и деньги прогона — в логе (`logs/card-*.json`): человеку в карточке
+    они ни к чему, а абзац «рисков» с именами файлов читать никто не станет.
+    """
+    text = f"🤖 **Готово, нужен ревью.**\n\nPR: {pr_url}"
     text += f"\n\n{verdict.get('summary', '')}"
     if verdict.get("risks"):
-        text += f"\n\n**Риски:** {verdict['risks']}"
-    if format_meta(meta):
-        text += f"\n\n_Агент: {format_meta(meta)}._"
+        text += f"\n\n**Проверь:** {verdict['risks']}"
     text += format_assumptions(verdict)
     return text
 
@@ -3407,8 +3430,6 @@ def comment_question(verdict: dict, meta: dict) -> str:
     text += verdict.get("summary", "")
     text += format_list("Что нужно уточнить", verdict.get("questions"))
     text += "\n\nПоправь описание карточки и верни её в «Очередь»."
-    if format_meta(meta):
-        text += f"\n\n_Агент: {format_meta(meta)}._"
     return text
 
 
@@ -3996,7 +4017,8 @@ def fix_round_cards(kaiten: Kaiten, profile: dict) -> list:
     fixes_column = role_column(profile, "fixes")
     in_progress = role_column(profile, "in_progress")
     if fixes_column and fixes_column != in_progress:
-        return kaiten.cards_in_column(profile["board_id"], fixes_column)
+        return [card for card in kaiten.cards_in_column(profile["board_id"], fixes_column)
+                if not theirs(profile, card)]
 
 
     found = []
@@ -4165,6 +4187,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       comments(last: 50) { nodes { author { login } body createdAt } }
       reviewThreads(last: 100) {
         nodes {
+          id
           isResolved
           path
           line
@@ -4177,20 +4200,32 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """
 
+PR_REPLY_MUTATION = """
+mutation($thread: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) {
+    comment { id }
+  }
+}
+"""
 
-def pr_feedback(repo: Path, pr_url: str) -> list[str]:
+
+def pr_feedback(repo: Path, pr_url: str) -> list[dict]:
     """
-    Что люди написали в PR после последнего коммита ветки — строками для промпта.
+    Что люди написали в PR после последнего коммита ветки.
 
     Человек ревьюит в GitHub, а просит в треде одной фразой: «поправь замечания из PR».
     Исполнитель видит только карточку, и без этого списка ему не на что опереться.
 
+    Каждое замечание — `ref` (номер, по которому агент на него ответит), `thread`
+    (id инлайн-треда на GitHub, пусто у ревью и общих комментариев), `who`, `quote`
+    (первая строка — чтобы было видно, на что ответ) и `text` — строка для промпта.
+
     «После последнего коммита» — граница того, что уже разобрано: ревью, оставленное
     до прошлого круга, тот круг и закрыл. Инлайн-тред берём, только если он не решён
-    и в нём писали после коммита. Свои реплики (🔍, 🤖 — выжимка ревьювера, отчёты)
-    отсекаются по метке: под каким логином их пишет фабрика, не важно.
-    Пусто — и когда замечаний нет, и когда GitHub не ответил: круг правок от этого
-    не встаёт, просто идёт по карточке.
+    и последний человек писал в нём после коммита. Свои реплики (🔍, 🤖 — выжимка
+    ревьювера, отчёты, ответы на замечания) отсекаются по метке: под каким логином их
+    пишет фабрика, не важно. Пусто — и когда замечаний нет, и когда GitHub не ответил:
+    круг правок от этого не встаёт, просто идёт по карточке.
     """
     parts = PR_PARTS_RE.match(pr_url or "")
     if not parts:
@@ -4223,24 +4258,99 @@ def pr_feedback(repo: Path, pr_url: str) -> list[str]:
         return (node.get("author") or {}).get("login") or "?"
 
     found = []
+
+    def add(author: str, head: str, body: str, thread: str = "", tail: list | None = None):
+        ref = str(len(found) + 1)
+        text = f"- `[{ref}]` **{author}**{head}: {body}"
+        text += "".join(f"\n  - **{a}**: {b}" for a, b in tail or [])
+        found.append({"ref": ref, "thread": thread, "who": author,
+                      "quote": body.splitlines()[0][:200], "text": text})
+
     for review in (pull.get("reviews") or {}).get("nodes") or []:
         body = (review.get("body") or "").strip()
         if human(body) and fresh(review.get("submittedAt")):
-            found.append(f"- **{who(review)}** (ревью): {body}")
+            add(who(review), " (ревью)", body)
     for comment in (pull.get("comments") or {}).get("nodes") or []:
         body = (comment.get("body") or "").strip()
         if human(body) and fresh(comment.get("createdAt")):
-            found.append(f"- **{who(comment)}**: {body}")
+            add(who(comment), "", body)
     for thread in (pull.get("reviewThreads") or {}).get("nodes") or []:
         said = [c for c in (thread.get("comments") or {}).get("nodes") or []
                 if human((c.get("body") or "").strip())]
         if thread.get("isResolved") or not said or not fresh(said[-1].get("createdAt")):
             continue
         where = f"`{thread.get('path')}:{thread.get('line') or thread.get('originalLine')}`"
-        lines = [f"- **{who(said[0])}**, {where}: {said[0]['body'].strip()}"]
-        lines += [f"  - **{who(c)}**: {c['body'].strip()}" for c in said[1:]]
-        found.append("\n".join(lines))
+        add(who(said[0]), f", {where}", said[0]["body"].strip(), thread.get("id") or "",
+            [(who(c), c["body"].strip()) for c in said[1:]])
     return found
+
+
+def post_pr_replies(worktree: Path, pr_url: str, feedback: list[dict],
+                    replies: list, dry_run: bool, token: str = "") -> int:
+    """
+    Ответы на замечания людей — в сам PR, рядом с замечаниями. Отдаёт, сколько ушло.
+
+    Человек ревьюил в GitHub — там же он и ждёт ответа, а не в карточке, которую
+    не открывал. Инлайн-замечание получает ответ в своём треде, ревью и общие
+    комментарии — одним комментарием к PR с цитатой, на что это ответ: десяток
+    отдельных комментариев зарос бы быстрее, чем их прочтут.
+
+    Каждый ответ начинается с AGENT_MARK: так `pr_feedback` узнаёт свою реплику
+    и следующим кругом не примет её за новое замечание. Пишется под тем, под кем
+    залогинен `gh`, — пока это аккаунт человека. `token` — свой аккаунт бота, когда
+    он появится: уйдёт в `GH_TOKEN` только этим вызовам.
+
+    Треды не закрываем: «решено» говорит тот, кто спрашивал.
+    """
+    by_ref = {item["ref"]: item for item in feedback}
+    said = {}
+    for reply in replies or []:
+        ref = str((reply or {}).get("ref") or "").strip("[] `")
+        text = str((reply or {}).get("text") or "").strip()
+        if ref in by_ref and text:
+            said[ref] = text
+    if not said:
+        return 0
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+
+    posted = 0
+    loose = []
+    for ref, text in said.items():
+        item = by_ref[ref]
+        if not item["thread"]:
+            loose.append(f"> **{item['who']}:** {item['quote']}\n\n{text}")
+            continue
+        body = f"{AGENT_MARK} {text}"
+        if dry_run:
+            log(f"  [dry-run] ответ в тред замечания [{ref}]: {text[:80]}")
+            continue
+        proc = run_bounded(["gh", "api", "graphql", "-f", f"query={PR_REPLY_MUTATION}",
+                            "-f", f"thread={item['thread']}", "-f", f"body={body}"],
+                           worktree, 120, env=env)
+        if proc.returncode != 0:
+            log(f"  !! ответ на замечание [{ref}] не ушёл: {proc.stderr.strip()[:160]}")
+            continue
+        posted += 1
+
+    if loose:
+        body = f"{AGENT_MARK} **По замечаниям**\n\n" + "\n\n".join(loose)
+        if dry_run:
+            log(f"  [dry-run] общий ответ в PR на {len(loose)} замечаний")
+        else:
+            handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                                 encoding="utf-8")
+            try:
+                handle.write(body)
+                handle.close()
+                proc = run_bounded(["gh", "pr", "comment", pr_url, "--body-file",
+                                    handle.name], worktree, 120, env=env)
+            finally:
+                os.unlink(handle.name)
+            if proc.returncode != 0:
+                log(f"  !! общий ответ в PR не ушёл: {proc.stderr.strip()[:160]}")
+            else:
+                posted += len(loose)
+    return posted
 
 
 def shipped_commit(repo: Path, repo_cfg: dict, card_id: int) -> dict:
@@ -4445,17 +4555,53 @@ def build_review_prompt(card: dict, card_url: str, repo_cfg: dict, branch: str,
 
 
 def format_findings(findings) -> str:
+    """
+    Замечания людям — по строке: что не так и что сделать.
+
+    Файл, строка и «причина» сюда не идут: человек читает ревью между делом, и абзац
+    на каждое замечание он пролистает. Исполнителю подробности нужны — он берёт их
+    из лога ревью (`review_details`), а не из этого текста.
+    """
     if not findings:
         return ""
     lines = []
     for item in findings:
         icon = SEVERITY_ICON.get(item.get("severity", ""), "•")
-        lines.append(f"\n{icon} `{item.get('where', '?')}` — {item.get('what', '')}")
+        fix = f" → {item['fix']}" if item.get("fix") else ""
+        lines.append(f"{icon} {item.get('what', '')}{fix}")
+    return "\n\n" + "\n".join(lines)
+
+
+def latest_log(prefix: str) -> dict:
+    """Последний лог вида `logs/<prefix>-<время>.json`. Пусто — лога нет или он битый."""
+    found = sorted(LOGS.glob(f"{prefix}-*.json")) if LOGS.is_dir() else []
+    if not found:
+        return {}
+    try:
+        return json.loads(found[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def review_details(card_id: int) -> str:
+    """
+    Замечания последнего ревью целиком — с файлом, причиной и что делать.
+
+    Людям уходит выжимка по строке, а исполнителю в круге правок без «где» и «почему»
+    придётся искать заново то, что ревьювер уже нашёл. Лог пишется на каждое ревью.
+    """
+    findings = ((latest_log(f"review-{card_id}").get("review") or {})
+                .get("findings") or [])
+    lines = []
+    for item in findings:
+        icon = SEVERITY_ICON.get(item.get("severity", ""), "•")
+        line = f"- {icon} `{item.get('where', '?')}` — {item.get('what', '')}"
         if item.get("why"):
-            lines.append(f"  причина: {item['why']}")
+            line += f"\n  причина: {item['why']}"
         if item.get("fix"):
-            lines.append(f"  → {item['fix']}")
-    return "\n\n**Замечания**\n" + "\n".join(lines)
+            line += f"\n  → {item['fix']}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
@@ -4465,9 +4611,7 @@ def comment_review(review: dict, meta: dict, round_number: int, max_rounds: int,
     text += full_summary(review)
     text += format_findings(review.get("findings"))
     if needs_changes:
-        text += "\n\nЗабираю в «Правки»: поправлю и вернусь с обновлённым PR."
-    if format_meta(meta):
-        text += f"\n\n_Ревьювер: {format_meta(meta)}._"
+        text += "\n\nПоправлю и вернусь с обновлённым PR."
     return text
 
 
@@ -4543,18 +4687,16 @@ def comment_review_short(review: dict, meta: dict, round_number: int, max_rounds
         blocking = [f for f in findings if f.get("severity") in ("blocker", "major")]
         text = (f"{REVIEWER_MARK} **Нужны правки: {len(blocking)} "
                 f"из {len(findings)}.**\n\n{review.get('summary', '')}")
-        # только сами замечания, без причин и «как чинить» — это уже на гите
+        # только сами замечания, без файлов, причин и «как чинить» — это уже на гите
+        if blocking:
+            text += "\n"
         for item in blocking[:4]:
             icon = SEVERITY_ICON.get(item.get("severity", ""), "•")
-            where = item.get("where") or ""
-            text += f"\n\n{icon} {item.get('what', '')}" + (f"\n  `{where}`" if where else "")
+            text += f"\n{icon} {item.get('what', '')}"
         if len(blocking) > 4:
-            text += f"\n\n…и ещё {len(blocking) - 4}."
+            text += f"\n…и ещё {len(blocking) - 4}."
     if pr_url.startswith("http"):
-        text += f"\n\nПодробно, с причинами и что делать: {pr_url}"
-    tail = format_meta(meta)
-    line = f"ревью, круг {round_number} из {max_rounds}"
-    text += f"\n\n_{line}{': ' + tail if tail else ''}._"
+        text += f"\n\nPR: {pr_url}"
     return text
 
 
@@ -4952,6 +5094,15 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
         if pr_url.startswith("http") and mock_backend_warning(card) and not args.dry_run:
             post_pr_review(worktree, pr_url, MOCK_BACKEND_NOTE)
 
+        # Ревьюили в GitHub — там же и ответ, после пуша: ссылаться на правку,
+        # которой ещё нет в PR, нельзя
+        if feedback and pr_url.startswith("http"):
+            write_status(phase="отвечаю на замечания в PR")
+            answered = post_pr_replies(worktree, pr_url, feedback,
+                                       verdict.get("pr_replies") or [], args.dry_run,
+                                       load_env().get("GITHUB_REPLY_TOKEN", ""))
+            log(f"  ответил в PR на {answered} из {len(feedback)} замечаний")
+
         text = comment_success(verdict, meta, pr_url, branch)
         # Обе приписки — без значка в начале строки. Со значком они выглядели для
         # open_questions пунктом списка, и «не отчитался о проверках» уезжало человеку
@@ -5155,16 +5306,33 @@ def work_card_description(card: dict, comments: list, verdict: dict, card_url: s
     if human:
         parts.append("**Что писали в комментариях**\n\n" + format_comments(human))
 
-    scout = [f"**Разведка агента**\n\n{verdict.get('problem', '')}",
-             format_list("Где это в коде", verdict.get("where")).strip(),
+    # Места в коде сюда не идут: описание читают люди, а исполнитель возьмёт их
+    # из лога разведки (`scout_hints`) — там же, где они и лежат целиком
+    scout = [f"**Суть:** {verdict.get('problem', '')}",
              format_list("Как чинить", verdict.get("plan")).strip()]
     if verdict.get("risk"):
-        scout.append(f"**На что смотреть:** {verdict['risk']}")
+        scout.append(f"**Проверь:** {verdict['risk']}")
     parts.append("\n\n".join(block for block in scout if block))
-
-    parts.append("_Карточку поставил разведчик инбокса. Разведка — не приговор: "
-                 "если в коде другое, верь коду._")
     return "\n\n".join(parts)
+
+
+def scout_hints(card: dict) -> str:
+    """
+    Где разведка нашла задачу в коде — для исполнителя, раз в описании этого больше нет.
+
+    Карточку из инбокса узнаём по строке «Из инбокса: #<id>», разведку — по логу этой
+    карточки инбокса. Нет лога (разведку делали на другой машине) — пусто, исполнитель
+    найдёт сам.
+    """
+    found = INBOX_ORIGIN_RE.search(strip_html(card.get("description")) or "")
+    if not found:
+        return ""
+    where = (latest_log(f"triage-{found.group(1)}").get("verdict") or {}).get("where") or []
+    if not where:
+        return ""
+    return ("\n\n> 🧭 **Где разведка нашла это в коде** — подсказка, а не приговор: "
+            "если в коде другое, верь коду.\n"
+            + "\n".join(f"> - {item}" for item in where if str(item).strip()))
 
 
 def handoff_profile(cfg: dict, product: str | None = None) -> dict:
@@ -5346,11 +5514,10 @@ def build_triage_prompt(card: dict, comments: list, card_url: str, repo_key: str
 def comment_triage(verdict: dict, meta: dict, round_number: int, handoff: str = "") -> str:
     status = verdict.get("status")
     text = f"{TRIAGE_MARK} **Разведка: {TRIAGE_HEAD[status]}.**\n\n{verdict.get('problem', '')}"
-    text += format_list("Где это в коде", verdict.get("where"))
     text += format_list("Что нужно уточнить", verdict.get("questions"))
     text += format_list("Как чинить" if status == "ready" else "Гипотеза", verdict.get("plan"))
     if verdict.get("risk"):
-        text += f"\n\n**На что смотреть:** {verdict['risk']}"
+        text += f"\n\n**Проверь:** {verdict['risk']}"
 
     if status == "ready":
         text += f"\n\n{handoff}" if handoff else (
@@ -5359,8 +5526,7 @@ def comment_triage(verdict: dict, meta: dict, round_number: int, handoff: str = 
     elif status == "needs_info":
         text += "\n\nОтветь комментарием здесь — я вернусь и пересмотрю."
 
-    tail = [bit for bit in (EFFORT_LABEL.get(verdict.get("effort") or ""), format_meta(meta))
-            if bit]
+    tail = [bit for bit in (EFFORT_LABEL.get(verdict.get("effort") or ""),) if bit]
     line = "разведка" + (f", круг {round_number}" if round_number > 1 else "")
     if tail:
         line += ": " + ", ".join(tail)

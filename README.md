@@ -1010,7 +1010,7 @@ PR 3 — вёрстка» (это шаги внутри одного PR), а д�
 
 ```jsonc
 "agent": {
-  "model": "claude-opus-5",
+  "model": "claude-opus-5-5",
   "effort": "high",      // максимум, который отдаёт подписка claude.ai
   "max_budget_usd": 6.0,
   "timeout_sec": 1800
