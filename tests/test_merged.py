@@ -167,9 +167,9 @@ check("под чужим блокером не двигаем", kaiten.moves == 
 check("и чужой блокер не снимаем", kaiten.unblocked == [], str(kaiten.unblocked))
 check("gh не тревожим", ASKED == [], str(ASKED))
 
-print("=== 5. «Клод, не трогай» сильнее мержа ===")
+print("=== 5. «Стёпа, не трогай» сильнее мержа ===")
 ASKED.clear(); fake_gh(MERGED)
-kaiten = FakeKaiten(comments=[{"text": REPORT}, {"text": "клод не трогай, я сам закрою"}])
+kaiten = FakeKaiten(comments=[{"text": REPORT}, {"text": "Стёпа, не трогай, я сам закрою"}])
 f.close_merged(kaiten, CFG, Args(), profiles)
 check("не тронули", kaiten.moves == [] and kaiten.written == [], str(kaiten.moves))
 

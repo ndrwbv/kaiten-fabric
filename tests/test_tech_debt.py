@@ -109,7 +109,7 @@ k = FakeKaiten([
     task(5, state=3, done_at="2020-01-01T10:00:00Z"),   # закрыта до спринта
     task(6, state=3, done_at=f"{start.isoformat()}T10:00:00Z"),  # закрыта в спринте
     task(7, [404404]),                         # родитель удалён
-    task(8, title="Клод не трогай: разберусь сам"),
+    task(8, title="Стёпа не трогай: разберусь сам"),
 ], [debt_card])
 linked = f.link_sprint_orphans(k, CFG, LIVE)
 check("висят на техдолге ровно задачи без эпика",

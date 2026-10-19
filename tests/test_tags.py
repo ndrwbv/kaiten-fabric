@@ -167,5 +167,21 @@ for phrase in ("Стёпа не трогай эту карточку", "СТЕП
                                                [], {})))
 check("а обычный текст не выключает",
       not f.hands_off({"title": "Стёпа, посмотри плз", "description": ""}, [], {}))
+check("«клод не трогай» больше не стоп-фраза",
+      not f.hands_off({"title": "Тест", "description": "клод не трогай"}, [], {}))
+
+print("=== 11. тег nostepa выключает карточку так же, как фраза ===")
+check("тег nostepa", f.hands_off({"title": "Тест", "tags": [{"name": "nostepa"}]}, [], {})
+      == "тег nostepa")
+check("регистр не важен",
+      bool(f.hands_off({"title": "Тест", "tags": [{"name": "NoStepa"}]}, [], {})))
+check("тег stepa сам по себе не выключает",
+      not f.hands_off({"title": "Тест", "tags": [{"name": "stepa"}]}, [], {}))
+check("свой тег бота — свой стоп-тег",
+      bool(f.hands_off({"title": "Тест", "tags": [{"name": "nofedya"}]}, [],
+                       {"bot": {"tag": "fedya"}})))
+check("фразы из конфига дополняют встроенные",
+      bool(f.hands_off({"title": "руками не трогать"}, [], {"stop_phrases": ["руками не трогать"]}))
+      and bool(f.hands_off({"title": "Стёпа не трогай"}, [], {"stop_phrases": ["руками не трогать"]})))
 
 print("\nвсё сошлось")

@@ -998,7 +998,8 @@ def rules(cfg: dict) -> list[dict]:
     blocks.append({"title": "Как его остановить", "lines": [
         "Фраза в карточке — и к ней не подойдёт ни один агент: "
         + ", ".join(f"«{phrase}»" for phrase in
-                    (cfg.get("stop_phrases") or factory.STOP_PHRASES)[:4]) + ".",
+                    factory.STOP_PHRASES[:4]) + ".",
+        f"Тег `{factory.stop_tag(cfg)}` — то же самое, без слов в тексте.",
         f"Снять тег `{tag}` — заберёшь карточку обратно себе.",
         "Кнопка «Стоп» в шапке гасит текущий прогон целиком — и обёртку, и агента.",
     ]})

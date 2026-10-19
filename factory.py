@@ -125,13 +125,13 @@ BOT_TAG = "stepa"
 NIGHT_SUFFIX = ":night"
 
 # Ручной стоп-кран: фраза в карточке выключает по ней всех агентов. Список можно
-# дополнить в config.json, ключ stop_phrases.
+# дополнить в config.json, ключ stop_phrases. То же самое без слов в тексте —
+# тег `no<тег Стёпы>`, по умолчанию `nostepa`.
 STOP_PHRASES = [
     "стёпа не трогай", "степа не трогай", "не трогай стёпу", "не трогай степу",
     "стёпа не бери", "степа не бери", "не для стёпы", "не для степы",
-    "клод не трогай", "не трогай клод", "клод не бери", "не для клода",
-    "claude не трогай", "не трогай claude",
 ]
+STOP_TAG_PREFIX = "no"
 
 # Kaiten отвечает 400 на комментарий длиннее 4096 символов. Считает он, судя по
 # поведению, в UTF-16 (эмодзи = 2), поэтому и мы меряем так же и оставляем запас
@@ -3000,24 +3000,33 @@ def strip_html(text: str) -> str:
 
 
 def normalize_phrase(text: str) -> str:
-    """«Клод, НЕ ТРОГАЙ!!» -> «клод не трогай»: сравниваем без регистра и знаков."""
+    """«Стёпа, НЕ ТРОГАЙ!!» -> «стёпа не трогай»: сравниваем без регистра и знаков."""
     return re.sub(r"[^\w]+", " ", (text or "").lower()).strip()
+
+
+def stop_tag(cfg: dict) -> str:
+    """Тег-стоп-кран: `nostepa` при теге Стёпы `stepa`."""
+    return STOP_TAG_PREFIX + bot_tag(cfg)
 
 
 def hands_off(card: dict, comments: list, cfg: dict) -> str | None:
     """
-    Просили не трогать? Тогда возвращаем найденную фразу, и агент к карточке не подходит.
+    Просили не трогать? Тогда возвращаем найденную фразу (или тег), и агент к карточке
+    не подходит.
 
-    Смотрим заголовок, описание и человеческие комментарии. Свои не смотрим: иначе агент,
-    процитировавший запрет, заблокировал бы карточку сам себе.
+    Смотрим тег `nostepa`, заголовок, описание и человеческие комментарии. Свои
+    не смотрим: иначе агент, процитировавший запрет, заблокировал бы карточку сам себе.
     """
+    tag = stop_tag(cfg)
+    if has_tag(card, tag):
+        return f"тег {tag}"
     human = [strip_html(c.get("text", "")) for c in comments or []]
     haystack = normalize_phrase(" ".join([
         card.get("title") or "",
         strip_html(card.get("description")),
         *(text for text in human if not text.startswith(AGENT_MARKS)),
     ]))
-    for phrase in cfg.get("stop_phrases") or STOP_PHRASES:
+    for phrase in STOP_PHRASES + list(cfg.get("stop_phrases") or []):
         if normalize_phrase(phrase) in haystack:
             return phrase
     return None
