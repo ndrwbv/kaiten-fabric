@@ -993,27 +993,42 @@ check("свой тред по-прежнему держит статус в ко
 check("в чужом треде до PR статусу жить негде",
       f.status_post({"root_id": "m1", "own_root": False}) == "")
 
-print("=== 41. Стёпа тегает в треде автора карточки ===")
-f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"888": {
-    "channel_id": "chan-1", "root_id": "root8", "last_post_id": "root8"}}}),
-    encoding="utf-8")
+print("=== 41. после PR Стёпа зовёт в тред автора карточки ===")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {}}), encoding="utf-8")
 owned = {"id": 888, "title": "Задача", "owner": {"email": "author@example.com"}}
 GOT.clear()
 f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
-            {"summary": "Поправил шапку."}, False, updated=True)
-said = [json.loads(g[2])["message"] for g in GOT
-        if g[0] == "POST" and g[1].endswith("/posts")]
-check("«поправил» начинается с тега автора",
-      said == ["@author Чекай, поправил: Поправил шапку."], str(said))
+            {"summary": "Сделал задачу."}, False)
+said = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/posts")]
+check("сначала PR в канал, потом тег в его тред",
+      len(said) == 2 and "root_id" not in said[0] and "pull/8" in said[0]["message"]
+      and said[1].get("root_id") == "new-post", str(said))
+check("тег — отдельным ответом, сам PR без него",
+      said[1]["message"].startswith("@author ") and "@author" not in said[0]["message"],
+      str(said))
 check("автор нашёлся по почте",
       any(g[1].endswith("/users/email/author%40example.com") for g in GOT), str(GOT))
 check("и запомнен в треде",
       json.loads(f.TIME_STATE_FILE.read_text())["threads"]["888"]["author"] == "@author")
 GOT.clear()
 f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
-            {"summary": "Ещё раз."}, False, updated=True)
-check("второй раз Time про автора не спрашиваем",
-      not any("/users/email/" in g[1] for g in GOT), str(GOT))
+            {"summary": "Поправил шапку."}, False, updated=True)
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("«поправил» уже без тега — автор и так в треде",
+      said == ["Чекай, поправил: Поправил шапку."], str(said))
+
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"889": {
+    "channel_id": "chan-1", "root_id": "m9", "own_root": False}}}), encoding="utf-8")
+GOT.clear()
+f.notify_pr(cfg, "kiosk", dict(owned, id=889), "https://k/889",
+            "https://github.com/acme/shop/pull/9", {"summary": "Сделал."}, False)
+said = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/posts")]
+check("в чужом треде тоже: PR, потом тег, оба туда же",
+      len(said) == 2 and all(m.get("root_id") == "m9" for m in said)
+      and said[1]["message"].startswith("@author "), str(said))
+check("в сообщение со статусом тег не попал",
+      "@author" not in json.loads(f.TIME_STATE_FILE.read_text())["threads"]["889"]["base"])
 
 client = f.Time(BASE, token="tok-123")
 check("нет такого в Time — без тега",

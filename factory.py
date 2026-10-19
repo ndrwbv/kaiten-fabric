@@ -1431,10 +1431,8 @@ def author_mention(client: Time, card: dict, info: dict) -> str:
     """
     `@логин` автора карточки в Time — или пусто, если его там не нашли.
 
-    Тред — разговор про его задачу, а Mattermost зовёт в тред только тех, кого
-    в нём упомянули: без тега вопросы Стёпы и «поправил» висят там, куда автор
-    может и не заглянуть. Находку запоминаем в треде, чтобы не спрашивать Time
-    на каждое сообщение; сбой сети — не находка, его не запоминаем.
+    Находку запоминаем в треде, чтобы не спрашивать Time второй раз; сбой
+    сети — не находка, его не запоминаем.
     """
     if "author" in info:
         return info["author"]
@@ -1451,8 +1449,24 @@ def author_mention(client: Time, card: dict, info: dict) -> str:
     return info["author"]
 
 
-def with_mention(mention: str, text: str) -> str:
-    return f"{mention} {text}" if mention and text else text
+def tag_author(client: Time, card: dict, info: dict, channel: str, root_id: str) -> None:
+    """
+    Позвать автора карточки в тред с PR.
+
+    Mattermost зовёт в тред только тех, кого в нём упомянули: без тега автор
+    узнаёт про PR, только если сам наткнётся на него в канале, а вопросы
+    и «поправил» потом висят там, куда он не заглядывает. Отдельным ответом,
+    а не в самом сообщении про PR: оно — две строки ссылок, и его потом
+    переписывает статус. Не вышло — PR от этого хуже не стал, только в лог.
+    """
+    mention = author_mention(client, card, info)
+    if not mention or not root_id:
+        return
+    try:
+        client.post(channel, f"{mention} это по твоей карточке", root_id=root_id)
+        log(f"  позвал в тред автора карточки ({mention})")
+    except FactoryError as e:
+        log(f"  !! не позвал автора карточки в тред: {e}")
 
 
 def thread_marks(info: dict) -> dict:
@@ -1547,7 +1561,6 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             else:
                 text = (f"Чекай, поправил: {summary}" if summary
                         else "Чекай, поправил по замечаниям, подробности в PR.")
-            text = with_mention(author_mention(client, card, known), text)
             client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
             # Отчёт ушёл — значит реакциям конец: они висели вместо слов, пока шла
             # работа, а теперь за неё говорит сам отчёт
@@ -1564,9 +1577,9 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         if known.get("own_root") is False and known.get("root_id"):
             # Карточку дали в канале — PR и есть ответ на ту просьбу, туда же он и
             # уходит. Это сообщение несёт и статус: корень треда чужой.
-            base = with_mention(author_mention(client, card, known), base)
             post = client.post(known.get("channel_id", ""), base, root_id=known["root_id"])
             drop_marks(client, known)
+            tag_author(client, card, known, known.get("channel_id", ""), known["root_id"])
             known.update(base=base, status="",
                          status_post=(post or {}).get("id") or known.get("status_post", ""))
             state.setdefault("threads", {})[str(card["id"])] = known
@@ -1579,7 +1592,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             return
         post = client.post(channel, base)
         if post and post.get("id"):
-            state.setdefault("threads", {})[str(card["id"])] = {
+            info = {
                 "channel_id": post.get("channel_id") or channel,
                 "root_id": post["id"],
                 "last_post_id": post["id"],
@@ -1587,6 +1600,8 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
                 "status": "",
                 "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+            tag_author(client, card, info, info["channel_id"], post["id"])
+            state.setdefault("threads", {})[str(card["id"])] = info
             save_time_state(state)
         log("  написал про PR в Time")
     except Exception as e:  # noqa: BLE001 — PR уже открыт, отправка не важнее
@@ -1782,7 +1797,6 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
             text = thread_asks(asks, again=bool(info.get("fixed") or info.get("asked")))
             if text and info.get("asked") != asked:
                 try:
-                    text = with_mention(author_mention(client, card, info), text)
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
                     # Круг кончился вопросами — ход опять человека, и глазок на его
                     # сообщении врал бы, что фабрика всё ещё что-то делает
