@@ -745,6 +745,17 @@ class Kaiten:
     def card(self, card_id: int) -> dict:
         return self._request("GET", f"/cards/{card_id}")
 
+    def custom_property(self, property_id: int) -> dict:
+        return self._request("GET", f"/company/custom-properties/{property_id}")
+
+    def user_uids(self, user_ids: list) -> dict:
+        """Номер пользователя → его uuid. `GET /users/{id}` чужим отвечает 403, список — нет."""
+        if not user_ids:
+            return {}
+        found = self._request("GET", "/users",
+                              params={"ids": ",".join(str(i) for i in user_ids)}) or []
+        return {user["id"]: user["uid"] for user in found if user.get("uid")}
+
     def comments(self, card_id: int) -> list:
         """
         Комментарии людей и фабрики, по времени. Интеграции отсюда вычищены.
@@ -3960,14 +3971,17 @@ def previous_debt_card(kaiten: Kaiten, debt: dict) -> dict | None:
     return kaiten.card(latest["id"])
 
 
-def debt_properties(props: dict, old: str, new: str) -> dict:
+def debt_properties(props: dict, old: str, new: str, uids: dict | None = None) -> dict:
     """
     Поля прошлого техдолга с датами нового спринта.
 
     Обязательные поля эпика без них Kaiten не примет, а придумывать их фабрике не
-    из чего — поэтому копируем у прошлого. Пользователи в выдаче списка приходят
-    объектами, а принимаются номерами.
+    из чего — поэтому копируем у прошлого. Поле-человек (Owner) читается списком
+    номеров, а записывается списком uuid: с номерами Kaiten отвечает 400, и техдолг
+    19.10 полдня не заводился. `uids` — такие поля и uuid их людей; кого не нашли,
+    того не пишем: пустой Owner лучше, чем ни одного техдолга.
     """
+    uids = uids or {}
     result = {}
     for key, value in (props or {}).items():
         if isinstance(value, str) and old:
@@ -3975,8 +3989,28 @@ def debt_properties(props: dict, old: str, new: str) -> dict:
         elif isinstance(value, list):
             value = [item["id"] if isinstance(item, dict) and "id" in item else item
                      for item in value]
+            if key in uids:
+                value = [uids[key][item] for item in value if item in uids[key]]
         result[key] = value
     return result
+
+
+def user_uids_for(kaiten: Kaiten, props: dict) -> dict:
+    """
+    Поля-люди среди полей-списков и uuid их людей: по значению поле-человека от
+    выбора из списка не отличить, тип спрашиваем у самого поля.
+    """
+    fields = {}
+    for key, value in (props or {}).items():
+        if not isinstance(value, list) or not key.startswith("id_"):
+            continue
+        try:
+            if kaiten.custom_property(int(key[3:])).get("type") == "user":
+                fields[key] = [item["id"] if isinstance(item, dict) else item for item in value]
+        except (NotFoundError, ValueError):
+            pass
+    known = kaiten.user_uids(sorted({i for ids in fields.values() for i in ids}))
+    return {key: {i: known[i] for i in ids if i in known} for key, ids in fields.items()}
 
 
 def ensure_tech_debt(kaiten: Kaiten, product: dict, debt: dict, dry_run: bool) -> dict:
@@ -4001,6 +4035,7 @@ def ensure_tech_debt(kaiten: Kaiten, product: dict, debt: dict, dry_run: bool) -
         log(f"  техдолга на {label} нет — завожу «{title}» по образцу #{template['id']}")
     else:
         log(f"  техдолга на {label} нет — завожу «{title}»")
+    props = (template or {}).get("properties")
     description = (template or {}).get("description") or (
         f"Задачи спринта {label} на доске «{product.get('title') or ''}», у которых нет "
         "своего продуктового эпика: баги, мелкие доработки, инфраструктура.")
@@ -4011,7 +4046,7 @@ def ensure_tech_debt(kaiten: Kaiten, product: dict, debt: dict, dry_run: bool) -
         "type_id": debt.get("card_type_id") or (template or {}).get("type_id"),
         "title": title,
         "description": description.replace(old, label) if old else description,
-        "properties": debt_properties((template or {}).get("properties"), old, label),
+        "properties": debt_properties(props, old, label, user_uids_for(kaiten, props)),
     }
     if dry_run:
         log("  [dry-run] карточку не создаю")

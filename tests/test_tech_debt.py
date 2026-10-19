@@ -72,6 +72,12 @@ class FakeKaiten:
     def comments(self, card_id):
         return self.comments_.get(card_id, [])
 
+    def custom_property(self, property_id):
+        return {"id": property_id, "type": "user" if property_id in (3, 4) else "select"}
+
+    def user_uids(self, user_ids):
+        return {i: f"uid-{i}" for i in user_ids if i != 44}
+
     def create_card(self, body):
         self.created.append(body)
         return {"id": 8900, "title": body["title"]}
@@ -137,7 +143,7 @@ k = FakeKaiten([task(1)], [old, other])
 k.full[8400] = {**old, "type_id": 77, "board_id": EPICS,
                 "description": f"Работа спринта {OLD_LABEL} без эпика",
                 "properties": {"id_1": [5], "id_2": f"Спринт {OLD_LABEL}",
-                               "id_3": [{"id": 42, "full_name": "Человек"}]}}
+                               "id_3": [{"id": 42, "full_name": "Человек"}], "id_4": [43, 44]}}
 f.link_sprint_orphans(k, CFG, LIVE)
 body = k.created[0] if k.created else {}
 check("название с датами этого спринта", body.get("title") == f"Техдолг спринта {LABEL}",
@@ -147,8 +153,9 @@ check("в дорожке и колонке из конфига",
       == (EPICS, LANE, DELIVERY))
 check("описание прошлого с новыми датами",
       body.get("description") == f"Работа спринта {LABEL} без эпика", body.get("description"))
-check("поля прошлого: даты новые, людей номерами",
-      body.get("properties") == {"id_1": [5], "id_2": f"Спринт {LABEL}", "id_3": [42]},
+check("поля прошлого: даты новые, люди uuid, ненайденных нет",
+      body.get("properties") == {"id_1": [5], "id_2": f"Спринт {LABEL}",
+                                 "id_3": ["uid-42"], "id_4": ["uid-43"]},
       str(body.get("properties")))
 check("задача уехала в новый техдолг", k.children_added == [(8900, 1)], str(k.children_added))
 
