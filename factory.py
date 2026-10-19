@@ -1083,6 +1083,8 @@ class Time:
             raise FactoryError(f"Time {method} -> curl {proc.returncode}: "
                                f"{proc.stderr.strip()[:200]}")
         raw, _, code = proc.stdout.rpartition("\n")
+        if code.strip() and int(code) == 404:
+            raise NotFoundError(f"Time {method} -> HTTP 404: {raw[:300]}")
         if code.strip() and int(code) >= 400:
             raise FactoryError(f"Time {method} -> HTTP {code}: {raw[:300]}")
         try:
@@ -1206,6 +1208,17 @@ class Time:
         found = self._request("POST", f"{self.api}/users/ids", sorted(set(ids)),
                               config=self._auth()) or []
         return {user.get("id"): user for user in found}
+
+    def user_by_email(self, email: str) -> dict:
+        """
+        Пользователь по почте; пусто, если такого нет. Почта — единственное, что
+        у Kaiten и Time общее: логины разные (`a_boev1` против `a.boev`).
+        """
+        try:
+            return self._request("GET", f"{self.api}/users/email/{urllib.parse.quote(email)}",
+                                 config=self._auth()) or {}
+        except NotFoundError:
+            return {}
 
 
 def time_config(cfg: dict) -> dict:
@@ -1414,6 +1427,34 @@ EYES = "eyes"
 CROSS = "x"
 
 
+def author_mention(client: Time, card: dict, info: dict) -> str:
+    """
+    `@логин` автора карточки в Time — или пусто, если его там не нашли.
+
+    Тред — разговор про его задачу, а Mattermost зовёт в тред только тех, кого
+    в нём упомянули: без тега вопросы Стёпы и «поправил» висят там, куда автор
+    может и не заглянуть. Находку запоминаем в треде, чтобы не спрашивать Time
+    на каждое сообщение; сбой сети — не находка, его не запоминаем.
+    """
+    if "author" in info:
+        return info["author"]
+    email = ((card.get("owner") or {}).get("email") or "").strip()
+    if not email or not client.can_read:
+        return ""
+    try:
+        user = client.user_by_email(email)
+    except FactoryError as e:
+        log(f"  !! не нашёл в Time автора карточки: {e}")
+        return ""
+    name = user.get("username") or ""
+    info["author"] = f"@{name}" if name and not user.get("delete_at") else ""
+    return info["author"]
+
+
+def with_mention(mention: str, text: str) -> str:
+    return f"{mention} {text}" if mention and text else text
+
+
 def thread_marks(info: dict) -> dict:
     """Что фабрика наставила в треде: id сообщения -> эмодзи."""
     marks = info.get("reacted")
@@ -1506,6 +1547,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             else:
                 text = (f"Чекай, поправил: {summary}" if summary
                         else "Чекай, поправил по замечаниям, подробности в PR.")
+            text = with_mention(author_mention(client, card, known), text)
             client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
             # Отчёт ушёл — значит реакциям конец: они висели вместо слов, пока шла
             # работа, а теперь за неё говорит сам отчёт
@@ -1522,6 +1564,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
         if known.get("own_root") is False and known.get("root_id"):
             # Карточку дали в канале — PR и есть ответ на ту просьбу, туда же он и
             # уходит. Это сообщение несёт и статус: корень треда чужой.
+            base = with_mention(author_mention(client, card, known), base)
             post = client.post(known.get("channel_id", ""), base, root_id=known["root_id"])
             drop_marks(client, known)
             known.update(base=base, status="",
@@ -1739,6 +1782,7 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
             text = thread_asks(asks, again=bool(info.get("fixed") or info.get("asked")))
             if text and info.get("asked") != asked:
                 try:
+                    text = with_mention(author_mention(client, card, info), text)
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
                     # Круг кончился вопросами — ход опять человека, и глазок на его
                     # сообщении врал бы, что фабрика всё ещё что-то делает

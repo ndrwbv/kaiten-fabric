@@ -36,6 +36,11 @@ class Fake(BaseHTTPRequestHandler):
         GOT.append(("GET", self.path, None, self.headers.get("Authorization")))
         if self.path.endswith("/users/me"):
             return self._reply({"id": BOT_ID, "username": "fabrica"})
+        if "/users/email/" in self.path:
+            if self.path.endswith("/nobody%40example.com"):
+                self.send_response(404); self.send_header("Content-Length", "0")
+                self.end_headers(); return
+            return self._reply({"id": "u-2", "username": "author"})
         if "/channels/" in self.path and "/posts?since=" in self.path:
             return self._reply({"order": [p["id"] for p in CHANNEL_POSTS],
                                 "posts": {p["id"]: p for p in CHANNEL_POSTS}})
@@ -987,6 +992,36 @@ check("свой тред по-прежнему держит статус в ко
       f.status_post({"root_id": "root"}) == "root")
 check("в чужом треде до PR статусу жить негде",
       f.status_post({"root_id": "m1", "own_root": False}) == "")
+
+print("=== 41. Стёпа тегает в треде автора карточки ===")
+f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"888": {
+    "channel_id": "chan-1", "root_id": "root8", "last_post_id": "root8"}}}),
+    encoding="utf-8")
+owned = {"id": 888, "title": "Задача", "owner": {"email": "author@example.com"}}
+GOT.clear()
+f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
+            {"summary": "Поправил шапку."}, False, updated=True)
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("«поправил» начинается с тега автора",
+      said == ["@author Чекай, поправил: Поправил шапку."], str(said))
+check("автор нашёлся по почте",
+      any(g[1].endswith("/users/email/author%40example.com") for g in GOT), str(GOT))
+check("и запомнен в треде",
+      json.loads(f.TIME_STATE_FILE.read_text())["threads"]["888"]["author"] == "@author")
+GOT.clear()
+f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
+            {"summary": "Ещё раз."}, False, updated=True)
+check("второй раз Time про автора не спрашиваем",
+      not any("/users/email/" in g[1] for g in GOT), str(GOT))
+
+client = f.Time(BASE, token="tok-123")
+check("нет такого в Time — без тега",
+      f.author_mention(client, {"owner": {"email": "nobody@example.com"}}, {}) == "")
+check("у карточки нет автора — без тега", f.author_mention(client, {}, {}) == "")
+check("на вебхуке искать нечем — без тега",
+      f.author_mention(f.Time(BASE, webhook_url="x"),
+                       {"owner": {"email": "author@example.com"}}, {}) == "")
 
 srv.shutdown()
 print("\nвсё сошлось")
