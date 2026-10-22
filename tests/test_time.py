@@ -498,7 +498,12 @@ print("=== 21. вторая пачка вопросов — это круг по
 check("в первый раз — просто вопросы",
       f.thread_asks(["❓ А где макет?"]) == "Есть вопрос: А где макет?")
 check("во второй — с оговоркой про правку",
-      f.thread_asks(["❓ А где макет?"], again=True).startswith("Перечитал ещё раз после правки"),
+      f.thread_asks(["❓ А где макет?"], again=True, fixed=True)
+      .startswith("Перечитал ещё раз после правки"),
+      f.thread_asks(["❓ А где макет?"], again=True, fixed=True))
+check("а без правки «после правки» не врёт",
+      f.thread_asks(["❓ А где макет?"], again=True)
+      == "Перечитал ещё раз, и появился вопрос: А где макет?",
       f.thread_asks(["❓ А где макет?"], again=True))
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
     "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply", "fixed": True,
@@ -1017,6 +1022,40 @@ said = [json.loads(g[2])["message"] for g in GOT
         if g[0] == "POST" and g[1].endswith("/posts")]
 check("«поправил» уже без тега — автор и так в треде",
       said == ["Чекай, поправил: Поправил шапку."], str(said))
+
+print("=== 42. круг правок без коммита — без «поправил» ===")
+GOT.clear()
+f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
+            {"summary": "Сербию оставил в PR — её сюда просил автор карточки."}, False,
+            updated=True, changed=False)
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("фраза агента как есть, без «Чекай, поправил:»",
+      said == ["Сербию оставил в PR — её сюда просил автор карточки."], str(said))
+saved = json.loads(f.TIME_STATE_FILE.read_text())["threads"]["888"]
+check("правкой круг не записан, но отчёт был",
+      saved["fixed"] is False and saved["reported"] is True, str(saved))
+GOT.clear()
+f.notify_pr(cfg, "kiosk", owned, "https://k/888", "https://github.com/acme/shop/pull/8",
+            {}, False, updated=True, changed=False)
+said = [json.loads(g[2])["message"] for g in GOT
+        if g[0] == "POST" and g[1].endswith("/posts")]
+check("и без фразы — тоже не «поправил»",
+      len(said) == 1 and "поправил" not in said[0].lower(), str(said))
+
+print("=== 43. ревьювер видит, что люди дописали к задаче ===")
+review_prompt = f.build_review_prompt(
+    {"id": 888, "title": "Выключить коинстор", "description": "Выключить флаг coinStore"},
+    "https://k/888", {"base_branch": "main", "remote": "origin", "key": None},
+    "stepa/card-888", "https://pr/8", 2, 3,
+    [{"text": f.from_thread_comment("Andrey", "добавь сюда ещё Сербию")},
+     {"text": f"{f.REVIEWER_MARK} **Ревью, круг 1/3: нужны правки.**"},
+     {"text": f"{f.AGENT_MARK} Сербию оставил"}])
+check("просьба из треда в промпте ревьювера",
+      "добавь сюда ещё Сербию" in review_prompt, review_prompt[:600])
+check("свои реплики фабрики туда не попали",
+      "Ревью, круг 1/3" not in review_prompt and "Сербию оставил" not in review_prompt)
+check("плейсхолдеров не осталось", "{{" not in review_prompt)
 
 f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"889": {
     "channel_id": "chan-1", "root_id": "m9", "own_root": False}}}), encoding="utf-8")

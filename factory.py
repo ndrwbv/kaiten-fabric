@@ -1536,7 +1536,8 @@ def drop_marks(client: Time, info: dict) -> None:
 
 def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
               pr_url: str, verdict: dict, dry_run: bool,
-              updated: bool = False, env: dict | None = None) -> None:
+              updated: bool = False, env: dict | None = None,
+              changed: bool = True) -> None:
     """
     Сообщение про PR в канал Time. Ошибки только в лог: PR уже открыт, и отчёт
     в мессенджер не важнее того, что работа сделана.
@@ -1544,6 +1545,8 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
     Новый PR — корневое сообщение, и его id запоминается: он же корень треда, в который
     человек напишет правки. Обновление PR (круг «Правки») — ответ в тот же тред, чтобы
     канал не зарастал одной и той же задачей.
+
+    `changed` — в этом круге появился новый коммит. Без него «поправил» говорить нельзя.
     """
     conf = time_config(cfg)
     event = "pr_updated" if updated else "pr_opened"
@@ -1569,6 +1572,12 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
                 # Круг завели вопросом из треда — там ждут ответа, а не отчёта
                 # о правке. «Поправил: смотрел на iPad» было бы ответом не на то.
                 text = summary or "Посмотрел, ответ — в карточке."
+            elif not changed:
+                # Круг правок кончился без коммита: с замечанием не согласился и
+                # оставил как было. Однажды это ушло в тред как «Чекай, поправил:
+                # Ничего не поправил: …», и человек не понял, сделано что-то или нет.
+                text = summary or ("Посмотрел замечания, но менять ничего не стал — "
+                                   "почему, написал в карточке.")
             else:
                 text = (f"Чекай, поправил: {summary}" if summary
                         else "Чекай, поправил по замечаниям, подробности в PR.")
@@ -1577,9 +1586,11 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             # работа, а теперь за неё говорит сам отчёт
             drop_marks(client, known)
             # Круг закончился — вопрос отвечен, а следующая пачка вопросов по этому
-            # треду будет уже «после правки», и сказать об этом придётся вслух.
+            # треду будет уже не первой, и сказать об этом придётся вслух. «После
+            # правки» — только если правка и была: иначе оговорка опять соврёт.
             known["answering"] = False
-            known["fixed"] = True
+            known["fixed"] = changed
+            known["reported"] = True
             state.setdefault("threads", {})[str(card["id"])] = known
             save_time_state(state)
             log("  написал в тред Time про правку")
@@ -1659,7 +1670,7 @@ def with_status(base: str, status: str) -> str:
     return f"{base}\n{status}" if status else base
 
 
-def thread_asks(asks: list[str], again: bool = False) -> str:
+def thread_asks(asks: list[str], again: bool = False, fixed: bool = False) -> str:
     """
     Вопросы для треда — так, как их написал бы человек.
 
@@ -1668,21 +1679,24 @@ def thread_asks(asks: list[str], again: bool = False) -> str:
     непонятно, вопрос это или предупреждение. Один вопрос — одна строка, несколько —
     список: перечисление из одной строки в мессенджере не читается.
 
-    `again` — вопросы уже второй раз за тот же тред, то есть это круг после правки.
-    Без этой оговорки вторая пачка выглядит дико: час назад отчитались «поправил»,
-    а теперь снова «есть вопросы», и человек не понимает, откуда они взялись.
+    `again` — в треде уже был отчёт или вопросы, и эти — не первые. Без оговорки
+    вторая пачка выглядит дико: час назад отчитались, а теперь снова «есть вопросы»,
+    и человек не понимает, откуда они взялись. `fixed` — и последний отчёт был
+    правкой: тогда «после правки». Без правки эти слова врут — однажды они ушли
+    в тред сразу за «ничего не поправил».
     """
     clean = [ask for ask in (ASK_MARK_RE.sub("", a).strip() for a in asks) if ask]
     if not clean:
         return ""
     # «и вот что вылезло» читалось как список замечаний, а не как вопрос: на такое
     # человеку нечего ответить, и он справедливо переспрашивал, чего от него хотят
-    after_fix = "Перечитал ещё раз после правки, и появился вопрос" if again else ""
-    if again and len(clean) > 1:
-        after_fix = "Перечитал ещё раз после правки, и появились вопросы"
+    lead = ""
+    if again or fixed:
+        lead = "Перечитал ещё раз" + (" после правки" if fixed else "")
+        lead += ", и появились вопросы" if len(clean) > 1 else ", и появился вопрос"
     if len(clean) == 1:
-        return f"{after_fix or 'Есть вопрос'}: {clean[0]}"
-    return (f"{after_fix or 'Есть следующие вопросы'}:\n"
+        return f"{lead or 'Есть вопрос'}: {clean[0]}"
+    return (f"{lead or 'Есть следующие вопросы'}:\n"
             + "\n".join(f"- {ask}" for ask in clean))
 
 
@@ -1803,9 +1817,11 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
         if asks and time_wants(conf, "asked") and role in ("review", "question"):
             asked = "\n".join(asks)
-            # Вторая пачка вопросов по тому же треду — это круг после правки, и без
-            # оговорки она выглядит дико: час назад тут отчитались «поправил».
-            text = thread_asks(asks, again=bool(info.get("fixed") or info.get("asked")))
+            # Вторая пачка вопросов по тому же треду — без оговорки она выглядит
+            # дико: час назад тут отчитались, а теперь снова вопросы.
+            text = thread_asks(asks,
+                               again=bool(info.get("reported") or info.get("asked")),
+                               fixed=bool(info.get("fixed")))
             if text and info.get("asked") != asked:
                 try:
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
@@ -3061,9 +3077,15 @@ FIX_NOTE = """
 > Если с замечанием ты не согласен — не игнорируй его молча: сделай остальное, а по этому
 > напиши в `risks`, почему считаешь текущий код верным. Это уйдёт человеку.
 >
+> Замечание требует откатить то, о чём человек прямо попросил в комментариях или в
+> треде, — прав человек. Оставь как есть и не спрашивай его, уверен ли он: он уже
+> ответил своей просьбой.
+>
 > В `summary` — **что ты исправил в этом круге**, а не о чём была задача: строка уйдёт
 > в рабочий чат как «Поправил: …», и заголовок карточки на этом месте человеку ничего
-> не говорит — он его и писал.
+> не говорит — он его и писал. Не исправил ничего — коммит не делай, а в `summary`
+> скажи, что оставил и почему: «Сербию оставил в PR — её сюда просил автор карточки».
+> Что правки не было, обёртка видит сама и «Поправил» к такой фразе не допишет.
 >
 > Коммить обычным порядком, одним коммитом поверх прошлых.
 """
@@ -4174,7 +4196,8 @@ def compose_pr_body(worktree: Path, card: dict, card_url: str, verdict: dict) ->
 
 
 def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
-            verdict: dict, cfg: dict, dry_run: bool, repo_key: str | None = None) -> str:
+            verdict: dict, cfg: dict, dry_run: bool, repo_key: str | None = None,
+            changed: bool = True) -> str:
     title = f"#{card['id']} {(card.get('title') or '').strip()[:70]}"
     body = compose_pr_body(worktree, card, card_url, verdict)
     template = find_pr_template(worktree)
@@ -4192,7 +4215,8 @@ def open_pr(worktree: Path, branch: str, base: str, card: dict, card_url: str,
     ).stdout.strip()
     if existing:
         log(f"  PR для ветки уже открыт: {existing}")
-        notify_pr(cfg, repo_key, card, card_url, existing, verdict, dry_run, updated=True)
+        notify_pr(cfg, repo_key, card, card_url, existing, verdict, dry_run,
+                  updated=True, changed=changed)
         return existing
 
     # тело отдаём файлом: шаблоны бывают на десятки килобайт, в argv их тащить незачем
@@ -4837,13 +4861,26 @@ def close_merged(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
 # --------------------------------------------------------------------------- #
 
 def build_review_prompt(card: dict, card_url: str, repo_cfg: dict, branch: str,
-                        pr_url: str, round_number: int, max_rounds: int) -> str:
+                        pr_url: str, round_number: int, max_rounds: int,
+                        comments: list | None = None) -> str:
+    """
+    Промпт ревьювера.
+
+    Кроме описания — всё, что люди дописали в комментариях и в треде. Без этого
+    просьба «добавь сюда ещё Сербию» для ревьювера выглядела посторонней правкой:
+    он дважды требовал вынести её в отдельный PR, исполнитель дважды отвечал, что
+    её просил автор карточки, и круг кончился вопросом человеку, на который тот
+    уже ответил своей просьбой.
+    """
     template = REVIEW_TEMPLATE_PATH.read_text(encoding="utf-8")
+    human = [c for c in comments or []
+             if not strip_html(c.get("text", "")).startswith(AGENT_MARKS)]
     replacements = {
         "{{CARD_ID}}": str(card["id"]),
         "{{CARD_URL}}": card_url,
         "{{TITLE}}": card.get("title") or "(без заголовка)",
         "{{DESCRIPTION}}": strip_html(card.get("description")) or "(описания нет)",
+        "{{HUMAN_COMMENTS}}": format_comments(human),
         "{{BRANCH}}": branch,
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
@@ -5060,7 +5097,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
         ).stdout.strip()
 
         prompt = build_review_prompt(card, card_url, repo_cfg, branch, pr_url,
-                                     round_number, max_rounds)
+                                     round_number, max_rounds, comments)
         if args.prompt_only:
             print("\n" + "=" * 78)
             print(prompt)
@@ -5275,6 +5312,9 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
 
         log("  агент пошёл работать…")
         write_status(phase="агент работает")
+        # С чего начинали: в круге правок старые коммиты уже в ветке, и только по
+        # сдвигу HEAD видно, поправил агент что-то в этом круге или оставил как есть
+        head_before = git(worktree, "rev-parse", "HEAD")
         started = time.time()
         verdict, meta = run_agent(prompt, worktree, cfg["agent"])
         note_spend(meta)
@@ -5385,7 +5425,8 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             pr_url = "(PR не создавался, --no-pr)"
         else:
             pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
-                             verdict, cfg, args.dry_run, repo_key)
+                             verdict, cfg, args.dry_run, repo_key,
+                             changed=git(worktree, "rev-parse", "HEAD") != head_before)
 
         epic_note = ""
         if wants_debt(profile, card):
