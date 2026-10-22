@@ -748,6 +748,11 @@ class Kaiten:
     def custom_property(self, property_id: int) -> dict:
         return self._request("GET", f"/company/custom-properties/{property_id}")
 
+    def custom_properties(self, query: str) -> list:
+        """Поля компании, в имени которых есть `query`: подстрока и без регистра."""
+        return self._request("GET", "/company/custom-properties",
+                             params={"query": query}) or []
+
     def user_uids(self, user_ids: list) -> dict:
         """Номер пользователя → его uuid. `GET /users/{id}` чужим отвечает 403, список — нет."""
         if not user_ids:
@@ -789,6 +794,9 @@ class Kaiten:
 
     def patch_card(self, card_id: int, body: dict) -> None:
         self._write("PATCH", f"/cards/{card_id}", body)
+
+    def create_custom_property(self, body: dict) -> dict | None:
+        return self._write("POST", "/company/custom-properties", body)
 
     def add_child(self, parent_id: int, child_id: int) -> None:
         self._write("POST", f"/cards/{parent_id}/children", {"card_id": child_id})
@@ -5161,6 +5169,8 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
             print("=" * 78 + "\n")
             log("  промпт ревьювера показан, агент не запускался")
             return
+        # поле появилось позже PR: так оно заполнится и у карточек, открытых до него
+        put_pr_in_field(kaiten, cfg, card, pr_url)
 
         log(f"  ревьювер смотрит {branch} (круг {round_number}/{max_rounds})")
         review, meta = run_agent(prompt, worktree, reviewer_cfg,
@@ -5484,6 +5494,7 @@ def process(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict) -> 
             pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
                              verdict, cfg, args.dry_run, repo_key,
                              changed=git(worktree, "rev-parse", "HEAD") != head_before)
+        put_pr_in_field(kaiten, cfg, card, pr_url)
 
         epic_note = ""
         if wants_debt(profile, card):
@@ -5859,6 +5870,67 @@ def hand_off_to_factory(kaiten: Kaiten, cfg: dict, card: dict, comments: list,
     except Exception as e:  # noqa: BLE001 — постановка не важнее уже сделанной разведки
         log(f"  !! не смог поставить задачу: {e}")
         return f"⚠️ Не смог поставить задачу на доску: {str(e)[:200]}"
+
+
+# Поле карточки со ссылкой на её PR. В комментариях ссылка тонет под коммитами
+# Octocat и кругами ревью, а поле видно сразу — и в карточке, и на её фасаде на доске.
+# Имя меняется в `pr.kaiten_field`, пустое имя поле выключает. «PR link» — потому что
+# такое поле-ссылка в Kaiten компании уже было, а своё завести личным токеном нельзя.
+PR_FIELD_DEFAULT = "PR link"
+
+# Имя поля → его id, на весь прогон. None — поля нет и завести не вышло: второй
+# раз за прогон не пробуем.
+pr_field_ids: dict[str, int | None] = {}
+
+
+def pr_field_id(kaiten: Kaiten, name: str) -> int | None:
+    """
+    id поля-ссылки с именем `name`; если такого в компании нет — заводим его сами.
+
+    Поля в Kaiten общие на всю компанию, и поиск по имени ищет подстроку: на «PR»
+    приезжают и «Priority», и строковый двойник «PR link». Поэтому берём только
+    точное имя с типом url.
+
+    Заводить поля компании может только её админ: личный токен получает 403, и
+    22 октября так и вышло. Тогда поле надо завести руками — или назвать в
+    `pr.kaiten_field` уже существующее.
+    """
+    if name in pr_field_ids:
+        return pr_field_ids[name]
+    found = next((prop for prop in kaiten.custom_properties(name)
+                  if prop.get("name") == name and prop.get("type") == "url"
+                  and prop.get("condition") == "active"), None)
+    if not found:
+        log(f"  поля «{name}» в Kaiten нет — завожу")
+        try:
+            found = kaiten.create_custom_property({"name": name, "type": "url",
+                                                   "show_on_facade": True})
+        except FactoryError as e:
+            log(f"  !! завести поле «{name}» не вышло, PR в поле класть не буду: {e}")
+    pr_field_ids[name] = (found or {}).get("id")
+    return pr_field_ids[name]
+
+
+def put_pr_in_field(kaiten: Kaiten, cfg: dict, card: dict, pr_url: str) -> None:
+    """
+    Ссылка на PR — в поле карточки.
+
+    Пишем только своё поле: остальные PATCH не трогает, а отправить их обратно как
+    есть нельзя — поле-человек читается номерами, а принимается только uuid'ами.
+    Тот же PR второй раз не пишем, другой — перетираем: актуален последний.
+    """
+    name = (cfg.get("pr") or {}).get("kaiten_field", PR_FIELD_DEFAULT)
+    if not name or not pr_url.startswith("http"):
+        return
+    try:
+        field = pr_field_id(kaiten, name)
+        key = f"id_{field}"
+        if not field or (card.get("properties") or {}).get(key) == pr_url:
+            return
+        kaiten.patch_card(card["id"], {"properties": {key: pr_url}})
+        log(f"  PR — в поле «{name}»")
+    except Exception as e:  # noqa: BLE001 — PR уже создан, ссылка есть и в комментарии
+        log(f"  !! не смог положить PR в поле «{name}»: {e}")
 
 
 def report_to_inbox(kaiten: Kaiten, card: dict, pr_url: str) -> None:
@@ -6829,6 +6901,7 @@ def advance_epic(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: li
             git(worktree, "push", "--force-with-lease", "-u", repo_cfg["remote"], branch)
         pr_url = open_pr(worktree, branch, repo_cfg["base_branch"], card, card_url,
                          verdict, cfg, args.dry_run, repo_key) if not args.no_pr else "(без PR)"
+        put_pr_in_field(kaiten, cfg, card, pr_url)
         head = SPEC_FIXED_LINE if fixing else SPEC_LINE
         kaiten.comment(card_id,
                        f"{EPIC_MARK} **{head}** {pr_url}\n\n"
