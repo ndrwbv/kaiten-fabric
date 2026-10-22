@@ -1022,7 +1022,7 @@ def time_status_answer(profile: dict | None, card: dict, comments: list,
     и деньги. Всё, что нужно для ответа, и так лежит в Kaiten: колонка, сколько раз
     переделывали и заголовок последнего отчёта.
     """
-    role, _ = time_status(profile, card, asks, blocker)
+    role, _ = time_status(profile, card, asks, blocker, review_passed(comments))
     where = TIME_PLAIN_STATUSES.get(role, "не пойму, где карточка")
     lines = [f"Сейчас: {where}."]
 
@@ -1631,7 +1631,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
 
 
 def time_status(profile: dict | None, card: dict, asks: list,
-                blocker: str = "") -> tuple[str, str]:
+                blocker: str = "", passed: bool = False) -> tuple[str, str]:
     """
     Роль колонки и фраза для канала. Роль нужна логике (конец потока, «Вопрос»),
     фраза — человеку. Обе пустые, если колонка не из потока фабрики.
@@ -1639,7 +1639,9 @@ def time_status(profile: dict | None, card: dict, asks: list,
     На доске команды колонок меньше, чем ролей, и «Ревью» — это и вход ревьювера,
     и «дальше человек». По одной колонке их не различить, а разница для канала
     решающая: в первом случае туда идти рано, во втором — ждут именно человека.
-    Различает их свой блокер: фабрика вешает его ровно тогда, когда отдаёт ход.
+    Различает их последнее слово в карточке (`passed`, см. `review_passed`), а
+    «Вопрос» и «Упало» от «В работе» — свой блокер: фабрика вешает его ровно тогда,
+    когда отдаёт ход.
     """
     if not profile:
         return "", ""
@@ -1653,6 +1655,8 @@ def time_status(profile: dict | None, card: dict, asks: list,
                        and blocker.startswith(block_reason(HANDOFF_BLOCKERS[role]))), "")
         if handed:
             roles = [handed]
+    if len(roles) > 1 and passed and "review" in roles:
+        roles = ["review"]
     role = roles[0]
     label = TIME_STATUSES[role]
     if asks and role in ("review", "question"):
@@ -1809,9 +1813,12 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         # а человеку в треде от них нечего ответить
         asks = human_questions(comments)
         # Блокер тут не про «трогать нельзя», а про «чей ход»: на доске команды
-        # только по нему и видно, что колонка «Ревью» — это уже ревью человека
+        # только по нему и видно, что «В работе» — это уже вопрос человеку. Колонку
+        # «Ревью» от ревью человека отличает последнее слово ревьювера
         stuck = blocked_by(kaiten, card["id"])
-        role, status = time_status(profile, card, asks, stuck or "")
+        passed = (bool(profile) and card.get("column_id") == role_column(profile, "review")
+                  and review_passed(comments))
+        role, status = time_status(profile, card, asks, stuck or "", passed)
 
         # Вопросы агента — в тред: человеку сказали «позырьте», и он должен увидеть,
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
@@ -1853,8 +1860,8 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
             save_time_state(state)
             continue
 
-        known[card_key] = {"card": card, "profile": profile,
-                           "comments": comments, "asks": asks, "stuck": stuck}
+        known[card_key] = {"card": card, "profile": profile, "comments": comments,
+                           "asks": asks, "stuck": stuck, "passed": passed}
     return state, known
 
 
@@ -1921,6 +1928,9 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         comments, asks = seen["comments"], seen["asks"]
         # блокер уже спрошен снимком статуса — второй раз за тот же прогон не ходим
         stuck = seen.get("stuck")
+        # ревью пройдено и ход человека: карточка стоит в колонке ревью, но ревьювер
+        # её уже отдал, и его вход тут ни при чём
+        reviewed = seen.get("passed")
 
         try:
             posts = client.thread(root_id)
@@ -2069,10 +2079,11 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
         if release:
             log(f"  #{card_key}: в треде ответили — снял свой блокер ({stuck})")
         # На доске команды «Ревью» — та же колонка, что вход ревьювера, и «стоять на
-        # месте» после снятия блокера значило бы отдать правку человека ревьюверу.
-        # Поэтому снятый блокер везёт карточку в «Правки» из любой своей колонки.
+        # месте» после ревью значило бы отдать правку человека ревьюверу. Поэтому
+        # отревьюенная карточка, как и снятый блокер, едет в «Правки» из любой своей
+        # колонки.
         if (mark == EYES and target and card.get("column_id") != target
-                and (release or card.get("column_id") not in stay)):
+                and (release or reviewed or card.get("column_id") not in stay)):
             kaiten.move(card["id"], target)
 
         if reply and time_wants(conf, "fix_taken"):
@@ -2339,7 +2350,6 @@ BLOCK_MARK = "🤖"
 
 BLOCK_QUESTION = "не хватило данных, ответь в комментариях"
 BLOCK_FAILED = "прогон сломался, нужен человек"
-BLOCK_HUMAN_REVIEW = "ревью агента пройдено, нужен человек"
 BLOCK_ACCEPTANCE = "жду апрува приёмочных критериев"
 BLOCK_ROLLOUT = "нельзя раскатывать до релиза бека"
 
@@ -2432,11 +2442,59 @@ ACTIVE_ROLES = ("queue", "in_progress", "agent_review")
 # Роли, означающие «дальше человек». На доске со своей колонкой под каждую роль всё
 # видно и так, и блокер не нужен. На чужой доске колонок меньше, роли делят их между
 # собой — там блокер и есть единственный способ сказать, чей сейчас ход.
+#
+# Ревью человека здесь нет, хотя на доске команды и оно делит колонку — с входом
+# ревьювера. Блокер «ревью агента пройдено, нужен человек» висел красным на каждой
+# карточке в «Коде», где ход человека и так очевиден, и снимать его было незачем.
+# Чей ход в этой колонке, говорит переписка — см. `review_passed`.
 HANDOFF_BLOCKERS = {
     "question": BLOCK_QUESTION,
     "failed": BLOCK_FAILED,
-    "review": BLOCK_HUMAN_REVIEW,
 }
+
+# Заголовок ревью, которое кончилось вопросами человеку. По нему `review_passed`
+# узнаёт, что ответ в карточке — это ход: ревьювер сам просил ответить там.
+REVIEW_ASKS_HEAD = "Ревью пройдено, но нужен твой взгляд."
+
+
+def review_in_place(profile: dict) -> bool:
+    """
+    Остаётся ли отревьюенная карточка там же, где ждала ревьювера.
+
+    Так на доске команды: «Код» — и вход ревьювера, и ревью человека. Отдельной
+    колонки под роль `review` там нет, или это та же колонка, что `agent_review`.
+    """
+    column = role_column(profile, "review")
+    return not column or column == role_column(profile, "agent_review")
+
+
+def review_passed(comments: list) -> bool:
+    """
+    Отдал ли ревьювер карточку человеку: последнее слово фабрики в ней — его.
+
+    Колонка тут не скажет, а блокер мы больше не вешаем (см. `HANDOFF_BLOCKERS`).
+    Но с замечаниями ревьювер уводит карточку в «Правки», и в колонке ревью его
+    слово остаётся последним, только когда он её отдал: чисто, с вопросами или
+    «не сошлось за N кругов» — во всех трёх случаях дальше человек.
+
+    Реплики людей в Kaiten хода не меняют: «гляну завтра» под отревьюенной карточкой —
+    не повод ревьюить её второй раз за отдельные деньги. Исключений два:
+    - просьба из треда Time (`💬`) — новая вводная, её надо отработать;
+    - ответ на вопросы ревьювера — он сам просил ответить в карточке, и пока
+      был блокер, ответ без его снятия так и лежал непрочитанным.
+    """
+    answered = False
+    for comment in reversed(comments):
+        text = strip_html(comment.get("text", ""))
+        if text.startswith(FROM_TIME_MARK):
+            return False
+        if not text.startswith(AGENT_MARKS):
+            answered = answered or bool(text)
+            continue
+        if not text.startswith(REVIEWER_MARK):
+            return False
+        return not (answered and REVIEW_ASKS_HEAD in text)
+    return False
 
 
 def handed_over(blockers: list) -> list:
@@ -5076,8 +5134,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
     if round_number > max_rounds and not args.prompt_only:
         kaiten.comment(card_id, f"{REVIEWER_MARK} **Ревью не сошлось за {max_rounds} круга.** "
                                 f"Дальше нужен человек — смотри замечания выше.")
-        hand_over(kaiten, profile, card_id, "review",
-                  f"ревью не сошлось за {max_rounds} круга")
+        hand_over(kaiten, profile, card_id, "review")
         log(f"  -> На ревью (исчерпаны {max_rounds} круга)")
         return
 
@@ -5141,7 +5198,7 @@ def review_card(card_stub: dict, kaiten: Kaiten, cfg: dict, args, profile: dict)
             # сабтасок эти две роли делят одну колонку. А вопрос был вида «кто
             # посмотрит экран на стенде до мержа» — это ровно то, чем ревью и
             # занимается. Поэтому едем в колонку ревью, вопросы несём с собой.
-            text = (f"{REVIEWER_MARK} **Ревью пройдено, но нужен твой взгляд.**\n\n"
+            text = (f"{REVIEWER_MARK} **{REVIEW_ASKS_HEAD}**\n\n"
                     f"{review.get('summary', '')}")
             for ask in asks[:4]:
                 text += f"\n\n❓ {ask}"
@@ -6330,8 +6387,10 @@ def epic_phase(kaiten: Kaiten, cfg: dict, flow: dict, card: dict, comments: list
         column = child.get("column_id")
         if column == role_column(profile, "done"):
             finished += 1
-        elif column == role_column(profile, "review") and blocked_by(kaiten, child["id"]):
-            # в колонке ревью с блокером — агентское ревью пройдено, дальше человек
+        elif column == role_column(profile, "review") and (
+                not review_in_place(profile) or review_passed(kaiten.comments(child["id"]))):
+            # агентское ревью пройдено, дальше человек: на доске команды колонка
+            # та же, что у ревьювера, и отличает их только последнее слово в карточке
             finished += 1
     log(f"  сабтасок {len(own)}, отревьюено {finished}")
     return "closing" if finished == len(own) else "working"
@@ -7249,8 +7308,11 @@ def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
     показывать их дважды значит запутать.
     """
     flow, seen = [], set()
+    handed = next((state, upcoming) for role, state, upcoming in FLOW_STATES
+                  if role == "review")
 
     for profile in profiles:
+        in_place = review_in_place(profile)
         for role, state, upcoming in FLOW_STATES:
             column = role_column(profile, role)
             if not column:
@@ -7262,12 +7324,17 @@ def snapshot_flow(kaiten: Kaiten, cfg: dict, profiles: list[dict]) -> None:
                 if blocked_by(kaiten, card_id):
                     continue
                 seen.add(card_id)
+                # на доске команды ревью человека — та же колонка, что вход
+                # ревьювера: отданную человеку карточку видно только по переписке
+                now, then = (handed if role == "agent_review" and in_place
+                             and review_passed(kaiten.comments(card_id))
+                             else (state, upcoming))
                 flow.append({
                     "id": card_id,
                     "title": (card.get("title") or "").strip(),
                     "kind": "card",
-                    "state": state,
-                    "next": upcoming,
+                    "state": now,
+                    "next": then,
                     "url": kaiten.card_url(card),
                 })
 
@@ -7539,12 +7606,14 @@ def route(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> int:
     if not args.card and not args.only_work:
         limit = args.limit if args.limit is not None else cfg.get("max_cards_per_run", 2)
         for profile in profiles:
-            # в колонке ревью лежат и карточки, ждущие агента, и те, что он уже
-            # отсмотрел и отдал человеку под блокером — вторые не наши
+            # на доске команды в колонке ревью лежат и карточки, ждущие агента, и те,
+            # что он уже отсмотрел и отдал человеку, — вторые не наши
+            in_place = review_in_place(profile)
             to_review = skip_off_hours(
                 [c for c in kaiten.cards_in_column(profile["board_id"],
                                                    role_column(profile, "agent_review"))
-                 if not theirs(profile, c) and not blocked_by(kaiten, c["id"])], cfg)
+                 if not theirs(profile, c) and not blocked_by(kaiten, c["id"])
+                 and not (in_place and review_passed(kaiten.comments(c["id"])))], cfg)
             where = f" ({profile['key']})" if len(profiles) > 1 else ""
             if not to_review:
                 log(f"в «Ревью агента»{where} пусто")

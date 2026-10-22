@@ -496,9 +496,10 @@ def card_outcome(card: dict) -> str:
     if column == "question":
         return "question"
     if column == "agent_review":
-        # блокер на карточке ревьювера значит, что он уже отработал и позвал человека:
-        # на доске, где ревью агента и ревью человека делят колонку, разницы больше нет
-        return "waiting" if card.get("blocked") else "review"
+        # Ревьювер уже отработал — последний заход по карточке его, — значит, позвал
+        # человека: на доске, где ревью агента и ревью человека делят колонку, разницы
+        # больше нет. Блокер — для карточек, которые ещё помнят блокер ревью.
+        return "waiting" if card.get("reviewed") or card.get("blocked") else "review"
     if column == "review":
         return "waiting"
     if column == "fixes":
@@ -616,6 +617,10 @@ def collect_cards(runs: list[dict], events: list[dict], outside: dict,
             "shipped": (outside.get("shipped") or {}).get(card_id),
             "column": on_board.get("role"),
             "blocked": bool(on_board.get("blocked")),
+            # с замечаниями ревьювер уводит карточку в «Правки», так что «последним
+            # был ревьювер» в его же колонке и значит «отдал человеку»
+            "reviewed": story[-1]["kind"] == "review"
+                        and story[-1]["status"] != "needs_changes",
             "first": story[0]["at"],
             "last": story[-1]["at"],
             "runs": len(story),
@@ -666,7 +671,9 @@ def waiting_list(cards: list[dict], outside: dict, cfg: dict) -> list[dict]:
     Собираем по доске, а не по логам: карточку мог положить в «На ревью» человек,
     и в логах фабрики её не будет вовсе, а ждать она всё равно ждёт. Заблокированные
     считаются всегда и в любой колонке: блокер — это и есть способ фабрики сказать
-    «дальше ты», когда отдельной колонки под роль на доске нет.
+    «дальше ты», когда отдельной колонки под роль на доске нет. Кроме ревью человека:
+    на доске команды оно делит колонку с ревьювером, и отданную карточку там видно
+    по тому, что последним по ней отработал ревьювер.
     """
     domain = cfg["kaiten"]["domain"]
     known = {card["id"]: card for card in cards}
@@ -674,12 +681,14 @@ def waiting_list(cards: list[dict], outside: dict, cfg: dict) -> list[dict]:
     for board in outside.get("boards") or []:
         for column in board["columns"]:
             for entry in column["cards"]:
+                card = known.get(entry["id"]) or {}
                 reason = WAIT_REASONS.get(column["role"], "")
+                if column["role"] == "agent_review" and card.get("reviewed"):
+                    reason = WAIT_REASONS["review"]
                 if entry.get("blocked"):
                     reason = BLOCKED_REASON
                 if not reason:
                     continue
-                card = known.get(entry["id"]) or {}
                 pull = card.get("pr") or {}
                 since = card.get("handover") or pull.get("createdAt") or ""
                 waiting.append({

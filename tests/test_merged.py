@@ -154,7 +154,7 @@ check("gh даже не спрашивали", ASKED == [], str(ASKED))
 
 print("=== 4. свой блокер снимаем, чужой уважаем ===")
 ASKED.clear(); fake_gh(MERGED)
-ours = {"id": 1, "reason": f"{f.BLOCK_MARK} {f.BLOCK_HUMAN_REVIEW}"}
+ours = {"id": 1, "reason": f.block_reason(f.BLOCK_FAILED)}
 kaiten = FakeKaiten(blockers=[dict(ours)])
 f.close_merged(kaiten, CFG, Args(), profiles)
 check("свой блокер снят", kaiten.unblocked == [1], str(kaiten.unblocked))

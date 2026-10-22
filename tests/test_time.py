@@ -676,40 +676,67 @@ check("сеть подвела — тред на месте",
 check("а 404 — карточки правда нет",
       "555" not in with_broken_card(f.NotFoundError("HTTP 404")))
 
-print("=== 33. на доске команды «Ревью» — две роли, различает их блокер ===")
+print("=== 33. на доске команды «Ревью» — две роли, различает их последнее слово ===")
 # Своей доски у Стёпы больше нет, он работает там же, где команда, а там колонок
 # меньше, чем ролей: «Ревью» — это и вход ревьювера, и «дальше человек». По колонке
 # их не различить, а для канала разница решающая: «пока не смотрите» против
-# «позырьте». Различает их свой блокер — фабрика вешает его, когда отдаёт ход.
+# «позырьте». Раньше различал блокер «ревью агента пройдено, нужен человек», но он
+# висел красным на каждой карточке в «Коде», где ход человека и так очевиден.
+# Теперь — переписка: последнее слово фабрики за ревьювером, значит, он отдал.
 shared = f.make_profile("работа", {"board_id": 2000, "columns": {
     "queue": 201, "in_progress": 202, "question": 202, "failed": 202,
     "agent_review": 205, "fixes": 202, "review": 205, "done": 208}}, own_only=True)
 in_review = {"id": 556, "board_id": 2000, "column_id": 205}
+report = {"text": "🤖 **Готово.** PR: https://github.com/acme/shop/pull/12"}
+passed = {"text": "🔍 **Ревью, круг 1/3:** замечаний нет"}
+asked_review = {"text": f"🔍 **{f.REVIEW_ASKS_HEAD}**\n\nВсё чисто.\n\n❓ Кто глянет на стенде?"}
 
-check("без блокера — ревьювер ещё смотрит",
+check("ревьювер ещё не смотрел — «пока не смотрите»",
       f.time_status(shared, in_review, []) == ("agent_review", f.TIME_STATUSES["agent_review"]),
       str(f.time_status(shared, in_review, [])))
-handed = f.block_reason(f.BLOCK_HUMAN_REVIEW)
-check("со своим блокером — ход человека",
-      f.time_status(shared, in_review, [], handed) == ("review", f.TIME_STATUSES["review"]),
-      str(f.time_status(shared, in_review, [], handed)))
+check("ревью пройдено — ход человека",
+      f.time_status(shared, in_review, [], "", True) == ("review", f.TIME_STATUSES["review"]),
+      str(f.time_status(shared, in_review, [], "", True)))
 check("и на «как дела» он отвечает тем же",
-      "жду вашего ревью" in f.time_status_answer(shared, in_review, [], [], handed))
+      "жду вашего ревью" in f.time_status_answer(shared, in_review, [report, passed], []))
 check("чужой блокер роль не меняет: это не наш способ сказать «твой ход»",
       f.time_status(shared, in_review, [], "ждём макет от дизайна")[0] == "agent_review")
 check("на доске со своей колонкой под каждую роль ничего не поменялось",
       f.time_status(profiles[0], {"id": 556, "column_id": 107}, []) [0] == "review")
+check("ревью человека блокером больше не выражается",
+      "review" not in f.HANDOFF_BLOCKERS and f.review_in_place(shared)
+      and not f.review_in_place(profiles[0]))
 
-print("=== 34. просьба в треде — это и есть ход человека: свой блокер снимается ===")
+human = {"text": "гляну завтра"}
+from_thread = {"text": f.from_thread_comment("Андрей", "поправь замечания из пр")}
+check("после отчёта исполнителя — ждём ревьювера", not f.review_passed([report]))
+check("последним был ревьювер — отдал человеку", f.review_passed([report, passed]))
+check("реплика человека в карточке хода не меняет",
+      f.review_passed([report, passed, human]))
+check("просьба из треда — новая вводная", not f.review_passed([report, passed, from_thread]))
+check("ответ на вопрос ревьювера — ход, он сам просил ответить в карточке",
+      not f.review_passed([report, asked_review, human]))
+check("а пока не ответили, вопрос ревьювера — тоже ход человека",
+      f.review_passed([report, asked_review]))
+check("исполнитель отработал после ревьювера — снова ждём ревьювера",
+      not f.review_passed([passed, report]))
+check("пустая карточка — ревью не было", not f.review_passed([]))
+
+print("=== 34. просьба в треде по отревьюенной карточке везёт её в «Правки» ===")
 # Пятнадцатого октября на «@стёпа поправь замечания из пр» бот ответил «Меня блочит:
 # 🤖 ревью агента пройдено, нужен человек» — тому самому человеку, которого ждал.
+# Блокера ревью больше нет, но «стоять на месте» в «Коде» всё равно нельзя: это вход
+# ревьювера, и правка человека ушла бы к нему вместо исполнителя.
 class Handed(FakeKaiten):
-    held = [{"id": 77, "reason": handed}]
+    held: list = []
+    said = [report, passed]
     def __init__(self): super().__init__(); self.unblocked = []
     def card(self, card_id): return {"id": card_id, "title": "Поправить текст",
-                                     "board_id": 2000, "column_id": 205}
+                                     "board_id": 2000, "column_id": self.column}
+    def comments(self, card_id): return list(self.said)
     def blockers(self, card_id): return list(self.held)
     def unblock(self, card_id, blocker_id): self.unblocked.append((card_id, blocker_id))
+    column = 205
 
 def thread_once(kaiten, stuck):
     f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
@@ -728,19 +755,33 @@ def thread_once(kaiten, stuck):
 
 QUESTION[0] = "@fabrica поправь замечания из пр"
 mine = Handed()
-marks, said = thread_once(mine, handed)
-check("свой блокер передачи снят", mine.unblocked == [(555, 77)], str(mine.unblocked))
-check("и карточка уехала в «Правки», хотя «Ревью» — колонка ревьювера",
+marks, said = thread_once(mine, None)
+check("карточка уехала в «Правки», хотя «Ревью» — колонка ревьювера",
       mine.moves == [(555, 202)], str(mine.moves))
 check("на сообщении глазок, а не крест", marks == ["eyes"], str(marks))
 check("и никакого «меня блочит»", said == [], str(said))
-check("просьба записана в карточку до снятия блокера",
-      len(mine.comments_written) == 1, str(mine.comments_written))
+check("просьба записана в карточку", len(mine.comments_written) == 1,
+      str(mine.comments_written))
+
+waiting = Handed()
+waiting.said = [report]
+marks, _ = thread_once(waiting, None)
+check("ревьювер ещё не смотрел — карточка ждёт его на месте, просьбу он прочтёт сам",
+      waiting.moves == [] and marks == ["eyes"], f"{waiting.moves} {marks}")
+
+asking = Handed()
+asking.column = 202
+question = f.block_reason(f.BLOCK_QUESTION)
+asking.held = [{"id": 76, "reason": question}]
+marks, said = thread_once(asking, question)
+check("свой блокер «не хватило данных» сообщение по-прежнему снимает",
+      asking.unblocked == [(555, 76)] and marks == ["eyes"] and said == [],
+      f"{asking.unblocked} {marks} {said}")
 
 mixed = Handed()
-mixed.held = [{"id": 77, "reason": handed}, {"id": 78, "reason": "ждём макет от дизайна"}]
-marks, said = thread_once(mixed, handed)
-check("рядом чужой блокер — не снимаем ничего", mixed.unblocked == [], str(mixed.unblocked))
+mixed.held = [{"id": 78, "reason": "ждём макет от дизайна"}]
+marks, said = thread_once(mixed, mixed.held[0]["reason"])
+check("чужой блокер — не снимаем", mixed.unblocked == [], str(mixed.unblocked))
 check("и не двигаем", mixed.moves == [], str(mixed.moves))
 check("а честно отвечаем крестом", marks == ["x"], str(marks))
 

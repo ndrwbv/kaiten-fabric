@@ -77,6 +77,14 @@ card = {"pr": {"state": "OPEN"}, "shipped": None, "column": "review",
 check("ждёт человека", d.card_outcome(card) == "waiting", d.card_outcome(card))
 card["column"] = "fixes"
 check("а из «Правок» — на правках", d.card_outcome(card) == "fixes", d.card_outcome(card))
+# на доске команды ревью человека и вход ревьювера — одна колонка, и блокера
+# «ревью пройдено» там больше нет: отданную карточку видно по последнему заходу
+card["column"] = "agent_review"
+check("в колонке ревьювера, пока он не смотрел, — на ревью агента",
+      d.card_outcome(card) == "review", d.card_outcome(card))
+card["reviewed"] = True
+check("а после его захода — ход человека", d.card_outcome(card) == "waiting",
+      d.card_outcome(card))
 
 print("=== 7. исход: до PR не дошло ===")
 base = {"pr": None, "shipped": None, "column": None, "cut": "", "last_outcome": ""}

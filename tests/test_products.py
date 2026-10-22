@@ -209,6 +209,21 @@ half = Phase([child(1, SITE, SITE + 4), child(2, B2B, B2B + 2)])
 check("одна ещё в работе — эпик в работе",
       f.epic_phase(half, CFG, f.epic_flow(CFG), epic_card, said) == "working")
 
+
+class Reviewed(Phase):
+    """Ревью и вход ревьювера — одна колонка; отревьюена та, где последним был 🔍."""
+    def comments(self, card_id):
+        report = {"text": "🤖 **Готово.** PR: https://github.com/acme/shop/pull/1"}
+        return [report, {"text": "🔍 **Ревью, круг 1/3:** чисто"}] if card_id == 1 else [report]
+
+
+reviewed = Reviewed([child(1, SITE, SITE + 3), child(2, B2B, B2B + 4)])
+check("сабтаска в «Коде» после ревьювера — отревьюена, блокер не нужен",
+      f.epic_phase(reviewed, CFG, f.epic_flow(CFG), epic_card, said) == "closing")
+waiting = Reviewed([child(1, SITE, SITE + 4), child(2, B2B, B2B + 3)])
+check("а та, которую ревьювер ещё не смотрел, — нет",
+      f.epic_phase(waiting, CFG, f.epic_flow(CFG), epic_card, said) == "working")
+
 print("=== 8. закрытый эпик на доске без ревью остаётся на месте ===")
 
 
