@@ -19,6 +19,8 @@ project/*/
 worktrees/
 logs/
 state/
+# что агенты скачали для проверки: меню юнитов, выгрузки
+scratch/
 
 # Локальные настройки Claude Code: содержат абсолютные пути с именем пользователя
 .claude/settings.local.json

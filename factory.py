@@ -61,6 +61,10 @@ BRANCH_PREFIX = "stepa/card-"
 LEGACY_BRANCH_PREFIXES = ("ai/card-",)
 LOGS = ROOT / "logs"
 STATE = ROOT / "state"
+# Куда агент кладёт скачанное для проверки — меню юнита, выгрузку, ответ API. Не в
+# рабочую копию: агент коммитит её целиком, и меню на 90 МБ уехало бы в PR. Каталог
+# открыт каждому агенту через --add-dir, иначе Claude Code не даст его прочитать.
+SCRATCH = ROOT / "scratch"
 STATUS_FILE = STATE / "status.json"
 # журнал исходов: строка на каждую законченную работу. status.json помнит только
 # последнюю, а витрине нужна история — что сделано, что упало и когда
@@ -1160,7 +1164,7 @@ class Time:
                       config=self._auth())
 
     def unreact(self, post_id: str, user_id: str, emoji: str = "eyes") -> None:
-        """Снять своё эмодзи. Глазок живёт ровно пока идёт работа, а не вечно."""
+        """Снять своё эмодзи: глазок по итогам круга меняется на итоговый значок."""
         if self.dry_run:
             log(f"  [dry-run] Time -> снять :{emoji}: с {post_id}")
             return
@@ -1452,6 +1456,12 @@ def time_pr_message(card_url: str, pr_url: str, summary: str) -> str:
 # с ним всё-таки уходит причина; глазку слова не нужны.
 EYES = "eyes"
 CROSS = "x"
+# Чем глазок становится, когда круг кончился. Снимать его совсем нельзя: человек
+# заглянул в тред через полчаса — и на его сообщении пусто, будто его не видели.
+# Так и вышло: Стёпа поправил, отчитался в треде, снял глазок, а на вопрос «видел
+# ли он мой коммент» ответить по треду было уже нечем.
+DONE = "white_check_mark"
+ASKED = "question"
 
 
 # Карточки из треда в Time приходят с подписью «Создатель тикета: i.ivanov» —
@@ -1544,13 +1554,17 @@ def mark_thread(client: Time, info: dict, user_id: str,
     info.pop("eyed", None)
 
 
-def drop_marks(client: Time, info: dict) -> None:
+def settle_marks(client: Time, info: dict, emoji: str) -> None:
     """
-    Снять реакции с сообщений, по которым фабрика работала.
+    Круг кончился — поменять реакции на сообщениях, по которым фабрика работала,
+    на итоговую: ✅ — отчитался, ❓ — вернулся с вопросами.
 
-    Они значат «сейчас мой ход»; круг кончился — дальше за фабрику говорят её же
-    слова, и висеть им незачем. Не снялось — работа от этого не отменяется,
-    поэтому только в лог.
+    Глазок значит «сейчас мой ход», и после круга он врал бы. Но и снимать его
+    бесследно нельзя: на сообщении человека должно остаться видно, что его
+    прочитали и по нему отработали. Итоговые значки в состоянии не держим —
+    они навсегда, и следующий круг их трогать не должен.
+
+    Не поменялось — работа от этого не отменяется, поэтому только в лог.
     """
     marks = thread_marks(info)
     if not marks:
@@ -1558,13 +1572,15 @@ def drop_marks(client: Time, info: dict) -> None:
     try:
         who = client.my_id
     except FactoryError as e:
-        log(f"  !! не узнал себя — реакции не снял: {e}")
+        log(f"  !! не узнал себя — реакции не поменял: {e}")
         return
-    for post_id, emoji in marks.items():
+    for post_id, mark in marks.items():
         try:
-            client.unreact(post_id, who, emoji)
+            if mark != emoji:
+                client.unreact(post_id, who, mark)
+            client.react(post_id, who, emoji)
         except FactoryError as e:
-            log(f"  !! реакция :{emoji}: с {post_id} не снялась: {e}")
+            log(f"  !! реакция :{mark}: на {post_id} не сменилась на :{emoji}: {e}")
     info["reacted"] = {}
     info.pop("eyed", None)
 
@@ -1617,9 +1633,9 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
                 text = (f"Чекай, поправил: {summary}" if summary
                         else "Чекай, поправил по замечаниям, подробности в PR.")
             client.post(known.get("channel_id", ""), text, root_id=known["root_id"])
-            # Отчёт ушёл — значит реакциям конец: они висели вместо слов, пока шла
-            # работа, а теперь за неё говорит сам отчёт
-            drop_marks(client, known)
+            # Отчёт ушёл — глазок на сообщении человека становится галочкой:
+            # «видел и сделал» остаётся на виду, а не пропадает вместе с работой
+            settle_marks(client, known, DONE)
             # Круг закончился — вопрос отвечен, а следующая пачка вопросов по этому
             # треду будет уже не первой, и сказать об этом придётся вслух. «После
             # правки» — только если правка и была: иначе оговорка опять соврёт.
@@ -1635,7 +1651,7 @@ def notify_pr(cfg: dict, repo_key: str | None, card: dict, card_url: str,
             # Карточку дали в канале — PR и есть ответ на ту просьбу, туда же он и
             # уходит. Это сообщение несёт и статус: корень треда чужой.
             post = client.post(known.get("channel_id", ""), base, root_id=known["root_id"])
-            drop_marks(client, known)
+            settle_marks(client, known, DONE)
             tag_author(client, card, known, known.get("channel_id", ""), known["root_id"])
             known.update(base=base, status="",
                          status_post=(post or {}).get("id") or known.get("status_post", ""))
@@ -1831,7 +1847,10 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         try:
             card = kaiten.card(int(card_key))
         except NotFoundError:
+            # Строку статуса снимаем и тут: дальше эту карточку никто не спросит,
+            # и «позырьте плз» висело бы в канале над удалённой задачей вечно
             log(f"  #{card_key} больше нет — убираю тред из состояния")
+            clear_time_status(client, info, card_key)
             threads.pop(card_key, None)
             save_time_state(state)
             continue
@@ -1854,6 +1873,11 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         passed = (bool(profile) and card.get("column_id") == role_column(profile, "review")
                   and review_passed(comments))
         role, status = time_status(profile, card, asks, stuck or "", passed)
+        if not role:
+            # Карточку увели из колонок фабрики — в «Тестинг», в «Ролаут», на чужую
+            # доску. Её ведёт человек, и «пока не смотрите, сыровато» над ней больше
+            # не правда: строку снимаем. Вернут в работу — статус вернётся сам.
+            role = "away"
 
         # Вопросы агента — в тред: человеку сказали «позырьте», и он должен увидеть,
         # о чём речь, не открывая карточку. Второй раз одно и то же не пишем.
@@ -1869,7 +1893,7 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
                     client.post(info.get("channel_id", ""), text, root_id=root_id)
                     # Круг кончился вопросами — ход опять человека, и глазок на его
                     # сообщении врал бы, что фабрика всё ещё что-то делает
-                    drop_marks(client, info)
+                    settle_marks(client, info, ASKED)
                     info["asked"] = asked
                     save_time_state(state)
                     log(f"  #{card_key}: вопросы в тред ({len(asks)})")
@@ -1898,6 +1922,18 @@ def sync_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict],
         known[card_key] = {"card": card, "profile": profile, "comments": comments,
                            "asks": asks, "stuck": stuck, "passed": passed}
     return state, known
+
+
+def clear_time_status(client: Time, info: dict, card_key: str) -> None:
+    """Снять строку статуса с сообщения — по карточке, про которую больше нечего сказать."""
+    if not info.get("status") or not status_post(info):
+        return
+    try:
+        client.edit(status_post(info), thread_base(client, info))
+        info["status"] = ""
+        log(f"  #{card_key}: статус в канале -> снят")
+    except FactoryError as e:
+        log(f"  !! не смог снять статус по #{card_key}: {e}")
 
 
 def refresh_time_status(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -> None:
@@ -2089,8 +2125,8 @@ def follow_time_threads(kaiten: Kaiten, cfg: dict, args, profiles: list[dict]) -
             mark, reply = EYES, ""
 
         # Ставим до Kaiten: и комментарий, и перенос ещё могут не получиться, а знать,
-        # чем кончилось его сообщение, человеку надо в любом случае. Снимется реакция
-        # тогда же, когда придёт настоящий ответ, — кругом позже.
+        # чем кончилось его сообщение, человеку надо в любом случае. Сменится реакция
+        # на итоговую тогда же, когда придёт настоящий ответ, — кругом позже.
         if time_wants(conf, "fix_taken"):
             mark_thread(client, info, bot_id,
                         [post.get("id") or "" for post, _, _ in work], mark)
@@ -3319,6 +3355,7 @@ def build_prompt(card: dict, comments: list, repo_cfg: dict, branch: str, card_u
         "{{BRANCH}}": branch,
         "{{BASE_BRANCH}}": repo_cfg["base_branch"],
         "{{REMOTE}}": repo_cfg["remote"],
+        "{{SCRATCH}}": str(SCRATCH),
         "{{RETURN_NOTE}}": (fix_note(comments, feedback or [], review_details(card["id"]))
                             if fixing else RETURN_NOTE if returning else "")
                            + scout_hints(card),
@@ -3542,7 +3579,8 @@ def run_agent(prompt: str, cwd: Path, agent_cfg: dict,
         cmd += ["--effort", agent_cfg["effort"]]
     if agent_cfg.get("max_budget_usd"):
         cmd += ["--max-budget-usd", str(agent_cfg["max_budget_usd"])]
-    for extra in add_dirs or []:
+    SCRATCH.mkdir(exist_ok=True)
+    for extra in [*(add_dirs or []), SCRATCH]:
         cmd += ["--add-dir", str(extra)]
 
     env = os.environ.copy()

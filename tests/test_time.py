@@ -314,6 +314,9 @@ check("круг кончился вопросами — глазок снят",
       [g for g in GOT if g[0] == "DELETE"] != [] and
       json.loads(f.TIME_STATE_FILE.read_text())["threads"]["555"]["reacted"] == {},
       str(GOT))
+check("и вместо него знак вопроса — видно, что сообщение прочитали",
+      [json.loads(g[2])["emoji_name"] for g in GOT
+       if g[0] == "POST" and g[1].endswith("/reactions")] == ["question"], str(GOT))
 check("в треде без эмодзи", not any(m in in_thread[0] for m in ("❓", "⚠️", "🛑", "💬")),
       in_thread[0])
 check("один вопрос — одной строкой",
@@ -498,7 +501,12 @@ dropped = [g for g in GOT if g[0] == "DELETE"]
 check("глазок снят — дальше говорит сам ответ", len(dropped) == 1, str(dropped))
 check("снят свой и с того самого сообщения",
       dropped[0][1].endswith(f"/users/{BOT_ID}/posts/reply/reactions/eyes"), dropped[0][1])
-check("и в состоянии его больше нет", saved["reacted"] == {}, str(saved))
+settled = [json.loads(g[2]) for g in GOT if g[0] == "POST" and g[1].endswith("/reactions")]
+check("а на его месте галочка: «видел и сделал» остаётся на виду",
+      settled == [{"user_id": BOT_ID, "post_id": "reply",
+                   "emoji_name": "white_check_mark"}], str(settled))
+check("и в состоянии его больше нет — галочку следующий круг не трогает",
+      saved["reacted"] == {}, str(saved))
 
 print("=== 21. вторая пачка вопросов — это круг после правки ===")
 check("в первый раз — просто вопросы",
@@ -681,6 +689,34 @@ check("сеть подвела — тред на месте",
       "555" in with_broken_card(f.NetworkError("curl 28: timed out")))
 check("а 404 — карточки правда нет",
       "555" not in with_broken_card(f.NotFoundError("HTTP 404")))
+
+print("=== 29б. строка статуса не замерзает над задачей, которой больше нет ===")
+# В канале висело «пацаны, пока не смотрите, сыровато» над задачей, которую
+# давно увели из колонок фабрики, — и человек читал это как ответ Стёпы.
+def status_edits(kaiten_stub):
+    f.TIME_STATE_FILE.write_text(json.dumps({"threads": {"555": {
+        "channel_id": "chan-1", "root_id": "root", "last_post_id": "reply",
+        "base": "[PR](u) Убрал lowercase.\n[Карточка](k)",
+        "status": "пацанчики, позырьте плз"}}}), encoding="utf-8")
+    GOT.clear()
+    f.sync_time_status(kaiten_stub, cfg, Args(), profiles)
+    return [json.loads(g[2])["message"] for g in GOT if g[0] == "PUT"]
+
+class Gone(FakeKaiten):
+    def card(self, card_id): raise f.NotFoundError("HTTP 404")
+check("карточку удалили — строку статуса сняли",
+      status_edits(Gone()) == ["[PR](u) Убрал lowercase.\n[Карточка](k)"], str(GOT))
+
+class Away(FakeKaiten):
+    column = 999      # «Тестинг»: колонка доски, у которой нет роли фабрики
+edits = status_edits(Away())
+check("карточку увели из колонок фабрики — строку статуса сняли",
+      edits == ["[PR](u) Убрал lowercase.\n[Карточка](k)"], str(edits))
+check("а тред остался: вернут в работу — статус вернётся",
+      "555" in json.loads(f.TIME_STATE_FILE.read_text())["threads"])
+GOT.clear()
+f.sync_time_status(Away(), cfg, Args(), profiles)
+check("второй раз снимать нечего", [g for g in GOT if g[0] == "PUT"] == [], str(GOT))
 
 print("=== 33. на доске команды «Ревью» — две роли, различает их последнее слово ===")
 # Своей доски у Стёпы больше нет, он работает там же, где команда, а там колонок
@@ -1040,6 +1076,9 @@ check("статус теперь живёт в этом ответе — кор�
       info["status_post"] == "new-post" and f.status_post(info) == "new-post", str(info))
 check("глазок снят — за работу говорит PR",
       any(g[0] == "DELETE" and "reactions/eyes" in g[1] for g in GOT), str(GOT))
+check("и сменился галочкой",
+      any(g[0] == "POST" and g[1].endswith("/reactions")
+          and json.loads(g[2])["emoji_name"] == "white_check_mark" for g in GOT), str(GOT))
 check("свой тред по-прежнему держит статус в корне",
       f.status_post({"root_id": "root"}) == "root")
 check("в чужом треде до PR статусу жить негде",
