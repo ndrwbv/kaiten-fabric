@@ -1239,6 +1239,14 @@ class Time:
         except NotFoundError:
             return {}
 
+    def user_by_username(self, username: str) -> dict:
+        """Пользователь по логину Time; пусто, если такого нет."""
+        try:
+            return self._request("GET", f"{self.api}/users/username/{urllib.parse.quote(username)}",
+                                 config=self._auth()) or {}
+        except NotFoundError:
+            return {}
+
 
 def time_config(cfg: dict) -> dict:
     return ((cfg.get("notify") or {}).get("time") or {})
@@ -1446,20 +1454,39 @@ EYES = "eyes"
 CROSS = "x"
 
 
+# Карточки из треда в Time приходят с подписью «Создатель тикета: i.ivanov» —
+# это логин в Time того, кто просил. Владелец карточки в Kaiten бывает другим:
+# тот, кто перенёс её на доску, а ждёт PR всё равно автор просьбы.
+TICKET_CREATOR_RE = re.compile(r"Создатель тикета\W*@?([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def ticket_creator(card: dict) -> str:
+    """Логин в Time из строки «Создатель тикета: …» в описании, или пусто."""
+    found = TICKET_CREATOR_RE.search(card.get("description") or "")
+    return found.group(1).rstrip(".") if found else ""
+
+
 def author_mention(client: Time, card: dict, info: dict) -> str:
     """
     `@логин` автора карточки в Time — или пусто, если его там не нашли.
+
+    Автор — тот, кто подписан в описании «Создатель тикета», а без подписи —
+    владелец карточки, его ищем по почте. Подписанного, но не найденного в Time
+    не тегаем наугад: идём к владельцу.
 
     Находку запоминаем в треде, чтобы не спрашивать Time второй раз; сбой
     сети — не находка, его не запоминаем.
     """
     if "author" in info:
         return info["author"]
+    creator = ticket_creator(card)
     email = ((card.get("owner") or {}).get("email") or "").strip()
-    if not email or not client.can_read:
+    if not (creator or email) or not client.can_read:
         return ""
     try:
-        user = client.user_by_email(email)
+        user = client.user_by_username(creator) if creator else {}
+        if (not user or user.get("delete_at")) and email:
+            user = client.user_by_email(email)
     except FactoryError as e:
         log(f"  !! не нашёл в Time автора карточки: {e}")
         return ""

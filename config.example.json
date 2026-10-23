@@ -103,6 +103,7 @@
     "timeout_sec": 2700,
 
     "//figma": "инструменты Figma в списках ниже — только чтение макетов, и только если у тебя подключён коннектор Figma. Имя MCP-сервера зависит от названия коннектора: точные имена покажет `claude -p \"перечисли инструменты, которые начинаются на mcp__\"`. Нет коннектора — просто убери эти строки",
+    "//time": "инструменты Time — только чтение тредов: в карточку часто кладут ссылку на тред, где задачу обсуждали, и без него агент работает вслепую. Ходят они через коннектор Time в claude.ai, то есть под тобой, а не под ботом фабрики: бот видит только свой канал. Нет коннектора — убери эти строки",
     "//allowed_tools": "главный предохранитель: агент может звать только это. Голого Bash здесь нет намеренно — карточку пишет человек, а команды из неё исполняет агент. Под свой стек поменяй строки сборки и тестов.",
     "allowed_tools": [
       "Read", "Grep", "Glob", "Edit", "Write", "TodoWrite", "Task", "Skill",
@@ -116,7 +117,9 @@
       "mcp__claude_ai_Figma__get_design_context",
       "mcp__claude_ai_Figma__get_metadata",
       "mcp__claude_ai_Figma__get_screenshot",
-      "mcp__claude_ai_Figma__get_variable_defs"
+      "mcp__claude_ai_Figma__get_variable_defs",
+      "mcp__claude_ai_Time__time_get_thread",
+      "mcp__claude_ai_Time__time_get_thread_messages"
     ]
   },
 
@@ -138,7 +141,9 @@
       "mcp__claude_ai_Figma__get_design_context",
       "mcp__claude_ai_Figma__get_metadata",
       "mcp__claude_ai_Figma__get_screenshot",
-      "mcp__claude_ai_Figma__get_variable_defs"
+      "mcp__claude_ai_Figma__get_variable_defs",
+      "mcp__claude_ai_Time__time_get_thread",
+      "mcp__claude_ai_Time__time_get_thread_messages"
     ]
   },
 
@@ -158,7 +163,9 @@
       "mcp__claude_ai_Figma__get_design_context",
       "mcp__claude_ai_Figma__get_metadata",
       "mcp__claude_ai_Figma__get_screenshot",
-      "mcp__claude_ai_Figma__get_variable_defs"
+      "mcp__claude_ai_Figma__get_variable_defs",
+      "mcp__claude_ai_Time__time_get_thread",
+      "mcp__claude_ai_Time__time_get_thread_messages"
     ]
   },
 

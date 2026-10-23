@@ -36,6 +36,12 @@ class Fake(BaseHTTPRequestHandler):
         GOT.append(("GET", self.path, None, self.headers.get("Authorization")))
         if self.path.endswith("/users/me"):
             return self._reply({"id": BOT_ID, "username": "fabrica"})
+        if "/users/username/" in self.path:
+            name = self.path.rsplit("/", 1)[1]
+            if name == "nobody":
+                self.send_response(404); self.send_header("Content-Length", "0")
+                self.end_headers(); return
+            return self._reply({"id": "u-3", "username": name})
         if "/users/email/" in self.path:
             if self.path.endswith("/nobody%40example.com"):
                 self.send_response(404); self.send_header("Content-Length", "0")
@@ -1111,6 +1117,21 @@ check("в сообщение со статусом тег не попал",
       "@author" not in json.loads(f.TIME_STATE_FILE.read_text())["threads"]["889"]["base"])
 
 client = f.Time(BASE, token="tok-123")
+ticket = {"owner": {"email": "author@example.com"},
+          "description": "Источник тикета: [тред в Time](https://t/x/pl/abc)\n\n"
+                         "Создатель тикета: i.ivanov"}
+GOT.clear()
+check("подписан создатель тикета — тегаем его, а не владельца",
+      f.author_mention(client, ticket, {}) == "@i.ivanov", str(GOT))
+check("и ищем его по логину, почту не трогаем",
+      any(g[1].endswith("/users/username/i.ivanov") for g in GOT)
+      and not any("/users/email/" in g[1] for g in GOT), str(GOT))
+check("создателя нет в Time — тегаем владельца",
+      f.author_mention(client, dict(ticket, description="Создатель тикета: nobody"), {})
+      == "@author")
+check("подпись в жирном и с @ тоже читается",
+      f.ticket_creator({"description": "**Создатель тикета:** @a.boev."}) == "a.boev")
+check("нет подписи — нет создателя", f.ticket_creator({"description": "Просто текст"}) == "")
 check("нет такого в Time — без тега",
       f.author_mention(client, {"owner": {"email": "nobody@example.com"}}, {}) == "")
 check("у карточки нет автора — без тега", f.author_mention(client, {}, {}) == "")
